@@ -1,0 +1,10 @@
+[package]
+name = "org-trace-importers"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+org-trace-protocol = { path = "../protocol" }

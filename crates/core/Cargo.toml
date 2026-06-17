@@ -1,0 +1,14 @@
+[package]
+name = "org-trace-core"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+org-trace-protocol = { path = "../protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "orgii-trace"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+org-trace-core = { path = "../core" }
+org-trace-protocol = { path = "../protocol" }
+serde_json.workspace = true
