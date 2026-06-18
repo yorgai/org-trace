@@ -1,5 +1,5 @@
 [package]
-name = "org-trace-protocol"
+name = "brick-protocol"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

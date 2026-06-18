@@ -1,147 +1,143 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-use org_trace_core::{discover_repo_root, LocalStore};
-use org_trace_protocol::{ActorRef, ActorType, EventType, TraceEvent};
-use serde_json::json;
+//! Entry point for the standalone `brick` CLI.
+//!
+//! The binary keeps parsing and dispatch thin; command construction, local
+//! inspection, and presentation live in focused modules so agent-facing behavior
+//! is easier to evolve without growing a monolithic main file.
 
-#[derive(Debug, Parser)]
-#[command(name = "orgii-trace")]
-#[command(about = "Record and sync ORGII mission provenance events")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
+use anyhow::{Context, Result};
+use brick_core::{discover_repo_root, LocalStore, SourceProfileStore, StorageOptions};
+use clap::Parser;
 
-#[derive(Debug, Subcommand)]
-enum Command {
-    Init,
-    Mission {
-        #[command(subcommand)]
-        command: MissionCommand,
-    },
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
-    Artifact {
-        #[command(subcommand)]
-        command: ArtifactCommand,
-    },
-    Sync {
-        #[arg(long)]
-        dry_run: bool,
-    },
-    Push {
-        #[arg(long)]
-        dry_run: bool,
-    },
-    Pull {
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
+mod args;
+mod commands;
+mod context;
+mod db;
+mod inspect;
+mod output;
+mod source;
+mod sync;
 
-#[derive(Debug, Subcommand)]
-enum MissionCommand {
-    Create { title: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum SessionCommand {
-    Start {
-        #[arg(long)]
-        mission: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ArtifactCommand {
-    Decision {
-        #[arg(long)]
-        mission: Option<String>,
-        title: String,
-    },
-}
+use args::{Cli, Command, SessionCommand};
+use commands::{handle_artifact, handle_diff, handle_import, handle_mission, handle_session};
+use context::{handle_context, handle_session_read};
+use db::handle_db;
+use inspect::{handle_index, handle_inspect};
+use output::{print_log, print_status};
+use source::handle_source;
+use sync::{handle_pull, handle_push, handle_sync};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo_root = discover_repo_root(std::env::current_dir()?)?;
-    let store = LocalStore::new(repo_root);
+    let work_dir = std::env::current_dir().context("failed to read current directory")?;
+    let repo_root = discover_repo_root(&work_dir)?;
+    let source_profiles = SourceProfileStore::new(repo_root.clone());
+    let mut command = cli.command;
+    let upload_log_uses_global_source = matches!(
+        command,
+        Command::Session {
+            command: SessionCommand::UploadLog { .. }
+        }
+    );
+    if let Command::Session {
+        command: SessionCommand::UploadLog { source, .. },
+    } = &mut command
+    {
+        if source.is_none() {
+            *source = cli.source.clone();
+        }
+    }
+    let selected_source_profile = match &command {
+        Command::Source { .. } => None,
+        _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
+        _ => source_profiles.selected_profile(cli.source.as_deref())?,
+    };
+    let store = LocalStore::with_options(
+        repo_root.clone(),
+        StorageOptions::new()
+            .with_explicit_store_root(cli.store_root.clone())
+            .with_source_profile(selected_source_profile.clone()),
+    )?;
 
-    match cli.command {
+    match command {
         Command::Init => {
             store.init()?;
-            println!("Initialized ORGII Trace at {}", store.provenance_dir().display());
+            println!("Initialized Brick at {}", store.provenance_dir().display());
         }
-        Command::Mission { command } => handle_mission(command, &store)?,
-        Command::Session { command } => handle_session(command, &store)?,
-        Command::Artifact { command } => handle_artifact(command, &store)?,
-        Command::Sync { dry_run } => println!("sync is not implemented yet; dry_run={dry_run}"),
-        Command::Push { dry_run } => println!("push is not implemented yet; dry_run={dry_run}"),
-        Command::Pull { dry_run } => println!("pull is not implemented yet; dry_run={dry_run}"),
+        Command::Diff { command } => handle_diff(
+            command,
+            &cli.identity,
+            &store,
+            &repo_root,
+            &work_dir,
+            selected_source_profile.as_ref(),
+        )?,
+        Command::Mission { command } => handle_mission(
+            command,
+            &cli.identity,
+            &store,
+            &repo_root,
+            &work_dir,
+            selected_source_profile.as_ref(),
+        )?,
+        Command::Session { command } => {
+            if !handle_session_read(
+                &command,
+                &cli.identity,
+                &store,
+                selected_source_profile.as_ref(),
+            )? {
+                handle_session(
+                    command,
+                    &cli.identity,
+                    &store,
+                    &repo_root,
+                    &work_dir,
+                    selected_source_profile.as_ref(),
+                )?;
+            }
+        }
+        Command::Artifact { command } => handle_artifact(
+            command,
+            &cli.identity,
+            &store,
+            &repo_root,
+            &work_dir,
+            selected_source_profile.as_ref(),
+        )?,
+        Command::Status => print_status(&store, &repo_root, &work_dir)?,
+        Command::Context { command } => handle_context(
+            command,
+            &cli.identity,
+            &store,
+            selected_source_profile.as_ref(),
+        )?,
+        Command::Log { limit } => print_log(&store, limit)?,
+        Command::Index { command } => handle_index(command, &store)?,
+        Command::Db { command } => handle_db(command, &store)?,
+        Command::Inspect { command } => handle_inspect(command, &store)?,
+        Command::Source { command } => handle_source(command, &source_profiles)?,
+        Command::Import { command } => handle_import(
+            command,
+            &cli.identity,
+            &store,
+            selected_source_profile.as_ref(),
+        )?,
+        Command::Sync {
+            dry_run,
+            remote,
+            repo_id,
+        } => handle_sync(&store, dry_run, remote, repo_id)?,
+        Command::Push {
+            dry_run,
+            remote,
+            repo_id,
+        } => handle_push(&store, dry_run, remote, repo_id)?,
+        Command::Pull {
+            dry_run,
+            remote,
+            repo_id,
+        } => handle_pull(&store, dry_run, remote, repo_id)?,
     }
 
     Ok(())
-}
-
-fn handle_mission(command: MissionCommand, store: &LocalStore) -> Result<()> {
-    match command {
-        MissionCommand::Create { title } => {
-            let mut event = TraceEvent::new(
-                EventType::MissionCreated,
-                default_actor(),
-                json!({ "title": title }),
-            );
-            event.mission_id = Some(format!("mission-{}", event.event_id));
-            let path = store.append_event(&event)?;
-            println!("Recorded mission event in {}", path.display());
-        }
-    }
-    Ok(())
-}
-
-fn handle_session(command: SessionCommand, store: &LocalStore) -> Result<()> {
-    match command {
-        SessionCommand::Start { mission } => {
-            let mut event = TraceEvent::new(
-                EventType::SessionStarted,
-                default_actor(),
-                json!({ "mission_id": mission }),
-            );
-            event.mission_id = mission;
-            event.session_id = Some(format!("session-{}", event.event_id));
-            let path = store.append_event(&event)?;
-            println!("Recorded session event in {}", path.display());
-        }
-    }
-    Ok(())
-}
-
-fn handle_artifact(command: ArtifactCommand, store: &LocalStore) -> Result<()> {
-    match command {
-        ArtifactCommand::Decision { mission, title } => {
-            let mut event = TraceEvent::new(
-                EventType::ArtifactCreated,
-                default_actor(),
-                json!({ "artifact_type": "decision", "title": title }),
-            );
-            event.mission_id = mission;
-            event.artifact_id = Some(format!("artifact-{}", event.event_id));
-            let path = store.append_event(&event)?;
-            println!("Recorded artifact event in {}", path.display());
-        }
-    }
-    Ok(())
-}
-
-fn default_actor() -> ActorRef {
-    let actor_id = std::env::var("ORGII_TRACE_ACTOR_ID")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    ActorRef {
-        actor_type: ActorType::Human,
-        actor_id,
-        display_name: None,
-    }
 }

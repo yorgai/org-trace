@@ -1,0 +1,195 @@
+//! Tests for the rebuildable SQLite query cache.
+
+use std::fs;
+
+use brick_protocol::{
+    ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload,
+    ArtifactFileRefRecordedPayload, ArtifactId, ArtifactKind, ArtifactUpdatedPayload, AttachmentId,
+    FileRefId, LogRefId, MissionCreatedPayload, MissionId, SessionId, SessionLogFormat,
+    SessionLogUploadedPayload, SessionSource, SessionStartedPayload, TraceEvent,
+};
+use chrono::Utc;
+
+use crate::{
+    query_sqlite_artifacts, query_sqlite_sessions, rebuild_sqlite_index, sqlite_index_status,
+    SqliteArtifactQuery, SqliteSessionQuery, TraceIndex, SQLITE_INDEX_FILE,
+    SQLITE_INDEX_SCHEMA_VERSION,
+};
+
+fn actor() -> ActorRef {
+    ActorRef {
+        actor_type: ActorType::Agent,
+        actor_id: "agent-1".to_string(),
+        display_name: None,
+    }
+}
+
+fn temp_sqlite_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "brick-sqlite-test-{name}-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::create_dir_all(&dir).expect("create temp sqlite dir");
+    dir.join(SQLITE_INDEX_FILE)
+}
+
+#[test]
+fn rebuilds_and_queries_sqlite_cache() {
+    let path = temp_sqlite_path("query");
+    let mission_id = MissionId::new();
+    let session_id = SessionId::new();
+    let artifact_id = ArtifactId::new();
+    let attachment_id = AttachmentId::new();
+    let log_ref_id = LogRefId::new();
+    let events = vec![
+        TraceEvent::mission_created(
+            actor(),
+            mission_id.clone(),
+            MissionCreatedPayload {
+                title: "Phase 6".to_string(),
+                description: None,
+                repo_context_id: None,
+            },
+        )
+        .expect("mission event"),
+        TraceEvent::session_started(
+            actor(),
+            session_id.clone(),
+            Some(mission_id.clone()),
+            SessionStartedPayload {
+                session_name: Some("SQLite work".to_string()),
+                source: SessionSource {
+                    app_id: Some("cursor".to_string()),
+                    app_session_id: Some("native-1".to_string()),
+                    app_session_name: Some("Phase 6 chat".to_string()),
+                    runtime_id: Some("runtime-1".to_string()),
+                },
+                repo_context_id: None,
+            },
+        )
+        .expect("session event"),
+        TraceEvent::artifact_created(
+            actor(),
+            artifact_id.clone(),
+            Some(mission_id.clone()),
+            Some(session_id.clone()),
+            ArtifactCreatedPayload {
+                artifact_kind: ArtifactKind::Decision,
+                title: "Use SQLite cache".to_string(),
+                body: Some("Original body".to_string()),
+                repo_context_id: None,
+            },
+        )
+        .expect("artifact event"),
+        TraceEvent::artifact_updated(
+            actor(),
+            artifact_id.clone(),
+            Some(session_id.clone()),
+            ArtifactUpdatedPayload {
+                title: Some("Use updated SQLite cache".to_string()),
+                body: Some("Updated body".to_string()),
+                artifact_kind: Some(ArtifactKind::Review),
+                repo_context_id: None,
+            },
+        )
+        .expect("artifact update event"),
+        TraceEvent::artifact_file_ref_recorded(
+            actor(),
+            artifact_id.clone(),
+            Some(session_id.clone()),
+            ArtifactFileRefRecordedPayload {
+                file_ref_id: FileRefId::new(),
+                path: "crates/core/src/sqlite_index.rs".to_string(),
+                repo_context_id: None,
+            },
+        )
+        .expect("file event"),
+        TraceEvent::artifact_attachment_uploaded(
+            actor(),
+            artifact_id.clone(),
+            Some(session_id.clone()),
+            ArtifactAttachmentUploadedPayload {
+                attachment_id: attachment_id.clone(),
+                name: "report.txt".to_string(),
+                original_path: "/tmp/report.txt".to_string(),
+                content_type: Some("text/plain".to_string()),
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                size_bytes: 5,
+                storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                repo_context_id: None,
+            },
+        )
+        .expect("attachment event"),
+        TraceEvent::session_log_uploaded(
+            actor(),
+            session_id.clone(),
+            SessionLogUploadedPayload {
+                log_ref_id: log_ref_id.clone(),
+                original_path: "/tmp/session.jsonl".to_string(),
+                format: SessionLogFormat::Jsonl,
+                source: "cursor".to_string(),
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                size_bytes: 5,
+                storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                local_path: "/tmp/blob".to_string(),
+                repo_context_id: None,
+            },
+        )
+        .expect("session log event"),
+    ];
+    let index = TraceIndex::build(&events).expect("build trace index");
+
+    rebuild_sqlite_index(&path, &events, &index).expect("rebuild sqlite index");
+    let status = sqlite_index_status(&path).expect("sqlite status");
+    assert!(status.exists);
+    assert_eq!(status.schema_version, Some(SQLITE_INDEX_SCHEMA_VERSION));
+    assert_eq!(status.event_count, 7);
+    assert_eq!(status.session_log_count, 1);
+
+    let sessions = query_sqlite_sessions(
+        &path,
+        &SqliteSessionQuery {
+            app_id: Some("cursor".to_string()),
+            actor_id: Some("agent-1".to_string()),
+            runtime_id: Some("runtime-1".to_string()),
+            limit: 20,
+        },
+    )
+    .expect("query sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, session_id.to_string());
+    assert_eq!(sessions[0].mission_ids, vec![mission_id.to_string()]);
+    assert_eq!(sessions[0].log_ref_ids, vec![log_ref_id.to_string()]);
+
+    let artifacts = query_sqlite_artifacts(
+        &path,
+        &SqliteArtifactQuery {
+            session_id: Some(session_id.to_string()),
+            mission_id: Some(mission_id.to_string()),
+            limit: 20,
+        },
+    )
+    .expect("query artifacts");
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].artifact_id, artifact_id.to_string());
+    assert_eq!(artifacts[0].artifact_kind.as_deref(), Some("review"));
+    assert_eq!(
+        artifacts[0].title.as_deref(),
+        Some("Use updated SQLite cache")
+    );
+    assert_eq!(artifacts[0].body.as_deref(), Some("Updated body"));
+    assert_eq!(
+        artifacts[0].file_paths,
+        vec!["crates/core/src/sqlite_index.rs".to_string()]
+    );
+    assert_eq!(artifacts[0].attachments.len(), 1);
+    assert_eq!(
+        artifacts[0].attachments[0].attachment_id,
+        attachment_id.to_string()
+    );
+    assert_eq!(artifacts[0].attachments[0].size_bytes, 5);
+    assert_eq!(
+        artifacts[0].attachments[0].content_type.as_deref(),
+        Some("text/plain")
+    );
+}

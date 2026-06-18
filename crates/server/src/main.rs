@@ -1,48 +1,37 @@
+//! Minimal self-hosted server entry point.
+//!
+//! The server now exposes a small append-only event sync surface while keeping
+//! auth, repo authorization, queue draining, and migrations for later phases.
+
 use anyhow::Result;
-use axum::{routing::get, Json, Router};
-use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use clap::Parser;
 
-#[derive(Debug, Parser)]
-#[command(name = "orgii-trace-server")]
-#[command(about = "Self-hosted ORGII Trace provenance server")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
+mod args;
+mod index;
+mod routes;
+mod store;
 
-#[derive(Debug, Subcommand)]
-enum Command {
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:7821")]
-        bind: String,
-    },
-    Migrate,
-    CreateAdmin,
-}
+use args::{Cli, Command};
+use index::{rebuild_server_index, server_index_status};
+use routes::serve;
+use store::ServerStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { bind } => serve(bind).await?,
+        Command::Serve { bind, data_dir } => serve(bind, ServerStore::new(data_dir)).await?,
+        Command::RebuildIndex { data_dir, repo_id } => {
+            let store = ServerStore::new(data_dir);
+            let events = store.read_events_for_repo(repo_id.as_deref())?;
+            let index = rebuild_server_index(repo_id.as_deref(), &events)?;
+            let status = server_index_status(repo_id.as_deref(), &index);
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         Command::Migrate => println!("migrate is not implemented yet"),
         Command::CreateAdmin => println!("create-admin is not implemented yet"),
     }
 
     Ok(())
-}
-
-async fn serve(bind: String) -> Result<()> {
-    let app = Router::new().route("/health", get(health));
-    let listener = TcpListener::bind(&bind).await?;
-    println!("orgii-trace-server listening on http://{bind}");
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true }))
 }

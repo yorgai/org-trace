@@ -1,5 +1,5 @@
 [package]
-name = "org-trace-core"
+name = "brick-core"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,7 +8,10 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-org-trace-protocol = { path = "../protocol" }
+brick-protocol = { path = "../protocol" }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+rusqlite.workspace = true
 uuid.workspace = true

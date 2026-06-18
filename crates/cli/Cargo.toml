@@ -1,5 +1,5 @@
 [package]
-name = "orgii-trace"
+name = "brick"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,6 +8,9 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-org-trace-core = { path = "../core" }
-org-trace-protocol = { path = "../protocol" }
+brick-core = { path = "../core" }
+brick-importers = { path = "../importers" }
+brick-protocol = { path = "../protocol" }
+chrono.workspace = true
 serde_json.workspace = true
+ureq = { version = "3.3.0", features = ["json"] }

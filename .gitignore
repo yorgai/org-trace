@@ -3,4 +3,6 @@
 .env
 .env.*
 !.env.example
-.orgii/provenance/cache
+.brick/
+*.local.md
+philosophy.md

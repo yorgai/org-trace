@@ -1,0 +1,168 @@
+//! Typed payloads for each provenance event family.
+//!
+//! `TraceEvent` stores payloads as JSON for append-only flexibility, but event
+//! constructors and index rebuilding use these structs so producers and
+//! consumers share the same schema.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ArtifactKind, AttachmentId, ContextMode, DiffFileChangeKind, DiffTarget, ExternalRefId,
+    FileRefId, LogRefId, RepoContextId,
+};
+
+/// Source-application identity for a canonical Brick session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionSource {
+    pub app_id: Option<String>,
+    pub app_session_id: Option<String>,
+    pub app_session_name: Option<String>,
+    pub runtime_id: Option<String>,
+}
+
+/// Payload recorded when a new Mission accountability container is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionCreatedPayload {
+    pub title: String,
+    pub description: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Partial update payload for Mission metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionUpdatedPayload {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload recorded when a canonical session begins or is first observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStartedPayload {
+    pub session_name: Option<String>,
+    pub source: SessionSource,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload for an explicit many-to-many Session ↔ Mission link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLinkedToMissionPayload {
+    pub relationship: String,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Declared format for uploaded session log content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLogFormat {
+    Text,
+    Jsonl,
+    Markdown,
+    Unknown,
+}
+
+/// Payload for content-addressed session log bytes captured outside artifact attachments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLogUploadedPayload {
+    pub log_ref_id: LogRefId,
+    pub original_path: String,
+    pub format: SessionLogFormat,
+    pub source: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub storage_uri: String,
+    pub local_path: String,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload for a reviewable output produced by a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactCreatedPayload {
+    pub artifact_kind: ArtifactKind,
+    pub title: String,
+    pub body: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Partial metadata update payload for an existing Artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactUpdatedPayload {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub artifact_kind: Option<ArtifactKind>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload for linking an existing Artifact to a Mission after capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactLinkedToMissionPayload {
+    pub relationship: String,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload for file-level artifact involvement without line-level attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactFileRefRecordedPayload {
+    pub file_ref_id: FileRefId,
+    pub path: String,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload for content-addressed file content attached to an Artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactAttachmentUploadedPayload {
+    pub attachment_id: AttachmentId,
+    pub name: String,
+    pub original_path: String,
+    pub content_type: Option<String>,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub storage_uri: String,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Git repository snapshot captured alongside write operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoContextCapturedPayload {
+    pub repo_root: String,
+    pub work_dir: String,
+    pub remote_url: Option<String>,
+    pub branch: Option<String>,
+    pub upstream_branch: Option<String>,
+    pub head_commit: Option<String>,
+    pub merge_base_commit: Option<String>,
+    pub dirty: bool,
+    pub context_mode: ContextMode,
+}
+
+/// Per-path summary for a captured diff without line-level blame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFileChange {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub change_kind: DiffFileChangeKind,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
+/// Payload for patch provenance captured as diff statistics and file summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffCapturedPayload {
+    pub diff_target: DiffTarget,
+    pub base_commit: Option<String>,
+    pub head_commit: Option<String>,
+    pub patch_id: Option<String>,
+    pub summary_hash: String,
+    pub file_changes: Vec<DiffFileChange>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Link from trace graph entities to external systems such as PRs or issues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRefLinkedPayload {
+    pub external_ref_id: ExternalRefId,
+    pub provider: String,
+    pub ref_type: String,
+    pub target: String,
+    pub repo_context_id: Option<RepoContextId>,
+}

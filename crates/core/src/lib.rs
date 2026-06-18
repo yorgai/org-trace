@@ -1,72 +1,46 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+//! Local-first storage, indexing, identity, and repository helpers.
+//!
+//! This crate owns local behavior only: JSONL queue writes, rebuildable cache
+//! indexes, Git context capture, and identity resolution. Server sync and auth
+//! should remain outside this crate until the local recorder is stable.
 
-use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
-use org_trace_protocol::TraceEvent;
+mod attachment_store;
+mod diff_capture;
+mod identity;
+mod index;
+mod index_types;
+mod log_store;
+mod repo;
+mod repo_context;
+mod session_query;
+mod source_profile;
+mod sqlite_index;
+#[cfg(test)]
+mod sqlite_index_tests;
+mod sqlite_schema;
+mod store;
+mod store_options;
 
-pub const PROVENANCE_DIR: &str = ".orgii/provenance";
+pub use attachment_store::*;
+pub use diff_capture::*;
+pub use identity::*;
+pub use index_types::*;
+pub use log_store::*;
+pub use repo::*;
+pub use repo_context::*;
+pub use session_query::*;
+pub use source_profile::*;
+pub use sqlite_index::*;
+pub use store::*;
+pub use store_options::*;
+
+pub const BRICK_DIR: &str = ".brick";
+pub const PROVENANCE_DIR: &str = ".brick/provenance";
 pub const QUEUE_DIR: &str = "queue";
 pub const EVENTS_DIR: &str = "events";
-
-#[derive(Debug, Clone)]
-pub struct LocalStore {
-    repo_root: PathBuf,
-}
-
-impl LocalStore {
-    pub fn new(repo_root: impl Into<PathBuf>) -> Self {
-        Self {
-            repo_root: repo_root.into(),
-        }
-    }
-
-    pub fn repo_root(&self) -> &Path {
-        &self.repo_root
-    }
-
-    pub fn provenance_dir(&self) -> PathBuf {
-        self.repo_root.join(PROVENANCE_DIR)
-    }
-
-    pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(self.provenance_dir().join(QUEUE_DIR))
-            .context("failed to create provenance queue directory")?;
-        fs::create_dir_all(self.provenance_dir().join(EVENTS_DIR))
-            .context("failed to create provenance events directory")?;
-        Ok(())
-    }
-
-    pub fn append_event(&self, event: &TraceEvent) -> Result<PathBuf> {
-        self.init()?;
-
-        let date = Utc::now().format("%Y-%m-%d");
-        let path = self.provenance_dir().join(QUEUE_DIR).join(format!("{date}.jsonl"));
-        let serialized = serde_json::to_string(event).context("failed to serialize trace event")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open event queue at {}", path.display()))?;
-        writeln!(file, "{serialized}").context("failed to append trace event")?;
-        Ok(path)
-    }
-}
-
-pub fn discover_repo_root(start: impl AsRef<Path>) -> Result<PathBuf> {
-    let mut current = start
-        .as_ref()
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", start.as_ref().display()))?;
-
-    loop {
-        if current.join(".git").exists() {
-            return Ok(current);
-        }
-
-        if !current.pop() {
-            return Err(anyhow!("no git repository found"));
-        }
-    }
-}
+pub const CACHE_DIR: &str = "cache";
+pub const BLOBS_DIR: &str = "blobs";
+pub const REPO_CONFIG_FILE: &str = "repo.json";
+pub const CURRENT_CONTEXT_FILE: &str = "current.json";
+pub const SOURCE_PROFILES_DIR: &str = "sources";
+pub const CURRENT_SOURCE_FILE: &str = "source-current.json";
