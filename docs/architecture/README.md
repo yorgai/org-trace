@@ -2,6 +2,8 @@
 
 Brick is a local-first provenance system with a small self-hosted sync surface. The MVP records accountable work as immutable events, derives query views from those events, and keeps local operation useful without a server.
 
+See `architecture.md` for the source metadata index architecture, naming glossary, and Mermaid diagrams. See `session-metadata.md` for the source-session metadata structure and per-source extraction map. See `source-querying.md` for platform-specific querying methods and history JSON contracts. See `orgtrack-core-offload.md` for the ORGII `orgtrack-core` migration inventory.
+
 ## Current phase status
 
 Phase 14 completes the MVP documentation and end-to-end smoke harness around the implemented surface:
@@ -9,7 +11,8 @@ Phase 14 completes the MVP documentation and end-to-end smoke harness around the
 - Local JSONL trace recording for missions, sessions, artifacts, repo contexts, diffs, logs, and imports.
 - Source profiles for stable app/actor defaults and optional store-root selection.
 - Content-addressed blob storage for artifact attachments and session logs.
-- Rebuildable JSON and SQLite local indexes for read-only inspection.
+- Rebuildable JSON and SQLite local derived indexes for read-only inspection.
+- Global source metadata index under `<BRICK_HOME>/metadata.sqlite` for external history metadata.
 - Explicit-file importers for Cursor, Codex, Claude Code, and CI summaries.
 - Unauthenticated self-hosted append-only event sync with repo-scoped routes.
 - Server rebuild-on-read status and session query endpoints.
@@ -65,7 +68,7 @@ Old recorder-shaped commands such as top-level `diff capture`, `artifact upload`
 
 ### `brick-core`
 
-`brick-core` owns local storage, source profile files, repo context capture, diff summarization, blob stores, JSON index rebuilds, SQLite rebuilds, and sync-oriented deduplication. The append-only event stream remains authoritative; `index.json` and `brick.sqlite` are disposable caches.
+`brick-core` owns local storage, source profile files, repo context capture, diff summarization, blob stores, source metadata indexing, JSON index rebuilds, SQLite rebuilds, and sync-oriented deduplication. The append-only event stream remains authoritative; `index.json` and `brick.sqlite` are disposable derived indexes. `<BRICK_HOME>/metadata.sqlite` is the source metadata index for external history; it is not a transcript store or a second cache layer.
 
 Storage root resolution order:
 

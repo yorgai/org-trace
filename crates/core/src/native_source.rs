@@ -1,8 +1,7 @@
-//! Read-only listing of native agent session files referenced by source profiles.
+//! Generic read-only listing for native session files.
 //!
-//! Native import starts from pointers to external stores. This module only
-//! enumerates files and metadata; copying transcript bytes remains an explicit
-//! evidence action.
+//! App-specific metadata extraction lives under `sources/*`. This module is the
+//! fallback file enumerator and shared session DTO/builder for providers.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +13,7 @@ use crate::SourceProfile;
 
 const DEFAULT_NATIVE_SESSION_LIMIT: usize = 50;
 const MAX_NATIVE_SCAN_ENTRIES: usize = 10_000;
+pub(crate) const GENERIC_NATIVE_FILE_PARSER_VERSION: &str = "native-file-v1";
 
 /// Metadata for an external source session that can be imported into Brick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,12 +24,49 @@ pub struct NativeSourceSession {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub modified_at: Option<SystemTime>,
+    pub parser_version: String,
+    pub session_created_at: Option<SystemTime>,
+    pub session_updated_at: Option<SystemTime>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub repo_path: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files: Vec<String>,
 }
 
-/// Returns recent native source sessions discovered from a source profile.
+#[derive(Debug, Default)]
+pub(crate) struct NativeSessionMetadata {
+    pub title: Option<String>,
+    pub parser_version: Option<String>,
+    pub session_created_at: Option<SystemTime>,
+    pub session_updated_at: Option<SystemTime>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub repo_path: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files: Vec<String>,
+}
+
+/// Returns recent generic native source sessions discovered from a source profile.
 pub fn list_native_source_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+) -> Result<Vec<NativeSourceSession>> {
+    list_file_source_sessions(profile, limit, |_| Ok(NativeSessionMetadata::default()))
+}
+
+pub(crate) fn list_file_source_sessions(
+    profile: &SourceProfile,
+    limit: Option<usize>,
+    extract: impl Fn(&Path) -> Result<NativeSessionMetadata>,
 ) -> Result<Vec<NativeSourceSession>> {
     let scan_limit = limit.unwrap_or(DEFAULT_NATIVE_SESSION_LIMIT);
     let mut roots = Vec::new();
@@ -46,7 +83,7 @@ pub fn list_native_source_sessions(
         .unwrap_or_else(|| profile.name.clone());
     let mut sessions = Vec::new();
     for root in roots {
-        collect_session_files(&root, &app_id, &mut sessions)?;
+        collect_session_files(&root, &app_id, &extract, &mut sessions)?;
         if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
             break;
         }
@@ -61,6 +98,7 @@ pub fn list_native_source_sessions(
 fn collect_session_files(
     root: &Path,
     app_id: &str,
+    extract: &impl Fn(&Path) -> Result<NativeSessionMetadata>,
     sessions: &mut Vec<NativeSourceSession>,
 ) -> Result<()> {
     if !root.exists() {
@@ -68,7 +106,7 @@ fn collect_session_files(
     }
     if root.is_file() {
         if is_supported_session_file(root) {
-            sessions.push(session_from_path(root, app_id)?);
+            sessions.push(session_from_path(root, app_id, extract)?);
         }
         return Ok(());
     }
@@ -96,7 +134,7 @@ fn collect_session_files(
             if !is_supported_session_file(&path) {
                 continue;
             }
-            sessions.push(session_from_path(&path, app_id)?);
+            sessions.push(session_from_path(&path, app_id, extract)?);
             if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
                 return Ok(());
             }
@@ -115,8 +153,12 @@ fn is_supported_session_file(path: &Path) -> bool {
     )
 }
 
-fn session_from_path(path: &Path, app_id: &str) -> Result<NativeSourceSession> {
-    let metadata = fs::metadata(path).with_context(|| {
+fn session_from_path(
+    path: &Path,
+    app_id: &str,
+    extract: &impl Fn(&Path) -> Result<NativeSessionMetadata>,
+) -> Result<NativeSourceSession> {
+    let file_metadata = fs::metadata(path).with_context(|| {
         format!(
             "failed to read native source metadata for {}",
             path.display()
@@ -127,13 +169,31 @@ fn session_from_path(path: &Path, app_id: &str) -> Result<NativeSourceSession> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("session")
         .to_string();
+    let extracted = extract(path)?;
+    let title = extracted
+        .title
+        .unwrap_or_else(|| external_session_id.clone());
     Ok(NativeSourceSession {
-        title: Some(external_session_id.clone()),
+        title: Some(title),
         external_session_id,
         source_app_id: app_id.to_string(),
         path: path.to_path_buf(),
-        size_bytes: metadata.len(),
-        modified_at: metadata.modified().ok(),
+        size_bytes: file_metadata.len(),
+        modified_at: file_metadata.modified().ok(),
+        parser_version: extracted
+            .parser_version
+            .unwrap_or_else(|| GENERIC_NATIVE_FILE_PARSER_VERSION.to_string()),
+        session_created_at: extracted.session_created_at,
+        session_updated_at: extracted.session_updated_at,
+        model: extracted.model,
+        input_tokens: extracted.input_tokens,
+        output_tokens: extracted.output_tokens,
+        repo_path: extracted.repo_path,
+        branch: extracted.branch,
+        files_changed: extracted.files_changed,
+        lines_added: extracted.lines_added,
+        lines_removed: extracted.lines_removed,
+        touched_files: extracted.touched_files,
     })
 }
 
@@ -142,6 +202,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use brick_protocol::ActorType;
 
     fn temp_source_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -163,10 +224,10 @@ mod tests {
         fs::write(nested.join("ignore.bin"), "ignored").expect("write ignored file");
 
         let profile = SourceProfile {
-            name: "claude_code".to_string(),
-            app_id: Some("claude_code".to_string()),
+            name: "generic".to_string(),
+            app_id: Some("generic".to_string()),
             actor_id: None,
-            actor_type: None,
+            actor_type: Some(ActorType::Agent),
             store_root: None,
             session_db_path: None,
             session_log_path: Some(root.join("projects")),
@@ -180,5 +241,9 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].external_session_id, "abc");
         assert_eq!(sessions[0].path, transcript_path);
+        assert_eq!(
+            sessions[0].parser_version,
+            GENERIC_NATIVE_FILE_PARSER_VERSION
+        );
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! The database lives at `<BRICK_HOME>/metadata.sqlite` and is independent from
 //! the repo-local JSONL provenance queue. Version mismatches reset the first-stage
-//! schema because these tables are metadata/cache scaffolding, not the durable
+//! schema because these tables are source metadata index scaffolding, not the durable
 //! provenance source of truth.
 
 use std::path::{Path, PathBuf};
@@ -41,6 +41,18 @@ pub struct SourceSessionUpsert {
     pub source_size: Option<u64>,
     pub source_fingerprint: Option<String>,
     pub parser_version: Option<String>,
+    pub session_created_at: Option<DateTime<Utc>>,
+    pub session_updated_at: Option<DateTime<Utc>>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub repo_path: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files_json: Option<Value>,
+    pub listable: bool,
     pub discovered_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub metadata_json: Option<Value>,
@@ -59,6 +71,18 @@ pub struct SourceSessionRecord {
     pub source_size: Option<u64>,
     pub source_fingerprint: Option<String>,
     pub parser_version: Option<String>,
+    pub session_created_at: Option<DateTime<Utc>>,
+    pub session_updated_at: Option<DateTime<Utc>>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub repo_path: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files_json: Option<Value>,
+    pub listable: bool,
     pub discovered_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -71,6 +95,7 @@ pub struct SourceSessionRecord {
 pub struct SourceSessionListQuery {
     pub source_id: Option<String>,
     pub limit: usize,
+    pub offset: usize,
 }
 
 impl MetadataDb {
@@ -124,13 +149,16 @@ impl MetadataDb {
             .transaction()
             .context("failed to start metadata source-session upsert")?;
         let now = Utc::now();
+        let touched_files_json = serialize_metadata_json(session.touched_files_json.as_ref())?;
         let metadata_json = serialize_metadata_json(session.metadata_json.as_ref())?;
         transaction.execute(
             "INSERT INTO source_sessions (
                 source_id, external_session_id, title, name, source_path, source_uri,
                 source_mtime, source_size, source_fingerprint, parser_version,
+                session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                files_changed, lines_added, lines_removed, touched_files_json, listable,
                 discovered_at, last_seen_at, created_at, updated_at, metadata_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
              ON CONFLICT(source_id, external_session_id) DO UPDATE SET
                 title = excluded.title,
                 name = excluded.name,
@@ -140,6 +168,18 @@ impl MetadataDb {
                 source_size = excluded.source_size,
                 source_fingerprint = excluded.source_fingerprint,
                 parser_version = excluded.parser_version,
+                session_created_at = excluded.session_created_at,
+                session_updated_at = excluded.session_updated_at,
+                model = excluded.model,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                repo_path = excluded.repo_path,
+                branch = excluded.branch,
+                files_changed = excluded.files_changed,
+                lines_added = excluded.lines_added,
+                lines_removed = excluded.lines_removed,
+                touched_files_json = excluded.touched_files_json,
+                listable = excluded.listable,
                 discovered_at = excluded.discovered_at,
                 last_seen_at = excluded.last_seen_at,
                 updated_at = excluded.updated_at,
@@ -158,6 +198,21 @@ impl MetadataDb {
                 optional_u64_to_i64(session.source_size)?,
                 session.source_fingerprint,
                 session.parser_version,
+                session.session_created_at.map(|value| value.to_rfc3339()),
+                session.session_updated_at.map(|value| value.to_rfc3339()),
+                session.model,
+                optional_u64_to_i64(session.input_tokens)?,
+                optional_u64_to_i64(session.output_tokens)?,
+                session
+                    .repo_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                session.branch,
+                optional_u64_to_i64(session.files_changed)?,
+                optional_u64_to_i64(session.lines_added)?,
+                optional_u64_to_i64(session.lines_removed)?,
+                touched_files_json,
+                session.listable,
                 session.discovered_at.to_rfc3339(),
                 session.last_seen_at.to_rfc3339(),
                 now.to_rfc3339(),
@@ -182,21 +237,37 @@ impl MetadataDb {
         query: &SourceSessionListQuery,
     ) -> Result<Vec<SourceSessionRecord>> {
         let limit = normalized_limit(query.limit);
+        let offset = normalized_offset(query.offset);
         let mut statement = self.connection.prepare(
             "SELECT source_id, external_session_id, title, name, source_path, source_uri,
                     source_mtime, source_size, source_fingerprint, parser_version,
+                    session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                    files_changed, lines_added, lines_removed, touched_files_json, listable,
                     discovered_at, last_seen_at, created_at, updated_at, metadata_json
              FROM source_sessions
              WHERE (?1 IS NULL OR source_id = ?1)
              ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC
-             LIMIT ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = statement.query_map(params![query.source_id, limit], source_session_from_row)?;
+        let rows = statement.query_map(
+            params![query.source_id, limit, offset],
+            source_session_from_row,
+        )?;
         let mut records = Vec::new();
         for row in rows {
             records.push(row.context("failed to read metadata source-session row")?);
         }
         Ok(records)
+    }
+
+    /// Counts source-session rows matching an optional source filter.
+    pub fn count_source_sessions(&self, source_id: Option<&str>) -> Result<usize> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM source_sessions WHERE (?1 IS NULL OR source_id = ?1)",
+            params![source_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        usize::try_from(count).context("metadata source-session count exceeds usize")
     }
 }
 
@@ -262,6 +333,18 @@ fn create_schema(connection: &Connection) -> Result<()> {
              source_size INTEGER,
              source_fingerprint TEXT,
              parser_version TEXT,
+             session_created_at TEXT,
+             session_updated_at TEXT,
+             model TEXT,
+             input_tokens INTEGER,
+             output_tokens INTEGER,
+             repo_path TEXT,
+             branch TEXT,
+             files_changed INTEGER,
+             lines_added INTEGER,
+             lines_removed INTEGER,
+             touched_files_json TEXT,
+             listable INTEGER NOT NULL DEFAULT 1,
              discovered_at TEXT NOT NULL,
              last_seen_at TEXT NOT NULL,
              created_at TEXT NOT NULL,
@@ -318,6 +401,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_source_sessions_source ON source_sessions(source_id, last_seen_at);
          CREATE INDEX IF NOT EXISTS idx_source_sessions_path ON source_sessions(source_path);
+         CREATE INDEX IF NOT EXISTS idx_source_sessions_repo_path ON source_sessions(source_id, repo_path);
          CREATE INDEX IF NOT EXISTS idx_source_sessions_fingerprint ON source_sessions(source_fingerprint);",
     )?;
     upsert_metadata(
@@ -402,6 +486,8 @@ fn read_source_session(
         .query_row(
             "SELECT source_id, external_session_id, title, name, source_path, source_uri,
                     source_mtime, source_size, source_fingerprint, parser_version,
+                    session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                    files_changed, lines_added, lines_removed, touched_files_json, listable,
                     discovered_at, last_seen_at, created_at, updated_at, metadata_json
              FROM source_sessions
              WHERE source_id = ?1 AND external_session_id = ?2",
@@ -416,11 +502,20 @@ fn source_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSe
     let source_path: Option<String> = row.get(4)?;
     let source_mtime: Option<String> = row.get(6)?;
     let source_size: Option<i64> = row.get(7)?;
-    let discovered_at: String = row.get(10)?;
-    let last_seen_at: String = row.get(11)?;
-    let created_at: String = row.get(12)?;
-    let updated_at: String = row.get(13)?;
-    let metadata_json: Option<String> = row.get(14)?;
+    let session_created_at: Option<String> = row.get(10)?;
+    let session_updated_at: Option<String> = row.get(11)?;
+    let input_tokens: Option<i64> = row.get(13)?;
+    let output_tokens: Option<i64> = row.get(14)?;
+    let repo_path: Option<String> = row.get(15)?;
+    let files_changed: Option<i64> = row.get(17)?;
+    let lines_added: Option<i64> = row.get(18)?;
+    let lines_removed: Option<i64> = row.get(19)?;
+    let touched_files_json: Option<String> = row.get(20)?;
+    let discovered_at: String = row.get(22)?;
+    let last_seen_at: String = row.get(23)?;
+    let created_at: String = row.get(24)?;
+    let updated_at: String = row.get(25)?;
+    let metadata_json: Option<String> = row.get(26)?;
     Ok(SourceSessionRecord {
         source_id: row.get(0)?,
         external_session_id: row.get(1)?,
@@ -432,6 +527,18 @@ fn source_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSe
         source_size: optional_i64_to_u64(source_size)?,
         source_fingerprint: row.get(8)?,
         parser_version: row.get(9)?,
+        session_created_at: parse_optional_datetime(session_created_at)?,
+        session_updated_at: parse_optional_datetime(session_updated_at)?,
+        model: row.get(12)?,
+        input_tokens: optional_i64_to_u64(input_tokens)?,
+        output_tokens: optional_i64_to_u64(output_tokens)?,
+        repo_path: repo_path.map(PathBuf::from),
+        branch: row.get(16)?,
+        files_changed: optional_i64_to_u64(files_changed)?,
+        lines_added: optional_i64_to_u64(lines_added)?,
+        lines_removed: optional_i64_to_u64(lines_removed)?,
+        touched_files_json: parse_metadata_json(touched_files_json)?,
+        listable: row.get(21)?,
         discovered_at: parse_datetime(discovered_at)?,
         last_seen_at: parse_datetime(last_seen_at)?,
         created_at: parse_datetime(created_at)?,
@@ -501,9 +608,14 @@ fn normalized_limit(limit: usize) -> i64 {
     }
 }
 
+fn normalized_offset(offset: usize) -> i64 {
+    i64::try_from(offset).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -545,6 +657,18 @@ mod tests {
             source_size: Some(42),
             source_fingerprint: Some(TEST_SOURCE_FINGERPRINT.to_string()),
             parser_version: Some(TEST_PARSER_VERSION.to_string()),
+            session_created_at: Some(discovered_at),
+            session_updated_at: Some(last_seen_at),
+            model: Some("model-a".to_string()),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            repo_path: Some(PathBuf::from("/tmp/repo")),
+            branch: Some("main".to_string()),
+            files_changed: Some(2),
+            lines_added: Some(3),
+            lines_removed: Some(4),
+            touched_files_json: Some(json!(["src/lib.rs", "README.md"])),
+            listable: true,
             discovered_at,
             last_seen_at,
             metadata_json: Some(json!({ "phase": "first-slice" })),
@@ -574,6 +698,20 @@ mod tests {
             .expect("insert source session");
         assert_eq!(inserted.title.as_deref(), Some("Original title"));
         assert_eq!(inserted.source_size, Some(42));
+        assert_eq!(inserted.session_created_at, inserted.source_mtime);
+        assert_eq!(inserted.model.as_deref(), Some("model-a"));
+        assert_eq!(inserted.input_tokens, Some(10));
+        assert_eq!(inserted.output_tokens, Some(20));
+        assert_eq!(inserted.repo_path.as_deref(), Some(Path::new("/tmp/repo")));
+        assert_eq!(inserted.branch.as_deref(), Some("main"));
+        assert_eq!(inserted.files_changed, Some(2));
+        assert_eq!(inserted.lines_added, Some(3));
+        assert_eq!(inserted.lines_removed, Some(4));
+        assert_eq!(
+            inserted.touched_files_json,
+            Some(json!(["src/lib.rs", "README.md"]))
+        );
+        assert!(inserted.listable);
         assert_eq!(
             inserted.metadata_json,
             Some(json!({ "phase": "first-slice" }))
@@ -593,6 +731,7 @@ mod tests {
             .list_source_sessions(&SourceSessionListQuery {
                 source_id: Some(TEST_SOURCE_ID.to_string()),
                 limit: 10,
+                offset: 0,
             })
             .expect("list source sessions");
         assert_eq!(sessions.len(), 1);
@@ -600,6 +739,11 @@ mod tests {
         assert_eq!(
             sessions[0].parser_version.as_deref(),
             Some(TEST_PARSER_VERSION)
+        );
+        assert_eq!(
+            db.count_source_sessions(Some(TEST_SOURCE_ID))
+                .expect("count source sessions"),
+            1
         );
     }
 

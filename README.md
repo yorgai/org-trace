@@ -6,7 +6,7 @@ The name points at a durable unit of accountable work: like historical bricks si
 
 ## Status
 
-Brick is at an MVP phase for local-first trace capture plus unauthenticated self-hosted sync. The local JSONL event log remains the source of truth; JSON and SQLite indexes are rebuildable caches. The server is suitable for localhost and lab use only until authentication and repo authorization are added.
+Brick is at an MVP phase for local-first trace capture plus unauthenticated self-hosted sync. The local JSONL event log remains the source of truth; JSON and SQLite projections are rebuildable derived indexes. The server is suitable for localhost and lab use only until authentication and repo authorization are added.
 
 ## Packages
 
@@ -40,7 +40,7 @@ cargo run -p brick -- --source claude_code import native list --limit 20
 cargo run -p brick -- --source claude_code import native ingest --external-session-id <native-id> --mission "$mission_id"
 ```
 
-The read-only history surface emits JSON for ORGII-style callers:
+The read-through history surface refreshes native source metadata into `<BRICK_HOME>/metadata.sqlite` and emits JSON for ORGII-style callers:
 
 ```bash
 cargo run -q -p brick -- history sources --format json
@@ -107,7 +107,7 @@ Set `BRICK_SMOKE_PORT` if the default local port is busy.
 
 ## Product model
 
-Humans manage Missions. A Mission is the accountability unit that replaces a task or work item: it carries the title, specification, status, project grouping, linked sessions, artifacts, and proof of work.
+Humans and agent manage Missions together. A Mission is the accountability unit that replaces a task or work item: it carries the title, specification, status, project grouping, linked sessions, artifacts, and proof of work.
 
 Sessions are evidence attached to Missions. A Session may be produced by an agent or by a human. Human sessions can record manual work, design review, meetings, QA passes, or operational activity. The lightweight Session metadata is synced by default: source app, actor, timestamps, linked artifacts, linked missions, transcript availability, and last update time. Full transcripts or recordings are optional content-addressed evidence.
 
@@ -119,10 +119,14 @@ Local writes use append-only JSONL under `.brick/provenance/` by default. `brick
 
 Repo-level behavior lives in `.brick/config.toml`; source-specific paths live in `.brick/sources/<name>.toml`. `brick init` and `brick source scan` discover common external stores such as `~/.orgii`, ORGII `sessions.db`, Cursor `state.vscdb`, Claude Code `~/.claude/projects`, Codex `sessions/`, and OpenCode `opencode.db`. Local Brick events default to metadata-only pointers with hashes, sizes, source paths, and availability. Full transcript or recording bytes are copied into local content-addressed blobs only when `--copy` is passed or the config/source profile opts into `default_full_evidence_upload = true`.
 
-`index.json`, `brick.sqlite`, and `views/` are derived caches under the effective store. Rebuilding them never mutates the source event log. `views/` contains agent-readable Markdown files for orgs, projects, missions, sessions, and artifacts. Pull writes remote events to separate inbound logs and deduplicates them by event ID when rebuilding indexes.
+`index.json`, `brick.sqlite`, and `views/` are derived indexes under the effective store. Rebuilding them never mutates the source event log. `views/` contains agent-readable Markdown files for orgs, projects, missions, sessions, and artifacts. Pull writes remote events to separate inbound logs and deduplicates them by event ID when rebuilding indexes.
+
+Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `brick history sessions`, `brick history recent-paths`, and `brick import native list/ingest` refresh native source-session rows into that metadata index before returning results.
 
 ## Documentation
 
+- `docs/architecture/architecture.md`: source metadata index architecture and Mermaid diagrams
+- `docs/architecture/source-querying.md`: platform-specific querying methods and history JSON contracts
 - `docs/architecture/README.md`: current architecture and phase status
 - `docs/protocol/README.md`: event families, envelope fields, sync routes, and query routes
 - `docs/self-hosting/README.md`: local server operation, push/pull, repo IDs, and Cursor notes
@@ -136,6 +140,19 @@ cargo check --workspace
 cargo test --workspace
 cargo doc --workspace --no-deps
 ```
+
+### Local React lab UI
+
+`apps/lab-ui` is a small Vite/React dashboard for exercising the localhost server routes while developing Brick features.
+
+```bash
+cargo run -p brick-server -- serve --bind 127.0.0.1:7821 --data-dir .brick-server
+cd apps/lab-ui
+npm install
+npm run dev
+```
+
+Open <http://127.0.0.1:5454>. The UI proxies `/api/*` to `http://127.0.0.1:7821` by default.
 
 ## License
 

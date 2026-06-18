@@ -6,8 +6,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use brick_core::{
-    capture_diff, capture_repo_context, list_native_source_sessions, BrickConfig,
-    DiffCaptureRequest, LocalStore, NativeSourceSession, SourceProfile,
+    capture_diff, capture_repo_context, list_source_sessions, BrickConfig, DiffCaptureRequest,
+    LocalStore, MetadataDb, NativeSourceSession, SourceProfile, SourceSessionUpsert,
 };
 use brick_importers::{import_traces, ImportRequest, ImportSource};
 use brick_protocol::{
@@ -19,6 +19,8 @@ use brick_protocol::{
     SessionLinkedToMissionPayload, SessionLogFormat, SessionLogUploadedPayload,
     SessionStartedPayload, TraceEvent,
 };
+use chrono::{DateTime, Utc};
+use serde_json::json;
 
 use crate::args::{
     AgentImportArgs, ArtifactCommand, ArtifactKindArg, CiImportArgs, DiffTargetArg,
@@ -558,7 +560,8 @@ fn handle_native_import(
     })?;
     match command {
         NativeImportCommand::List(args) => {
-            let sessions = list_native_source_sessions(profile, Some(args.limit))?;
+            let sessions = list_source_sessions(profile, Some(args.limit))?;
+            index_native_source_sessions(profile, sessions.iter())?;
             println!("native_session_count={}", sessions.len());
             for session in sessions {
                 print_native_source_session(&session);
@@ -566,7 +569,7 @@ fn handle_native_import(
             Ok(())
         }
         NativeImportCommand::Ingest(args) => {
-            let session = list_native_source_sessions(profile, None)?
+            let session = list_source_sessions(profile, None)?
                 .into_iter()
                 .find(|session| session.external_session_id == args.external_session_id)
                 .ok_or_else(|| {
@@ -575,6 +578,7 @@ fn handle_native_import(
                         args.external_session_id
                     )
                 })?;
+            index_native_source_sessions(profile, std::iter::once(&session))?;
             let requested_session_id =
                 parse_optional_id::<SessionId>(args.session.as_deref(), "session")?;
             let native_session_id = requested_session_id.unwrap_or_default();
@@ -630,6 +634,56 @@ fn handle_native_import(
             println!("path={}", session.path.display());
             Ok(())
         }
+    }
+}
+
+fn index_native_source_sessions<'a>(
+    profile: &SourceProfile,
+    sessions: impl IntoIterator<Item = &'a NativeSourceSession>,
+) -> Result<()> {
+    let mut metadata_db = MetadataDb::open_global()?;
+    for session in sessions {
+        metadata_db.upsert_source_session(&native_source_session_upsert(profile, session))?;
+    }
+    Ok(())
+}
+
+fn native_source_session_upsert(
+    profile: &SourceProfile,
+    session: &NativeSourceSession,
+) -> SourceSessionUpsert {
+    let now = Utc::now();
+    let source_mtime = session.modified_at.map(DateTime::<Utc>::from);
+    SourceSessionUpsert {
+        source_id: profile.name.clone(),
+        external_session_id: session.external_session_id.clone(),
+        title: session.title.clone(),
+        name: session.title.clone(),
+        source_path: Some(session.path.clone()),
+        source_uri: Some(format!("file://{}", session.path.display())),
+        source_mtime,
+        source_size: Some(session.size_bytes),
+        source_fingerprint: None,
+        parser_version: Some(session.parser_version.clone()),
+        session_created_at: session.session_created_at.map(DateTime::<Utc>::from),
+        session_updated_at: session.session_updated_at.map(DateTime::<Utc>::from),
+        model: session.model.clone(),
+        input_tokens: session.input_tokens,
+        output_tokens: session.output_tokens,
+        repo_path: session.repo_path.clone(),
+        branch: session.branch.clone(),
+        files_changed: session.files_changed,
+        lines_added: session.lines_added,
+        lines_removed: session.lines_removed,
+        touched_files_json: Some(json!(session.touched_files)),
+        listable: true,
+        discovered_at: now,
+        last_seen_at: session
+            .session_updated_at
+            .map(DateTime::<Utc>::from)
+            .or(source_mtime)
+            .unwrap_or(now),
+        metadata_json: Some(json!({ "app_id": session.source_app_id })),
     }
 }
 

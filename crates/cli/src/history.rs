@@ -5,15 +5,19 @@
 //! listings into stable JSON DTOs that can be consumed by ORGII-style callers.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use brick_core::{
-    list_native_source_sessions, NativeSourceSession, SourceProfile, SourceProfileStore,
+    list_source_sessions, MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore,
+    SourceSessionListQuery, SourceSessionRecord, SourceSessionUpsert,
 };
 use brick_protocol::ActorType;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::{json, Value};
 
 use crate::args::{HistoryCommand, HistoryFormatArg};
 
@@ -57,6 +61,18 @@ pub struct HistorySessionRow {
     pub path: String,
     pub size_bytes: u64,
     pub modified_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -111,7 +127,18 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
         } => {
             ensure_json(format);
             let profile = read_profile(profiles, &source)?;
-            print_json(&build_sessions_response(&profile, limit, offset)?)
+            let mut metadata_db = MetadataDb::open_global()?;
+            refresh_profiles_to_metadata(
+                &mut metadata_db,
+                std::slice::from_ref(&profile),
+                offset.saturating_add(limit).saturating_add(1),
+            )?;
+            print_json(&build_sessions_response(
+                &metadata_db,
+                &profile,
+                limit,
+                offset,
+            )?)
         }
         HistoryCommand::RecentPaths {
             source,
@@ -125,7 +152,10 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
             } else {
                 vec![read_profile(profiles, &source)?]
             };
+            let mut metadata_db = MetadataDb::open_global()?;
+            refresh_profiles_to_metadata(&mut metadata_db, &selected_profiles, limit)?;
             print_json(&build_recent_paths_response(
+                &metadata_db,
                 source_label,
                 &selected_profiles,
                 limit,
@@ -158,20 +188,19 @@ fn build_sources_response(profiles: &SourceProfileStore) -> Result<HistorySource
 }
 
 fn build_sessions_response(
+    metadata_db: &MetadataDb,
     profile: &SourceProfile,
     limit: usize,
     offset: usize,
 ) -> Result<HistorySessionsResponse> {
-    let scan_limit = offset.saturating_add(limit).saturating_add(1);
-    let sessions = list_native_source_sessions(profile, Some(scan_limit))?;
-    let total = sessions.len();
-    let has_more = total > offset.saturating_add(limit);
-    let sessions = sessions
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|session| session_row(&profile.name, session))
-        .collect();
+    let records = metadata_db.list_source_sessions(&SourceSessionListQuery {
+        source_id: Some(profile.name.clone()),
+        limit,
+        offset,
+    })?;
+    let total = metadata_db.count_source_sessions(Some(&profile.name))?;
+    let sessions = records.into_iter().map(session_row).collect::<Vec<_>>();
+    let has_more = offset.saturating_add(sessions.len()) < total;
     Ok(HistorySessionsResponse {
         source_id: profile.name.clone(),
         limit,
@@ -183,20 +212,30 @@ fn build_sessions_response(
 }
 
 fn build_recent_paths_response(
+    metadata_db: &MetadataDb,
     source_id: String,
     profiles: &[SourceProfile],
     limit: usize,
 ) -> Result<HistoryRecentPathsResponse> {
-    let mut paths = Vec::new();
-    for profile in profiles {
-        paths.extend(
-            list_native_source_sessions(profile, Some(limit))?
-                .into_iter()
-                .map(|session| recent_path_row(&profile.name, session)),
-        );
-    }
-    paths.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
-    paths.truncate(limit);
+    let query_source = if source_id == "all" {
+        None
+    } else {
+        Some(source_id.clone())
+    };
+    let configured_sources = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect::<Vec<_>>();
+    let paths = metadata_db
+        .list_source_sessions(&SourceSessionListQuery {
+            source_id: query_source,
+            limit,
+            offset: 0,
+        })?
+        .into_iter()
+        .filter(|record| configured_sources.contains(&record.source_id.as_str()))
+        .map(recent_path_row)
+        .collect();
     Ok(HistoryRecentPathsResponse {
         source_id,
         limit,
@@ -223,28 +262,146 @@ fn source_row(profile: SourceProfile, selected: Option<&str>) -> HistorySourceRo
     }
 }
 
-fn session_row(source_id: &str, session: NativeSourceSession) -> HistorySessionRow {
-    HistorySessionRow {
+fn refresh_profiles_to_metadata(
+    metadata_db: &mut MetadataDb,
+    profiles: &[SourceProfile],
+    limit: usize,
+) -> Result<()> {
+    for profile in profiles {
+        for session in list_source_sessions(profile, Some(limit))? {
+            let upsert = source_session_upsert(&profile.name, session);
+            metadata_db.upsert_source_session(&upsert)?;
+        }
+    }
+    Ok(())
+}
+
+fn source_session_upsert(source_id: &str, session: NativeSourceSession) -> SourceSessionUpsert {
+    let now = Utc::now();
+    let source_mtime = session.modified_at.map(system_time_to_utc);
+    SourceSessionUpsert {
         source_id: source_id.to_string(),
-        app_id: session.source_app_id,
-        session_id: session.external_session_id.clone(),
         external_session_id: session.external_session_id,
-        title: session.title,
-        path: session.path.display().to_string(),
-        size_bytes: session.size_bytes,
-        modified_at: session.modified_at.and_then(format_system_time),
+        title: session.title.clone(),
+        name: session.title,
+        source_path: Some(session.path.clone()),
+        source_uri: Some(format!("file://{}", session.path.display())),
+        source_mtime,
+        source_size: Some(session.size_bytes),
+        source_fingerprint: None,
+        parser_version: Some(session.parser_version),
+        session_created_at: session.session_created_at.map(system_time_to_utc),
+        session_updated_at: session.session_updated_at.map(system_time_to_utc),
+        model: session.model,
+        input_tokens: session.input_tokens,
+        output_tokens: session.output_tokens,
+        repo_path: session.repo_path,
+        branch: session.branch,
+        files_changed: session.files_changed,
+        lines_added: session.lines_added,
+        lines_removed: session.lines_removed,
+        touched_files_json: Some(json!(session.touched_files)),
+        listable: true,
+        discovered_at: now,
+        last_seen_at: session
+            .session_updated_at
+            .map(system_time_to_utc)
+            .or(source_mtime)
+            .unwrap_or(now),
+        metadata_json: Some(json!({ "app_id": session.source_app_id })),
     }
 }
 
-fn recent_path_row(source_id: &str, session: NativeSourceSession) -> HistoryRecentPathRow {
+fn session_row(record: SourceSessionRecord) -> HistorySessionRow {
+    let app_id = app_id_from_metadata(&record);
+    let path = source_path_display(&record);
+    let repo_path = record
+        .repo_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let touched_files = touched_files_from_record(&record);
+    let total_tokens = total_tokens(record.input_tokens, record.output_tokens);
+    HistorySessionRow {
+        source_id: record.source_id.clone(),
+        app_id,
+        session_id: record.external_session_id.clone(),
+        external_session_id: record.external_session_id,
+        title: record.title,
+        path,
+        size_bytes: record.source_size.unwrap_or_default(),
+        modified_at: record.source_mtime.map(|time| time.to_rfc3339()),
+        created_at: record.session_created_at.map(|time| time.to_rfc3339()),
+        updated_at: record.session_updated_at.map(|time| time.to_rfc3339()),
+        model: record.model,
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        total_tokens,
+        repo_path,
+        branch: record.branch,
+        files_changed: record.files_changed,
+        lines_added: record.lines_added,
+        lines_removed: record.lines_removed,
+        touched_files,
+    }
+}
+
+fn recent_path_row(record: SourceSessionRecord) -> HistoryRecentPathRow {
+    let app_id = app_id_from_metadata(&record);
+    let path = source_path_display(&record);
     HistoryRecentPathRow {
-        source_id: source_id.to_string(),
-        app_id: session.source_app_id,
-        session_id: session.external_session_id,
-        path: session.path.display().to_string(),
-        title: session.title,
-        size_bytes: session.size_bytes,
-        modified_at: session.modified_at.and_then(format_system_time),
+        source_id: record.source_id.clone(),
+        app_id,
+        session_id: record.external_session_id,
+        path,
+        title: record.title,
+        size_bytes: record.source_size.unwrap_or_default(),
+        modified_at: record.source_mtime.map(|time| time.to_rfc3339()),
+    }
+}
+
+fn source_path_display(record: &SourceSessionRecord) -> String {
+    record
+        .source_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| record.source_uri.clone())
+        .unwrap_or_default()
+}
+
+fn app_id_from_metadata(record: &SourceSessionRecord) -> String {
+    record
+        .metadata_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("app_id"))
+        .and_then(Value::as_str)
+        .unwrap_or(&record.source_id)
+        .to_string()
+}
+
+fn touched_files_from_record(record: &SourceSessionRecord) -> Vec<String> {
+    record
+        .touched_files_json
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn total_tokens(input_tokens: Option<u64>, output_tokens: Option<u64>) -> Option<u64> {
+    match (input_tokens, output_tokens) {
+        (None, None) => None,
+        (input, output) => Some(
+            input
+                .unwrap_or_default()
+                .saturating_add(output.unwrap_or_default()),
+        ),
     }
 }
 
@@ -277,10 +434,14 @@ fn format_actor_type(actor_type: ActorType) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn format_system_time(time: SystemTime) -> Option<String> {
     time.duration_since(UNIX_EPOCH).ok()?;
-    let datetime: DateTime<Utc> = time.into();
-    Some(datetime.to_rfc3339())
+    Some(system_time_to_utc(time).to_rfc3339())
+}
+
+fn system_time_to_utc(time: SystemTime) -> DateTime<Utc> {
+    time.into()
 }
 
 #[cfg(test)]
@@ -339,15 +500,32 @@ mod tests {
         let root = temp_repo_root("sessions-root");
         let session_dir = root.join("native");
         fs::create_dir_all(&session_dir).expect("create native dir");
-        fs::write(session_dir.join("one.jsonl"), "one").expect("write one");
-        fs::write(session_dir.join("two.jsonl"), "two").expect("write two");
-        fs::write(session_dir.join("three.jsonl"), "three").expect("write three");
+        fs::write(
+            session_dir.join("one.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"one\"}}\n",
+        )
+        .expect("write one");
+        fs::write(
+            session_dir.join("two.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:01:00Z\",\"message\":{\"role\":\"user\",\"content\":\"two\"}}\n",
+        )
+        .expect("write two");
+        fs::write(
+            session_dir.join("three.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:02:00Z\",\"message\":{\"role\":\"user\",\"content\":\"three\"}}\n",
+        )
+        .expect("write three");
 
         let mut profile = profile("claude_code");
         profile.app_id = Some("claude_code".to_string());
         profile.session_log_path = Some(session_dir);
 
-        let response = build_sessions_response(&profile, 1, 1).expect("build sessions");
+        let mut metadata_db =
+            MetadataDb::open_path(root.join("metadata.sqlite")).expect("open metadata DB");
+        refresh_profiles_to_metadata(&mut metadata_db, std::slice::from_ref(&profile), 10)
+            .expect("refresh metadata index");
+        let response =
+            build_sessions_response(&metadata_db, &profile, 1, 1).expect("build sessions");
 
         assert_eq!(response.source_id, "claude_code");
         assert_eq!(response.limit, 1);
@@ -373,7 +551,12 @@ mod tests {
         let mut second = profile("second");
         second.session_log_path = Some(second_dir);
 
-        let response = build_recent_paths_response("all".to_string(), &[first, second], 10)
+        let mut metadata_db =
+            MetadataDb::open_path(root.join("metadata.sqlite")).expect("open metadata DB");
+        let profiles = [first, second];
+        refresh_profiles_to_metadata(&mut metadata_db, &profiles, 10)
+            .expect("refresh metadata index");
+        let response = build_recent_paths_response(&metadata_db, "all".to_string(), &profiles, 10)
             .expect("build recent paths");
 
         assert_eq!(response.source_id, "all");
