@@ -32,6 +32,7 @@ pub fn format_source_session_chunks(
     match source_id {
         SOURCE_CLAUDE_CODE => claude_code::format_chunks(external_session_id, source_path),
         SOURCE_CODEX_APP => codex_app::format_chunks(external_session_id, source_path),
+        SOURCE_CURSOR_IDE => cursor_ide::format_chunks(external_session_id, source_path),
         _ => Ok(Vec::new()),
     }
 }

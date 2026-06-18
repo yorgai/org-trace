@@ -92,7 +92,7 @@ Future formats should be added as formatting adapters over the same source metad
 | ORGII implementation | `orgtrack-core/src/sources/cursor_ide/db.rs`, `history.rs`, `io.rs`, `helpers.rs`, `models.rs`, `summaries.rs`. Tauri bridge: `src-tauri/src/orgtrack/history_commands.rs`. Frontend wrapper: `src/api/tauri/cursorIde/index.ts`. |
 | Current ORGII metadata store | `imported_history_session_cache` for session metadata and `cursor_ide_turn_summaries` for derived turn summaries. |
 | Brick target | Cursor source provider with metadata rows in `<BRICK_HOME>/metadata.sqlite`; lazy chunk provider reads Cursor DB on demand; turn summaries become a derived index keyed by source fingerprint. |
-| JSON export | `history sessions` returns session rows; `history chunks --mode full`; Cursor-specific chunk modes: `initial-window`, `full-refresh`, `turn-window`. |
+| JSON export | `history sessions` returns session rows; `history chunks` supports first-pass full-session raw formatting from `composerData:{composerId}` and `bubbleId:{composerId}:{bubbleId}`. Cursor-specific chunk modes `initial-window`, `full-refresh`, and `turn-window` remain pending. |
 
 ### Cursor session metadata fields observed
 
@@ -363,7 +363,7 @@ Recovery flow:
 
 | Source | Brick today | ORGII today | Target |
 | --- | --- | --- | --- |
-| Cursor IDE | Metadata-only provider reads `composer.composerHeaders.allComposers`; full chunks/windowing pending. | Mature metadata scan, DB parsing, lazy chunks, window APIs, turn summaries. | Port Cursor-family chunk/window provider next. |
+| Cursor IDE | Metadata provider reads `composer.composerHeaders.allComposers`; first raw chunk formatter reads composer/bubble KV rows; windowing/content blob dereference pending. | Mature metadata scan, DB parsing, lazy chunks, window APIs, turn summaries. | Add window modes and content blob dereferencing next. |
 | Claude Code | Generic file listing and metadata index upsert. | Mature JSONL metadata scan, impact stats, lazy chunks. | Port first. |
 | Codex App | Generic file listing and metadata index upsert. | Mature JSONL metadata scan, impact stats, lazy chunks. | Port first. |
 | OpenCode | Discovery only for DB candidates. | DB metadata scan and lazy chunks. | Port after file-based sources. |

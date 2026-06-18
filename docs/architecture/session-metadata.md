@@ -144,6 +144,6 @@ Both schemas include a `chunks` array. For Claude Code and Codex App, Brick lazi
 | --- | --- | --- | --- |
 | Claude Code | First JSONL metadata parser in Brick. | Input/output extracted from `message.usage`. | JSONL-to-chunk JSON formatting. |
 | Codex App | First JSONL metadata parser in Brick. | Input/output extracted from `token_count`. | JSONL-to-chunk JSON formatting. |
-| Cursor IDE | First metadata-only provider in Brick using `composer.composerHeaders.allComposers`. | Split not available in first provider; context token handling remains pending. | Planned. |
+| Cursor IDE | First provider reads `composer.composerHeaders.allComposers`. | Split not available in first provider; context token handling remains pending. | First full-session raw formatter reads `composerData:{composerId}` and `bubbleId:{composerId}:{bubbleId}`; window modes and content blob dereferencing remain pending. |
 | Windsurf | Documented; not ported yet. | Context token metadata documented. | Planned. |
 | OpenCode | Documented; not ported yet. | Input/output strategy documented. | Planned. |
