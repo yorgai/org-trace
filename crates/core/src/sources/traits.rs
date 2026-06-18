@@ -1,6 +1,8 @@
 use anyhow::Result;
 
-use crate::{list_native_source_sessions, NativeSourceSession, SourceProfile};
+use std::path::Path;
+
+use crate::{list_native_source_sessions, ActivityChunk, NativeSourceSession, SourceProfile};
 
 use super::{claude_code, codex_app, cursor_ide};
 
@@ -18,6 +20,19 @@ pub fn list_source_sessions(
         SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit),
         SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit),
         _ => list_native_source_sessions(profile, limit),
+    }
+}
+
+/// Formats source records as activity chunk JSON for one source session when supported.
+pub fn format_source_session_chunks(
+    source_id: &str,
+    external_session_id: &str,
+    source_path: Option<&Path>,
+) -> Result<Vec<ActivityChunk>> {
+    match source_id {
+        SOURCE_CLAUDE_CODE => claude_code::format_chunks(external_session_id, source_path),
+        SOURCE_CODEX_APP => codex_app::format_chunks(external_session_id, source_path),
+        _ => Ok(Vec::new()),
     }
 }
 

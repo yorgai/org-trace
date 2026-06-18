@@ -4,11 +4,11 @@ status: active
 
 # Session Metadata Structure
 
-This document tracks Brick's source-session metadata structure and how each native source populates it. It is the working contract for `<BRICK_HOME>/metadata.sqlite`, `brick history sessions --format json`, and `brick history export --schema audit-v1|source-metadata-v1`.
+This document tracks Brick's source-session metadata structure and how each native source populates it. It is the working contract for `<BRICK_HOME>/metadata.sqlite`, `brick history sessions --format json`, and `brick history export --schema audit-v1|source-metadata-v1 --format json|csv`.
 
 ## Boundary
 
-`metadata.sqlite` stores indexed session metadata. It does not store full transcript content. Full replay is loaded lazily from native storage by source-specific chunk providers, or copied into Brick blobs only through explicit evidence actions.
+`metadata.sqlite` stores indexed session metadata. It does not store full transcript content. Full transcript records are formatted lazily from native storage by source-specific chunk providers, or copied into Brick blobs only through explicit evidence actions.
 
 ## Core table shape: `source_sessions`
 
@@ -73,7 +73,7 @@ Token fields are optional because not every source exposes them.
 | `input_tokens` | Sum of `message.usage.input_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens`. |
 | `output_tokens` | Sum of `message.usage.output_tokens`. |
 | `files_changed`, `lines_added`, `lines_removed`, `touched_files` | Planned: parse Claude edit/write tool calls. Current first slice leaves null/empty. |
-| Full chunks | Planned lazy JSONL replay into `ActivityChunk`-compatible JSON. |
+| Full chunks | Planned lazy JSONL-to-chunk JSON formatting. |
 
 ### Codex App
 
@@ -92,7 +92,7 @@ Token fields are optional because not every source exposes them.
 | `input_tokens` | Latest/observed `payload.total_token_usage.input_tokens` from `payload.type == "token_count"`. |
 | `output_tokens` | Latest/observed `payload.total_token_usage.output_tokens` from `payload.type == "token_count"`. |
 | `files_changed`, `lines_added`, `lines_removed`, `touched_files` | Parse `apply_patch` payloads from `function_call` and `custom_tool_call`. |
-| Full chunks | Planned lazy JSONL replay into `ActivityChunk`-compatible JSON. |
+| Full chunks | Planned lazy JSONL-to-chunk JSON formatting. |
 
 ### Cursor IDE
 
@@ -100,11 +100,11 @@ Token fields are optional because not every source exposes them.
 | --- | --- |
 | Native storage | Cursor `state.vscdb` SQLite `cursorDiskKV`. |
 | Primary resilient session metadata path | `composer.composerHeaders.allComposers` for `name`, `createdAt`, `lastUpdatedAt`, `workspaceIdentifier`, `trackedGitRepos`, `subtitle`, `mode`, `isArchived`. |
-| Full composer/chunk path | `composerData:{composerId}`, `bubbleId:{composerId}:{bubbleId}`, and content blob keys for full replay. |
+| Full composer/chunk source path | `composerData:{composerId}`, `bubbleId:{composerId}:{bubbleId}`, and content blob keys for full chunk JSON formatting. |
 | Plan/session edges | `composer.planRegistry.{planId}` gives `uri.fsPath`, `createdBy`, `editedBy[]`, `referencedBy[]`, and `builtBy{sessionId: todoIds[]}`. Resolve session IDs through `composer.composerHeaders.allComposers`. |
 | Token metadata | `contextTokensUsed` when available; Cursor does not always expose input/output split. Store split only when available; otherwise keep provider-specific values in `metadata_json`. |
 | Impact metadata | Composer fields such as `totalLinesAdded`, `totalLinesRemoved`, and `filesChangedCount` when available. |
-| Full chunks | Lazy DB replay with window modes. |
+| Full chunks | Lazy DB-to-chunk JSON formatting with window modes. |
 
 ### Windsurf
 
@@ -114,7 +114,7 @@ Token fields are optional because not every source exposes them.
 | Query method | Cursor-family composer/bubble key grammar. |
 | Core metadata | `composerId`, `name`, `createdAt`, `lastUpdatedAt`, `modelConfig.modelName`, `contextTokensUsed`, `trackedGitRepos`, `workspaceIdentifier`. |
 | Token metadata | `contextTokensUsed` when available; keep input/output split null unless source exposes split. |
-| Full chunks | Lazy Cursor-family DB replay. |
+| Full chunks | Lazy Cursor-family DB-to-chunk JSON formatting. |
 
 ### OpenCode
 
@@ -124,7 +124,7 @@ Token fields are optional because not every source exposes them.
 | Query method | `session` table for metadata; `message` and `part` tables for chunks. |
 | Core metadata | `session.id`, `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, archive flags. |
 | Token metadata | `tokens_input + tokens_cache_read + tokens_cache_write` as input; `tokens_output + tokens_reasoning` as output. |
-| Full chunks | Lazy DB replay from `part` joined to `message`. |
+| Full chunks | Lazy DB-to-chunk JSON formatting from `part` joined to `message`. |
 
 ## Shared session export formats
 
@@ -134,15 +134,16 @@ Brick keeps the public export surface intentionally small. Source-specific provi
 | --- | --- | --- | --- |
 | `audit-v1` | `brick history export --source <source> --session-id <id> --schema audit-v1 --format json` | Stable cross-provider audit packet for humans, reviewers, and ORGII ingestion. | Normalized source, session, token, impact, evidence, and chunk sections. |
 | `source-metadata-v1` | `brick history export --source <source> --session-id <id> --schema source-metadata-v1 --format json` | Loss-minimized export of the current metadata index row for debugging and provider parity checks. | Mirrors first-class `source_sessions` metadata plus provider extras. |
+| CSV formatting | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | Spreadsheet/audit-table export for a specific session. | One row per chunk, with repeated session metadata/token/impact columns; metadata-only sources emit one row with empty chunk columns. |
 
-Both schemas include a `chunks` array. It is empty for metadata-only providers until lazy chunk replay lands for the source. This preserves the final audit shape while keeping full transcript content out of `metadata.sqlite`.
+Both schemas include a `chunks` array. For Claude Code and Codex App, Brick lazily formats JSONL transcript records into chunk JSON. Metadata-only providers keep the array empty until their source-record-to-chunk JSON formatter lands. This preserves the final audit shape while keeping full transcript content out of `metadata.sqlite`.
 
 ## Current implementation status
 
 | Source | Metadata status | Token status | Chunk status |
 | --- | --- | --- | --- |
-| Claude Code | First JSONL metadata parser in Brick. | Input/output extracted from `message.usage`. | Planned. |
-| Codex App | First JSONL metadata parser in Brick. | Input/output extracted from `token_count`. | Planned. |
+| Claude Code | First JSONL metadata parser in Brick. | Input/output extracted from `message.usage`. | JSONL-to-chunk JSON formatting. |
+| Codex App | First JSONL metadata parser in Brick. | Input/output extracted from `token_count`. | JSONL-to-chunk JSON formatting. |
 | Cursor IDE | First metadata-only provider in Brick using `composer.composerHeaders.allComposers`. | Split not available in first provider; context token handling remains pending. | Planned. |
 | Windsurf | Documented; not ported yet. | Context token metadata documented. | Planned. |
 | OpenCode | Documented; not ported yet. | Input/output strategy documented. | Planned. |

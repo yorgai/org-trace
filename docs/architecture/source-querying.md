@@ -4,7 +4,7 @@ status: active
 
 # Source Querying Inventory
 
-This document tracks how Brick should query native coding-agent history sources, extract metadata, persist source metadata rows, and export JSON for consumers such as ORGII. The architecture boundary is defined in `architecture.md`.
+This document tracks how Brick should query native coding-agent history sources, extract metadata, persist source metadata rows, and export JSON/CSV for consumers such as ORGII. The architecture boundary is defined in `architecture.md`.
 
 Terminology:
 
@@ -51,7 +51,7 @@ Terminology:
 
 ### Chunk JSON
 
-`brick history chunks --source <source> --session-id <id> --format json` should return a stable `ActivityChunk`-compatible shape during ORGII migration:
+`brick history chunks --source <source> --session-id <id> --format json` should return a stable `ActivityChunk`-compatible shape during ORGII migration. This is raw source-record formatting for audit/consumer APIs; it is not app rendering logic:
 
 | Field | Meaning |
 | --- | --- |
@@ -66,6 +66,18 @@ Terminology:
 | `sourcePath` | Optional native evidence pointer. |
 | `sourceLineNumber` | Optional JSONL line number for file-backed sources. |
 | `sourceRecordKey` | Optional DB row/key pointer for DB-backed sources. |
+
+### Session export formatting
+
+`brick history export` is the specific-session export surface. JSON is canonical and loss-minimized. CSV is a convenience formatting for audit tables and spreadsheets.
+
+| Format | Command shape | Treatment |
+| --- | --- | --- |
+| JSON | `brick history export --source <source> --session-id <id> --schema audit-v1 --format json` | Full structured audit packet. |
+| JSON metadata | `brick history export --source <source> --session-id <id> --schema source-metadata-v1 --format json` | Current source metadata index row plus chunks when supported. |
+| CSV | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | One row per formatted chunk with repeated session metadata/token/impact columns. If no chunks are available, emit one metadata-only row. |
+
+Future formats should be added as formatting adapters over the same source metadata and chunk DTOs, not as provider-specific CLI paths.
 
 ## Cursor IDE
 
@@ -144,9 +156,9 @@ Recovery flow:
 2. For each `planId`, collect all related session IDs from `createdBy`, `editedBy[]`, `referencedBy[]`, and `builtBy` keys.
 3. Resolve those session IDs through `composer.composerHeaders.allComposers` to recover session metadata such as `name`, `createdAt`, `lastUpdatedAt`, `workspaceIdentifier`, `trackedGitRepos`, `subtitle`, `mode`, and `isArchived`.
 4. Persist plan/session edges into Brick source metadata or a dedicated planning-edge index.
-5. Use the larger composer/bubble rows only for full transcript/chunk replay, not as the only source for plan relationship recovery.
+5. Use the larger composer/bubble rows only for full transcript-to-chunk JSON formatting, not as the only source for plan relationship recovery.
 
-### Cursor chunk loading
+### Cursor chunk formatting
 
 | Step | Details |
 | --- | --- |
@@ -170,7 +182,7 @@ Recovery flow:
 | Native raw format | JSONL. Lines include `type`, `timestamp`, `cwd`, `gitBranch`, and optional `message`. Message includes `model`, `content`, and `usage`. |
 | ORGII implementation | `orgtrack-core/src/sources/claude_code/history.rs`. Older stats scanner: `orgtrack-core/src/sources/claude_code/db.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`; older stats path also writes `claude_session_cache`. |
-| Brick target | One Claude provider that combines modern JSONL replay with optional `sessions-index.json` scan optimization. |
+| Brick target | One Claude provider that combines modern JSONL-to-JSON formatting with optional `sessions-index.json` scan optimization. |
 | JSON export | Sessions, recent paths, full chunks. Optional chunk source pointers should include JSONL path and line number. |
 
 ### Claude metadata fields
@@ -192,7 +204,7 @@ Recovery flow:
 | Assistant `tool_use` items | Tool actions. | impact stats and lazy chunks. |
 | Tool names `Edit`, `MultiEdit`, `Write` | File edits. | `touchedFiles`, `filesChanged`, `linesAdded`, `linesRemoved`. |
 
-### Claude chunk loading
+### Claude chunk formatting
 
 | Step | Details |
 | --- | --- |
@@ -233,7 +245,7 @@ Recovery flow:
 | `token_count.total_token_usage.output_tokens` | Output tokens. | `outputTokens`. |
 | `apply_patch` payloads | Patch impact. | `touchedFiles`, `filesChanged`, `linesAdded`, `linesRemoved`. |
 
-### Codex chunk loading
+### Codex chunk formatting
 
 | Step | Details |
 | --- | --- |
@@ -278,7 +290,7 @@ Recovery flow:
 | `time_updated` | Updated time. | `updatedAt`; fallback to `time_created`. |
 | `time_archived` | Archive marker. | filter archived sessions by default. |
 
-### OpenCode chunk loading
+### OpenCode chunk formatting
 
 | Step | Details |
 | --- | --- |
@@ -325,7 +337,7 @@ Recovery flow:
 | `subagentInfo` | Subagent marker. | listability filter and `sourceMetadata`. |
 | `fullConversationHeadersOnly` | Bubble order. | lazy chunk order source; store count/fingerprint only by default. |
 
-### Windsurf chunk loading
+### Windsurf chunk formatting
 
 | Step | Details |
 | --- | --- |

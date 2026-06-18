@@ -4,6 +4,7 @@
 //! indexes, Git context capture, and identity resolution. Server sync and auth
 //! should remain outside this crate until the local recorder is stable.
 
+mod activity;
 mod attachment_store;
 mod diff_capture;
 mod global_home;
@@ -26,6 +27,7 @@ mod sqlite_schema;
 mod store;
 mod store_options;
 
+pub use activity::*;
 pub use attachment_store::*;
 pub use diff_capture::*;
 pub use global_home::*;

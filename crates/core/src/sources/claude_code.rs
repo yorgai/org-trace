@@ -1,9 +1,14 @@
+use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Result;
-use serde_json::Value;
+use anyhow::{anyhow, Result};
+use serde_json::{json, Value};
 
-use crate::{list_file_source_sessions, NativeSessionMetadata, NativeSourceSession, SourceProfile};
+use crate::{
+    assistant_message_chunk, list_file_source_sessions, thinking_chunk, tool_call_chunk,
+    user_message_chunk, ActivityChunk, ImportedToolCall, NativeSessionMetadata,
+    NativeSourceSession, SourceProfile, FUNCTION_EDIT_FILE, FUNCTION_RUN_COMMAND_LINE,
+};
 
 use super::jsonl::{
     read_jsonl_values, set_first_path, set_first_string, set_first_string_value, text_from_value,
@@ -11,12 +16,114 @@ use super::jsonl::{
 };
 
 const CLAUDE_CODE_JSONL_PARSER_VERSION: &str = "claude-code-jsonl-v1";
+const CLAUDE_CODE_PROVIDER_SLUG: &str = "claudecode";
 
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
     list_file_source_sessions(profile, limit, extract_jsonl_metadata)
+}
+
+pub(super) fn format_chunks(
+    external_session_id: &str,
+    source_path: Option<&Path>,
+) -> Result<Vec<ActivityChunk>> {
+    let path = source_path.ok_or_else(|| {
+        anyhow!("Claude Code source path missing for session: {external_session_id}")
+    })?;
+    let lines = read_jsonl_values(path)?;
+    let mut chunks = Vec::new();
+    let mut pending_tool_calls = HashMap::<String, ImportedToolCall>::new();
+    let mut sequence = 0_usize;
+
+    for value in lines {
+        let created_at = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        match value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "user" => {
+                if let Some((call_id, output)) = claude_tool_result_text(message.get("content")) {
+                    if let Some(call) = pending_tool_calls.remove(&call_id) {
+                        chunks.push(tool_call_chunk(
+                            external_session_id,
+                            CLAUDE_CODE_PROVIDER_SLUG,
+                            sequence,
+                            &call,
+                            &output,
+                        ));
+                        sequence += 1;
+                    }
+                } else if let Some(text) = message.get("content").and_then(text_from_value) {
+                    chunks.push(user_message_chunk(
+                        external_session_id,
+                        CLAUDE_CODE_PROVIDER_SLUG,
+                        sequence,
+                        created_at,
+                        &text,
+                    ));
+                    sequence += 1;
+                }
+            }
+            "assistant" => {
+                for item in claude_content_items(message.get("content")) {
+                    match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                        "text" => {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                chunks.push(assistant_message_chunk(
+                                    external_session_id,
+                                    CLAUDE_CODE_PROVIDER_SLUG,
+                                    sequence,
+                                    created_at,
+                                    text,
+                                ));
+                                sequence += 1;
+                            }
+                        }
+                        "thinking" => {
+                            if let Some(text) = item.get("thinking").and_then(Value::as_str) {
+                                chunks.push(thinking_chunk(
+                                    external_session_id,
+                                    CLAUDE_CODE_PROVIDER_SLUG,
+                                    sequence,
+                                    created_at,
+                                    text,
+                                ));
+                                sequence += 1;
+                            }
+                        }
+                        "tool_use" => {
+                            if let Some(call) = claude_tool_call_from_item(item, created_at) {
+                                pending_tool_calls.insert(call.call_id.clone(), call);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for call in pending_tool_calls.into_values() {
+        chunks.push(tool_call_chunk(
+            external_session_id,
+            CLAUDE_CODE_PROVIDER_SLUG,
+            sequence,
+            &call,
+            "",
+        ));
+        sequence += 1;
+    }
+    Ok(chunks)
 }
 
 fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
@@ -85,12 +192,97 @@ fn is_user_message(value: &Value, message: Option<&Value>) -> bool {
             == Some(&Value::String("user".to_string()))
 }
 
+fn claude_tool_call_from_item(item: &Value, created_at: &str) -> Option<ImportedToolCall> {
+    let call_id = item.get("id")?.as_str()?.to_string();
+    let raw_name = item.get("name")?.as_str()?.to_string();
+    let args = item.get("input").cloned().unwrap_or_else(|| json!({}));
+    let (canonical_name, args) = normalize_claude_tool_call(&raw_name, args);
+    Some(ImportedToolCall {
+        call_id,
+        raw_name,
+        canonical_name,
+        args,
+        created_at: created_at.to_string(),
+    })
+}
+
+fn normalize_claude_tool_call(raw_name: &str, args: Value) -> (String, Value) {
+    match raw_name {
+        "Bash" => (
+            FUNCTION_RUN_COMMAND_LINE.to_string(),
+            normalize_shell_args(args),
+        ),
+        "Edit" | "MultiEdit" | "Write" => (
+            FUNCTION_EDIT_FILE.to_string(),
+            normalize_edit_args(raw_name, args),
+        ),
+        _ => (raw_name.to_string(), args),
+    }
+}
+
+fn normalize_shell_args(args: Value) -> Value {
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("cmd").and_then(Value::as_str))
+        .unwrap_or_default();
+    json!({
+        "command": command,
+        "cmd": command,
+    })
+}
+
+fn normalize_edit_args(raw_name: &str, args: Value) -> Value {
+    let file_path = args
+        .get("file_path")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("path").and_then(Value::as_str))
+        .unwrap_or_default();
+    json!({
+        "action": raw_name,
+        "file_path": file_path,
+        "payload": args,
+    })
+}
+
+fn claude_content_items(content: Option<&Value>) -> Vec<&Value> {
+    match content {
+        Some(Value::Array(items)) => items.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn claude_tool_result_text(content: Option<&Value>) -> Option<(String, String)> {
+    let Some(Value::Array(items)) = content else {
+        return None;
+    };
+    let result_item = items
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))?;
+    let call_id = result_item.get("tool_use_id")?.as_str()?.to_string();
+    let output = match result_item.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    Some((call_id, output))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::{
+        ACTION_TYPE_ASSISTANT, ACTION_TYPE_RAW, ACTION_TYPE_TOOL_CALL, FUNCTION_ASSISTANT,
+        FUNCTION_USER_MESSAGE,
+    };
 
     fn temp_source_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -115,6 +307,34 @@ mod tests {
             default_full_evidence_upload: None,
             notes: None,
         }
+    }
+
+    #[test]
+    fn formats_claude_code_jsonl_as_source_chunks() {
+        let root = temp_source_root("chunks");
+        let transcript_path = root.join("claude-session.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Run tests\"}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-06-18T01:01:00Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Sure\"},{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n",
+                "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:02:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"ok\"}]}}\n"
+            ),
+        )
+        .expect("write claude chunks transcript");
+
+        let chunks =
+            format_chunks("claude-session", Some(&transcript_path)).expect("format chunks");
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].action_type, ACTION_TYPE_RAW);
+        assert_eq!(chunks[0].function, FUNCTION_USER_MESSAGE);
+        assert_eq!(chunks[1].action_type, ACTION_TYPE_ASSISTANT);
+        assert_eq!(chunks[1].function, FUNCTION_ASSISTANT);
+        assert_eq!(chunks[2].action_type, ACTION_TYPE_TOOL_CALL);
+        assert_eq!(chunks[2].function, FUNCTION_RUN_COMMAND_LINE);
+        assert_eq!(chunks[2].args["command"], "cargo test");
+        assert_eq!(chunks[2].result["output"], "ok");
     }
 
     #[test]

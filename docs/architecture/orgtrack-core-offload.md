@@ -22,7 +22,7 @@ Do not move `orgtrack-core` as an opaque crate. Instead:
 
 | Bucket | Meaning |
 | --- | --- |
-| Move to Brick | Generic provenance, source querying, metadata indexing, chunk loading, replay, blame, or privacy policy logic. |
+| Move to Brick | Generic provenance, source querying, metadata indexing, chunk formatting, blame, or privacy policy logic. |
 | Split / refactor | Valuable logic that is currently entangled with ORGII-specific DTOs, DB schema, or runtime assumptions. |
 | Keep in ORGII | UI, Tauri registration, live runtime orchestration, and app-specific scheduling. |
 
@@ -39,7 +39,7 @@ Do not move `orgtrack-core` as an opaque crate. Instead:
 | Windsurf source provider | `sources/windsurf/history.rs` | Cursor-family DB scanner/chunk reader. | Shared Cursor-family provider module. |
 | Recent-path aggregation | imported-history recent path helpers and per-source recent path commands | Recent paths are a metadata-index query, not UI-specific logic. | `brick history recent-paths`. |
 | Impact stats extraction | imported-history impact stats and provider parsers | Changed files/line counts are provenance metadata. | Provider metadata extraction and optional evidence projections. |
-| Lazy chunk conversion | imported source chunk loaders to `ActivityChunk` | Normalized replay/export belongs in Brick as source APIs. | `brick history chunks` JSON and library API. |
+| Lazy chunk formatting | imported source record formatters to `ActivityChunk` | Source-record JSON formatting belongs in Brick as source APIs. | `brick history chunks` JSON and library API. |
 | Source diagnostics | ORGII debug/diagnostic source commands | Provider health and parser diagnostics are Brick source concerns. | `brick source doctor`, `brick history doctor`. |
 | Source discovery candidates | per-provider path candidate functions | Brick should discover native agent data roots directly. | `brick source scan`, `brick source config`, provider discovery. |
 | Parser versioning | provider parser constants | Brick must own source parser versions for metadata invalidation. | Provider version constants and migration policy. |
@@ -131,8 +131,8 @@ brick blame session
 
 ### Slice 2: lazy chunks for file-backed sources
 
-- Port Claude Code chunk loader.
-- Port Codex App chunk loader.
+- Port Claude Code chunk formatter.
+- Port Codex App chunk formatter.
 - Add `brick history chunks --source ... --session-id ... --format json`.
 - Preserve ORGII-compatible `ActivityChunk` JSON during migration.
 
@@ -166,4 +166,4 @@ brick blame session
 
 ## Conclusion
 
-Most of `orgtrack-core` should migrate into Brick because it implements exactly the cross-app source querying, metadata indexing, replay, projection, and blame logic Brick is meant to own. The migration should not be a crate move. It should be a sequence of provider and projection ports that leaves ORGII as a thin UI/runtime consumer over Brick's source and provenance APIs.
+Most of `orgtrack-core` should migrate into Brick because it implements exactly the cross-app source querying, metadata indexing, source-record formatting, projection, and blame logic Brick is meant to own. The migration should not be a crate move. It should be a sequence of provider and projection ports that leaves ORGII as a thin UI/runtime consumer over Brick's source and provenance APIs.

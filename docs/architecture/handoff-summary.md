@@ -4,7 +4,7 @@ status: active
 
 # Brick Handoff Summary
 
-This document captures the current state of Brick so another agent can continue without replaying the full conversation.
+This document captures the current state of Brick so another agent can continue from the current implementation state.
 
 ## Product direction
 
@@ -244,7 +244,7 @@ Important ORGII context:
 - Cursor uses the existing ORGII table named `cursor_session_cache` after read-only delta sync from Cursor `state.vscdb`.
 - Non-Cursor imported history uses the existing ORGII table named `imported_history_session_cache` keyed by source and source session ID.
 - The source-specific loading mechanisms currently live in ORGII: when a user opens an external session, ORGII knows how to re-open the native DB/JSONL/source path, parse the relevant transcript/window, and produce `ActivityChunk` records for rendering.
-- Those loaders are not just metadata helpers. They are the operational source readers for external history replay, so migration must move/abstract them into Brick history providers rather than only copying metadata schemas.
+- Those loaders are not just metadata helpers. They are operational source readers for external history chunk formatting, so migration must move/abstract them into Brick history providers rather than only copying metadata schemas.
 - ORGII stores metadata rows and reads transcript chunks lazily from source paths/DBs when rendering read-only history.
 - Brick should eventually absorb/migrate the entire ORGII external-history subsystem, not only scan/index tables.
 - Scope includes scanners, delta indexing, source-specific parsers, source-specific loading/windowing mechanisms, chunk loaders, `ActivityChunk` normalization, recent paths, impact stats, analysis backfills, diagnostics, and source-specific debug helpers.
@@ -275,7 +275,7 @@ Portable external-history core:
 - Delta indexing algorithms: source path, mtime, size, fingerprint, parser version, live IDs, pruning, and changed-record detection.
 - Source-specific parsers and raw DTOs.
 - Source-specific loading/windowing mechanisms that currently live in ORGII and reopen native DB/JSONL records on demand.
-- `ActivityChunk` creation/normalization for read-only replay.
+- `ActivityChunk` JSON formatting for read-only external history.
 - Recent-path aggregation and repo/workspace inference.
 - Impact stats: touched files, files changed, lines added/removed, model/token metadata.
 - Parser diagnostics, parse errors, source status, and source-index debug commands.
@@ -307,6 +307,8 @@ brick history sources --format json
 brick history sessions --source <source_id> --limit 200 --offset 0 --format json
 brick history recent-paths --source <source_id|all> --limit 20 --format json
 brick history chunks --source <source_id> --session-id <id> --format json
+brick history export --source <source_id> --session-id <id> --schema audit-v1 --format json
+brick history export --source <source_id> --session-id <id> --schema audit-v1 --format csv
 ```
 
 Cursor-specific read APIs should be preserved because ORGII's Cursor UI uses windowed loading:
@@ -374,6 +376,8 @@ brick history sources --format json
 brick history sessions --source <source_id> --limit 20 --offset 0 --format json
 brick history recent-paths --source all --limit 20 --format json
 brick history chunks --source <source_id> --session-id <native-id> --format json
+brick history export --source <source_id> --session-id <native-id> --schema audit-v1 --format json
+brick history export --source <source_id> --session-id <native-id> --schema audit-v1 --format csv
 ```
 
 Current behavior:

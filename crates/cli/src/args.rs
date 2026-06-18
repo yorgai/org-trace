@@ -463,8 +463,8 @@ pub enum HistoryCommand {
         session_id: String,
         #[arg(long, value_enum, default_value_t = HistoryExportSchemaArg::AuditV1)]
         schema: HistoryExportSchemaArg,
-        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
-        format: HistoryFormatArg,
+        #[arg(long, value_enum, default_value_t = HistoryExportFormatArg::Json)]
+        format: HistoryExportFormatArg,
     },
 }
 
@@ -472,6 +472,13 @@ pub enum HistoryCommand {
 #[value(rename_all = "snake_case")]
 pub enum HistoryFormatArg {
     Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum HistoryExportFormatArg {
+    Json,
+    Csv,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -47,8 +47,10 @@ cargo run -q -p brick -- history sources --format json
 cargo run -q -p brick -- history sessions --source claude_code --limit 20 --format json
 cargo run -q -p brick -- history recent-paths --source all --limit 20 --format json
 cargo run -q -p brick -- history chunks --source claude_code --session-id <native-id> --format json
+cargo run -q -p brick -- history chunks --source codex_app --session-id <native-id> --format json
 cargo run -q -p brick -- history export --source claude_code --session-id <native-id> --schema audit-v1 --format json
 cargo run -q -p brick -- history export --source claude_code --session-id <native-id> --schema source-metadata-v1 --format json
+cargo run -q -p brick -- history export --source claude_code --session-id <native-id> --schema audit-v1 --format csv
 ```
 
 Create an Org, Project, Mission, agent-friendly current Session, and Artifacts:
@@ -128,7 +130,7 @@ Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.b
 ## Documentation
 
 - `docs/architecture/architecture.md`: source metadata index architecture and Mermaid diagrams
-- `docs/architecture/source-querying.md`: platform-specific querying methods and history JSON contracts
+- `docs/architecture/source-querying.md`: platform-specific querying methods and history JSON/CSV contracts
 - `docs/architecture/README.md`: current architecture and phase status
 - `docs/protocol/README.md`: event families, envelope fields, sync routes, and query routes
 - `docs/self-hosting/README.md`: local server operation, push/pull, repo IDs, and Cursor notes

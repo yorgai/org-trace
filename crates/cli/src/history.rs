@@ -11,15 +11,18 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use brick_core::{
-    list_source_sessions, MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore,
-    SourceSessionListQuery, SourceSessionRecord, SourceSessionUpsert,
+    format_source_session_chunks, list_source_sessions, ActivityChunk, MetadataDb,
+    NativeSourceSession, SourceProfile, SourceProfileStore, SourceSessionListQuery,
+    SourceSessionRecord, SourceSessionUpsert,
 };
 use brick_protocol::ActorType;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::args::{HistoryCommand, HistoryExportSchemaArg, HistoryFormatArg};
+use crate::args::{
+    HistoryCommand, HistoryExportFormatArg, HistoryExportSchemaArg, HistoryFormatArg,
+};
 
 const HISTORY_EXPORT_SCHEMA_AUDIT_V1: &str = "audit-v1";
 const HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1: &str = "source-metadata-v1";
@@ -98,26 +101,16 @@ pub struct HistoryRecentPathRow {
     pub modified_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct HistoryChunksResponse {
     pub source_id: String,
     pub session_id: String,
     pub chunks: Vec<ActivityChunkDto>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq, Clone)]
-pub struct ActivityChunkDto {
-    pub chunk_id: String,
-    pub source_id: String,
-    pub session_id: String,
-    pub kind: String,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-    pub path: Option<String>,
-    pub text: Option<String>,
-}
+pub type ActivityChunkDto = ActivityChunk;
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct AuditSessionExportV1 {
     pub schema: String,
     pub exported_at: String,
@@ -173,7 +166,7 @@ pub struct AuditEvidenceRef {
     pub parser_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct SourceMetadataSessionExportV1 {
     pub schema: String,
     pub exported_at: String,
@@ -267,20 +260,6 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
             format,
         } => {
             ensure_json(format);
-            read_profile(profiles, &source)?;
-            print_json(&HistoryChunksResponse {
-                source_id: source,
-                session_id,
-                chunks: Vec::new(),
-            })
-        }
-        HistoryCommand::Export {
-            source,
-            session_id,
-            schema,
-            format,
-        } => {
-            ensure_json(format);
             let profile = read_profile(profiles, &source)?;
             let mut metadata_db = MetadataDb::open_global()?;
             refresh_profiles_to_metadata(
@@ -293,12 +272,33 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
                 .ok_or_else(|| {
                     anyhow!("source session not found: {}/{}", profile.name, session_id)
                 })?;
-            match schema {
-                HistoryExportSchemaArg::AuditV1 => print_json(&build_audit_export(record)),
-                HistoryExportSchemaArg::SourceMetadataV1 => {
-                    print_json(&build_source_metadata_export(record))
-                }
-            }
+            let chunks = format_chunks_for_record(&record)?;
+            print_json(&HistoryChunksResponse {
+                source_id: source,
+                session_id,
+                chunks,
+            })
+        }
+        HistoryCommand::Export {
+            source,
+            session_id,
+            schema,
+            format,
+        } => {
+            let profile = read_profile(profiles, &source)?;
+            let mut metadata_db = MetadataDb::open_global()?;
+            refresh_profiles_to_metadata(
+                &mut metadata_db,
+                std::slice::from_ref(&profile),
+                EXPORT_REFRESH_LIMIT,
+            )?;
+            let record = metadata_db
+                .get_source_session(&profile.name, &session_id)?
+                .ok_or_else(|| {
+                    anyhow!("source session not found: {}/{}", profile.name, session_id)
+                })?;
+            let chunks = format_chunks_for_record(&record)?;
+            print_export(schema, format, record, chunks)
         }
     }
 }
@@ -369,7 +369,116 @@ fn build_recent_paths_response(
     })
 }
 
-fn build_audit_export(record: SourceSessionRecord) -> AuditSessionExportV1 {
+fn print_export(
+    schema: HistoryExportSchemaArg,
+    format: HistoryExportFormatArg,
+    record: SourceSessionRecord,
+    chunks: Vec<ActivityChunkDto>,
+) -> Result<()> {
+    match (schema, format) {
+        (HistoryExportSchemaArg::AuditV1, HistoryExportFormatArg::Json) => {
+            print_json(&build_audit_export(record, chunks))
+        }
+        (HistoryExportSchemaArg::SourceMetadataV1, HistoryExportFormatArg::Json) => {
+            print_json(&build_source_metadata_export(record, chunks))
+        }
+        (_, HistoryExportFormatArg::Csv) => print_export_csv(&record, &chunks),
+    }
+}
+
+fn print_export_csv(record: &SourceSessionRecord, chunks: &[ActivityChunkDto]) -> Result<()> {
+    let rows = if chunks.is_empty() {
+        vec![export_csv_row(record, None)]
+    } else {
+        chunks
+            .iter()
+            .map(|chunk| export_csv_row(record, Some(chunk)))
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "source_id,app_id,external_session_id,title,model,created_at,updated_at,repo_path,branch,input_tokens,output_tokens,total_tokens,files_changed,lines_added,lines_removed,touched_files,source_path,chunk_id,chunk_created_at,chunk_action_type,chunk_function,chunk_args_json,chunk_result_json"
+    );
+    for row in rows {
+        println!("{}", row.join(","));
+    }
+    Ok(())
+}
+
+fn export_csv_row(record: &SourceSessionRecord, chunk: Option<&ActivityChunkDto>) -> Vec<String> {
+    let touched_files = touched_files_from_record(record).join(";");
+    let repo_path = record
+        .repo_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let source_path = source_path_display(record);
+    let chunk_args_json = chunk
+        .map(|chunk| chunk.args.to_string())
+        .unwrap_or_default();
+    let chunk_result_json = chunk
+        .map(|chunk| chunk.result.to_string())
+        .unwrap_or_default();
+    [
+        record.source_id.clone(),
+        app_id_from_metadata(record),
+        record.external_session_id.clone(),
+        record.title.clone().unwrap_or_default(),
+        record.model.clone().unwrap_or_default(),
+        record
+            .session_created_at
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_default(),
+        record
+            .session_updated_at
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_default(),
+        repo_path,
+        record.branch.clone().unwrap_or_default(),
+        optional_u64_csv(record.input_tokens),
+        optional_u64_csv(record.output_tokens),
+        optional_u64_csv(total_tokens(record.input_tokens, record.output_tokens)),
+        optional_u64_csv(record.files_changed),
+        optional_u64_csv(record.lines_added),
+        optional_u64_csv(record.lines_removed),
+        touched_files,
+        source_path,
+        chunk
+            .map(|chunk| chunk.chunk_id.clone())
+            .unwrap_or_default(),
+        chunk
+            .map(|chunk| chunk.created_at.clone())
+            .unwrap_or_default(),
+        chunk
+            .map(|chunk| chunk.action_type.clone())
+            .unwrap_or_default(),
+        chunk
+            .map(|chunk| chunk.function.clone())
+            .unwrap_or_default(),
+        chunk_args_json,
+        chunk_result_json,
+    ]
+    .into_iter()
+    .map(csv_cell)
+    .collect()
+}
+
+fn optional_u64_csv(value: Option<u64>) -> String {
+    value.map(|number| number.to_string()).unwrap_or_default()
+}
+
+fn csv_cell(value: String) -> String {
+    let escaped = value.replace('"', "\"\"");
+    if escaped.contains(',') || escaped.contains('\n') || escaped.contains('"') {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
+fn build_audit_export(
+    record: SourceSessionRecord,
+    chunks: Vec<ActivityChunkDto>,
+) -> AuditSessionExportV1 {
     let exported_at = Utc::now().to_rfc3339();
     let app_id = app_id_from_metadata(&record);
     let touched_files = touched_files_from_record(&record);
@@ -415,12 +524,15 @@ fn build_audit_export(record: SourceSessionRecord) -> AuditSessionExportV1 {
             source_modified_at: record.source_mtime.map(|time| time.to_rfc3339()),
             parser_version: record.parser_version,
         },
-        chunks: Vec::new(),
+        chunks,
         source_metadata: record.metadata_json,
     }
 }
 
-fn build_source_metadata_export(record: SourceSessionRecord) -> SourceMetadataSessionExportV1 {
+fn build_source_metadata_export(
+    record: SourceSessionRecord,
+    chunks: Vec<ActivityChunkDto>,
+) -> SourceMetadataSessionExportV1 {
     let exported_at = Utc::now().to_rfc3339();
     let app_id = app_id_from_metadata(&record);
     let touched_files = touched_files_from_record(&record);
@@ -465,8 +577,16 @@ fn build_source_metadata_export(record: SourceSessionRecord) -> SourceMetadataSe
             last_seen_at: record.last_seen_at.to_rfc3339(),
             metadata_json: record.metadata_json,
         },
-        chunks: Vec::new(),
+        chunks,
     }
+}
+
+fn format_chunks_for_record(record: &SourceSessionRecord) -> Result<Vec<ActivityChunkDto>> {
+    format_source_session_chunks(
+        &record.source_id,
+        &record.external_session_id,
+        record.source_path.as_deref(),
+    )
 }
 
 fn source_row(profile: SourceProfile, selected: Option<&str>) -> HistorySourceRow {
@@ -675,6 +795,7 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    use brick_core::{user_message_chunk, ACTION_TYPE_RAW, FUNCTION_USER_MESSAGE};
     use chrono::TimeZone;
 
     use super::*;
@@ -843,7 +964,7 @@ mod tests {
 
     #[test]
     fn audit_export_serializes_universal_session_shape() {
-        let response = build_audit_export(source_session_record_for_export());
+        let response = build_audit_export(source_session_record_for_export(), Vec::new());
 
         assert_eq!(response.schema, HISTORY_EXPORT_SCHEMA_AUDIT_V1);
         assert_eq!(response.source.source_id, "claude_code");
@@ -866,7 +987,7 @@ mod tests {
 
     #[test]
     fn source_metadata_export_preserves_index_fields() {
-        let response = build_source_metadata_export(source_session_record_for_export());
+        let response = build_source_metadata_export(source_session_record_for_export(), Vec::new());
 
         assert_eq!(response.schema, HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1);
         assert_eq!(response.source_session.source_id, "claude_code");
@@ -887,6 +1008,49 @@ mod tests {
             serialized["source_session"]["parser_version"],
             "claude-code-jsonl-v1"
         );
+    }
+
+    #[test]
+    fn audit_export_includes_formatted_source_chunks() {
+        let chunk = user_message_chunk(
+            "session-1",
+            "claudecode",
+            0,
+            "2026-06-18T01:00:00Z",
+            "hello",
+        );
+        let response = build_audit_export(source_session_record_for_export(), vec![chunk]);
+
+        assert_eq!(response.chunks.len(), 1);
+        let serialized = serde_json::to_value(&response).expect("serialize audit chunks");
+        assert_eq!(serialized["chunks"][0]["action_type"], ACTION_TYPE_RAW);
+        assert_eq!(serialized["chunks"][0]["function"], FUNCTION_USER_MESSAGE);
+        assert_eq!(
+            serialized["chunks"][0]["result"]["message"]["content"],
+            "hello"
+        );
+    }
+
+    #[test]
+    fn export_csv_row_flattens_session_and_chunk_fields() {
+        let chunk = user_message_chunk(
+            "session-1",
+            "claudecode",
+            0,
+            "2026-06-18T01:00:00Z",
+            "hello, \"world\"",
+        );
+        let row = export_csv_row(&source_session_record_for_export(), Some(&chunk));
+
+        assert_eq!(row[0], "claude_code");
+        assert_eq!(row[2], "session-1");
+        assert_eq!(row[10], "25");
+        assert_eq!(row[11], "125");
+        assert_eq!(row[15], "src/lib.rs;README.md");
+        assert_eq!(row[20], FUNCTION_USER_MESSAGE);
+        assert!(row[22].starts_with('"'));
+        assert!(row[22].contains("hello,"));
+        assert!(row[22].contains("world"));
     }
 
     #[test]

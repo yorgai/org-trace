@@ -2,7 +2,7 @@
 
 Brick is a local-first provenance system with a small self-hosted sync surface. The MVP records accountable work as immutable events, derives query views from those events, and keeps local operation useful without a server.
 
-See `architecture.md` for the source metadata index architecture, naming glossary, and Mermaid diagrams. See `session-metadata.md` for the source-session metadata structure and per-source extraction map. See `source-querying.md` for platform-specific querying methods and history JSON contracts. See `orgtrack-core-offload.md` for the ORGII `orgtrack-core` migration inventory.
+See `architecture.md` for the source metadata index architecture, naming glossary, and Mermaid diagrams. See `session-metadata.md` for the source-session metadata structure and per-source extraction map. See `source-querying.md` for platform-specific querying methods and history JSON/CSV contracts. See `orgtrack-core-offload.md` for the ORGII `orgtrack-core` migration inventory.
 
 ## Current phase status
 
@@ -44,7 +44,7 @@ Brick intentionally keeps Session metadata separate from full Session content:
 1. **Metadata tier** — synced and indexed by default. It includes session ID, actor, source app, timestamps, linked missions, linked artifacts, repo contexts, transcript availability, and last update time. Mission pages can show useful session cards from this tier alone.
 2. **Full evidence tier** — optional content-addressed files, such as transcript JSON/JSONL, video recordings, screenshots, or raw logs. Events store hashes, sizes, and storage URIs; large bytes live in blob storage and can be fetched or uploaded explicitly.
 
-There is no separate third tier in the MVP. Structured replay is a rendering capability over full evidence when the uploaded transcript format supports it.
+There is no separate third tier in the MVP. Structured rendering is an app-side capability over full evidence when the uploaded transcript format supports it.
 
 ## Components
 

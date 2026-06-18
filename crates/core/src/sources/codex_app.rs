@@ -1,10 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use anyhow::Result;
-use serde_json::Value;
+use anyhow::{anyhow, Result};
+use serde_json::{json, Value};
 
-use crate::{list_file_source_sessions, NativeSessionMetadata, NativeSourceSession, SourceProfile};
+use crate::{
+    assistant_message_chunk, list_file_source_sessions, parse_inner_json, thinking_chunk,
+    tool_call_chunk, user_message_chunk, ActivityChunk, ImportedToolCall, NativeSessionMetadata,
+    NativeSourceSession, SourceProfile, FUNCTION_EDIT_FILE, FUNCTION_RUN_COMMAND_LINE,
+};
 
 use super::jsonl::{
     read_jsonl_values, set_first_path, set_first_string, text_from_value, token_value,
@@ -12,6 +16,7 @@ use super::jsonl::{
 };
 
 const CODEX_APP_JSONL_PARSER_VERSION: &str = "codex-app-jsonl-v1";
+const CODEX_APP_PROVIDER_SLUG: &str = "codex";
 
 #[derive(Debug, Default)]
 struct PatchImpact {
@@ -25,6 +30,126 @@ pub(super) fn list_sessions(
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
     list_file_source_sessions(profile, limit, extract_jsonl_metadata)
+}
+
+pub(super) fn format_chunks(
+    external_session_id: &str,
+    source_path: Option<&Path>,
+) -> Result<Vec<ActivityChunk>> {
+    let path = source_path.ok_or_else(|| {
+        anyhow!("Codex App source path missing for session: {external_session_id}")
+    })?;
+    let lines = read_jsonl_values(path)?;
+    let mut chunks = Vec::new();
+    let mut pending_tool_calls = HashMap::<String, ImportedToolCall>::new();
+    let mut sequence = 0_usize;
+
+    for value in lines {
+        let created_at = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "user_message" => {
+                if let Some(message) = user_message_from_payload(payload) {
+                    chunks.push(user_message_chunk(
+                        external_session_id,
+                        CODEX_APP_PROVIDER_SLUG,
+                        sequence,
+                        created_at,
+                        &message,
+                    ));
+                    sequence += 1;
+                }
+            }
+            "agent_message" => {
+                if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                    chunks.push(assistant_message_chunk(
+                        external_session_id,
+                        CODEX_APP_PROVIDER_SLUG,
+                        sequence,
+                        created_at,
+                        message,
+                    ));
+                    sequence += 1;
+                }
+            }
+            "message" => {
+                if payload.get("role").and_then(Value::as_str) == Some("assistant") {
+                    if let Some(text) = content_text_from_payload(payload) {
+                        chunks.push(assistant_message_chunk(
+                            external_session_id,
+                            CODEX_APP_PROVIDER_SLUG,
+                            sequence,
+                            created_at,
+                            &text,
+                        ));
+                        sequence += 1;
+                    }
+                }
+            }
+            "reasoning" | "agent_reasoning" => {
+                if let Some(text) = reasoning_text_from_payload(payload) {
+                    chunks.push(thinking_chunk(
+                        external_session_id,
+                        CODEX_APP_PROVIDER_SLUG,
+                        sequence,
+                        created_at,
+                        &text,
+                    ));
+                    sequence += 1;
+                }
+            }
+            "function_call" => {
+                if let Some(call) = pending_tool_call_from_payload(payload, created_at) {
+                    pending_tool_calls.insert(call.call_id.clone(), call);
+                }
+            }
+            "custom_tool_call" => {
+                if let Some(call) = pending_custom_tool_call_from_payload(payload, created_at) {
+                    pending_tool_calls.insert(call.call_id.clone(), call);
+                }
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                    if let Some(call) = pending_tool_calls.remove(call_id) {
+                        let output = payload
+                            .get("output")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        chunks.push(tool_call_chunk(
+                            external_session_id,
+                            CODEX_APP_PROVIDER_SLUG,
+                            sequence,
+                            &call,
+                            output,
+                        ));
+                        sequence += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for call in pending_tool_calls.into_values() {
+        chunks.push(tool_call_chunk(
+            external_session_id,
+            CODEX_APP_PROVIDER_SLUG,
+            sequence,
+            &call,
+            "",
+        ));
+        sequence += 1;
+    }
+    Ok(chunks)
 }
 
 fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
@@ -152,12 +277,139 @@ fn normalize_diff_path(path: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
+fn pending_tool_call_from_payload(payload: &Value, created_at: &str) -> Option<ImportedToolCall> {
+    let call_id = payload.get("call_id")?.as_str()?.to_string();
+    let raw_name = payload.get("name")?.as_str()?.to_string();
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(parse_inner_json)
+        .unwrap_or_else(|| json!({}));
+    let (canonical_name, args) = normalize_codex_tool_call(&raw_name, arguments);
+    Some(ImportedToolCall {
+        call_id,
+        raw_name,
+        canonical_name,
+        args,
+        created_at: created_at.to_string(),
+    })
+}
+
+fn pending_custom_tool_call_from_payload(
+    payload: &Value,
+    created_at: &str,
+) -> Option<ImportedToolCall> {
+    let call_id = payload.get("call_id")?.as_str()?.to_string();
+    let raw_name = payload.get("name")?.as_str()?.to_string();
+    let input = payload
+        .get("input")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let args = if raw_name == "apply_patch" {
+        json!({ "patch": input })
+    } else {
+        json!({ "input": input })
+    };
+    let (canonical_name, args) = normalize_codex_tool_call(&raw_name, args);
+    Some(ImportedToolCall {
+        call_id,
+        raw_name,
+        canonical_name,
+        args,
+        created_at: created_at.to_string(),
+    })
+}
+
+fn normalize_codex_tool_call(raw_name: &str, args: Value) -> (String, Value) {
+    match raw_name {
+        "shell" => (
+            FUNCTION_RUN_COMMAND_LINE.to_string(),
+            normalize_shell_args(args),
+        ),
+        "apply_patch" => (
+            FUNCTION_EDIT_FILE.to_string(),
+            normalize_apply_patch_args(args),
+        ),
+        _ => (raw_name.to_string(), args),
+    }
+}
+
+fn normalize_shell_args(args: Value) -> Value {
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("cmd").and_then(Value::as_str))
+        .unwrap_or_default();
+    json!({
+        "command": command,
+        "cmd": command,
+    })
+}
+
+fn normalize_apply_patch_args(args: Value) -> Value {
+    let patch = args
+        .get("patch")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("input").and_then(Value::as_str))
+        .unwrap_or_default();
+    json!({
+        "action": "apply_patch",
+        "patch": patch,
+    })
+}
+
+fn user_message_from_payload(payload: &Value) -> Option<String> {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn content_text_from_payload(payload: &Value) -> Option<String> {
+    let content = payload.get("content")?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let parts = items
+                .iter()
+                .filter_map(content_part_text)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn content_part_text(part: &Value) -> Option<&str> {
+    part.get("text")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("content").and_then(Value::as_str))
+}
+
+fn reasoning_text_from_payload(payload: &Value) -> Option<String> {
+    if let Some(text) = payload.get("content").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let summary = payload.get("summary")?.as_array()?;
+    let parts = summary
+        .iter()
+        .filter_map(content_part_text)
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
 
     use super::*;
+    use crate::{
+        ACTION_TYPE_ASSISTANT, ACTION_TYPE_RAW, ACTION_TYPE_TOOL_CALL, FUNCTION_ASSISTANT,
+        FUNCTION_USER_MESSAGE,
+    };
 
     fn temp_source_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -182,6 +434,34 @@ mod tests {
             default_full_evidence_upload: None,
             notes: None,
         }
+    }
+
+    #[test]
+    fn formats_codex_app_jsonl_as_source_chunks() {
+        let root = temp_source_root("chunks");
+        let transcript_path = root.join("codex-session.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"timestamp\":\"2026-06-18T01:00:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"Patch bug\"}}\n",
+                "{\"timestamp\":\"2026-06-18T01:01:00Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Working\"}}\n",
+                "{\"timestamp\":\"2026-06-18T01:02:00Z\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"cargo test\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-06-18T01:03:00Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"ok\"}}\n"
+            ),
+        )
+        .expect("write codex chunks transcript");
+
+        let chunks = format_chunks("codex-session", Some(&transcript_path)).expect("format chunks");
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].action_type, ACTION_TYPE_RAW);
+        assert_eq!(chunks[0].function, FUNCTION_USER_MESSAGE);
+        assert_eq!(chunks[1].action_type, ACTION_TYPE_ASSISTANT);
+        assert_eq!(chunks[1].function, FUNCTION_ASSISTANT);
+        assert_eq!(chunks[2].action_type, ACTION_TYPE_TOOL_CALL);
+        assert_eq!(chunks[2].function, FUNCTION_RUN_COMMAND_LINE);
+        assert_eq!(chunks[2].args["command"], "cargo test");
+        assert_eq!(chunks[2].result["output"], "ok");
     }
 
     #[test]

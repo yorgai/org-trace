@@ -31,7 +31,7 @@ Local append-only logs are the source of truth. Derived indexes may denormalize 
 - `session.linked_to_mission`: links an existing session to a mission with a relationship label.
 - `session.log_uploaded`: records metadata for content-addressed session log or transcript bytes. The payload stores log ref ID, original path, format, source, SHA-256, byte size, storage URI, local path, and optional repo context; it does not inline log content.
 
-Session metadata is the default sync tier. Full transcripts, replay JSON, recordings, and logs are optional evidence tier content addressed by hashes and storage URIs.
+Session metadata is the default sync tier. Full transcripts, formatted transcript JSON, recordings, and logs are optional evidence tier content addressed by hashes and storage URIs.
 
 ### Artifact events
 
