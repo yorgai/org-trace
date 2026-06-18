@@ -183,6 +183,7 @@ dependencies = [
  "chrono",
  "clap",
  "dialoguer",
+ "serde",
  "serde_json",
  "ureq",
 ]

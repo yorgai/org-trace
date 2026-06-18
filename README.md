@@ -40,6 +40,15 @@ cargo run -p brick -- --source claude_code import native list --limit 20
 cargo run -p brick -- --source claude_code import native ingest --external-session-id <native-id> --mission "$mission_id"
 ```
 
+The read-only history surface emits JSON for ORGII-style callers:
+
+```bash
+cargo run -q -p brick -- history sources --format json
+cargo run -q -p brick -- history sessions --source claude_code --limit 20 --format json
+cargo run -q -p brick -- history recent-paths --source all --limit 20 --format json
+cargo run -q -p brick -- history chunks --source claude_code --session-id <native-id> --format json
+```
+
 Create an Org, Project, Mission, agent-friendly current Session, and Artifacts:
 
 ```bash

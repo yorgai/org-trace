@@ -1,0 +1,618 @@
+---
+status: active
+---
+
+# Brick Handoff Summary — 2026-06-18
+
+This document captures the current state of Brick so another agent can continue without replaying the full conversation.
+
+## Product direction
+
+Brick is a standalone, publishable, self-host-first Rust CLI and server for accountable work provenance. The product model is:
+
+```text
+Brick Org
+  -> Brick Project
+    -> Brick Mission
+      -> Brick Session
+      -> Brick Artifact
+```
+
+Key principles:
+
+- Git remains the source of truth for code.
+- Brick is the source of truth for execution/provenance history.
+- Humans primarily manage `missions`.
+- Agent and human work are both represented as `sessions`.
+- Full transcripts or recordings should not be duplicated locally by default.
+- Local Brick records default to metadata-only pointers; copying evidence bytes is explicit.
+- Long term, `.brick` should become the unified local metadata/provenance root for external coding-app history and Brick's own org/project/mission/session ledger.
+- `.orgii` should be narrowed to ORGII-owned runtime sessions, CLI state, and app-private state. ORGII should eventually consume Brick metadata instead of maintaining a parallel external-history cache.
+- The local JSONL event log is the source of truth for provenance claims. SQLite and Markdown views are derived query/readability layers.
+- `.brick/` is local state and is automatically added to `.gitignore` by `brick init` when Brick is initialized inside a repo.
+
+## Repository status
+
+Recent commits:
+
+- `e12182d` — `Update Brick product model and source discovery`
+  - Pushed to `origin/main`.
+- `88df213` — `Add native source session import`
+  - Pushed to `origin/main`.
+
+Current working tree includes the first ORGII offload implementation slice:
+
+- `BRICK_HOME` resolution and `metadata.sqlite` schema/API skeleton.
+- Read-only `brick history` JSON command surface for sources, sessions, recent paths, and placeholder chunks.
+- Updated handoff/docs for the Brick-owned external-history direction.
+
+Before continuing, run:
+
+```bash
+git status --short --branch
+```
+
+If the user wants the latest native-import work on remote, push:
+
+```bash
+git push origin HEAD
+```
+
+## Current architecture
+
+### Pivot: unified Brick metadata root
+
+The latest product decision is that Brick should not be primarily a per-repo `.brick` folder that duplicates ORGII or external-app metadata. Instead, Brick should move toward a unified local metadata root, with repo/org/project/mission used as filter/sync dimensions.
+
+Target model:
+
+```text
+~/.brick/ or configured BRICK_HOME
+  metadata.sqlite          # unified external-history + Brick metadata cache
+  events/                  # provenance ledger events
+  sources/                 # source profiles and parser metadata
+  views/                   # derived agent-readable views
+  blobs/                   # optional copied evidence blobs only
+```
+
+Repo-local `.brick/` can still exist for lightweight bootstrap/config or repo-specific overrides, but should not be required as the only storage model. If Brick is initialized in a repo, `.brick/` stays gitignored. If Brick uses global storage, it should bind sessions to repo/workspace roots through explicit metadata fields rather than by placing all state in each repo.
+
+This matters because a single agent session can touch multiple roots/workspaces. The unified DB should model:
+
+- one native/source session
+- zero or more workspace roots
+- zero or more Git repos/branches/commits
+- zero or more Brick org/project/mission links
+
+Sync should then filter by `org_id` / project / mission / repo context, not by assuming one repo-local `.brick` directory contains all relevant metadata.
+
+### Crates
+
+- `crates/cli` — `brick` CLI.
+- `crates/server` — `brick-server` self-hosted remote.
+- `crates/protocol` — event schema, typed IDs, sync wire types.
+- `crates/core` — local storage, indexing, SQLite cache, source profiles, discovery, native source listing.
+- `crates/importers` — explicit-file import normalization.
+
+### Global metadata home
+
+First-stage global metadata support is implemented in:
+
+```text
+crates/core/src/global_home.rs
+crates/core/src/metadata_db.rs
+```
+
+Current behavior:
+
+- `BRICK_HOME` overrides the global Brick home.
+- Default global Brick home is `~/.brick`.
+- Unified metadata DB path is `<BRICK_HOME>/metadata.sqlite`.
+- The metadata DB has schema versioning and resets first-stage metadata/cache tables on incompatible version mismatch.
+- Implemented typed APIs include `MetadataDb::open_global`, `MetadataDb::open_in_home`, `MetadataDb::open_path`, `upsert_source_session`, and `list_source_sessions`.
+- Existing repo-local JSONL provenance flow remains unchanged.
+
+### Local storage
+
+Current implemented default store is repo-local:
+
+```text
+.brick/
+  config.toml
+  sources/<name>.toml
+  provenance/
+    repo.json
+    events/queue/*.jsonl
+    events/inbound/*.jsonl
+    cache/index.json
+    cache/brick.sqlite
+    views/
+      orgs/*.md
+      projects/*.md
+      missions/*.md
+      sessions/*.md
+      artifacts/*.md
+    blobs/sha256/<hash>
+```
+
+Important current behavior:
+
+- `LocalStore::init()` creates provenance directories and repo metadata.
+- `LocalStore::init()` also ensures `.brick/` is present in `.gitignore`, idempotently.
+- `events/queue` and `events/inbound` are the event sources for local and pulled events.
+- `index.json`, `brick.sqlite`, and `views/` are rebuildable.
+- SQLite schema versioning is implemented; incompatible derived DBs are reset and rebuilt.
+
+Planned storage direction:
+
+- Move external-history metadata and cache tables into a unified Brick DB under a global/configured Brick root.
+- Keep repo-local `.brick` as optional bootstrap/config only, not as the only metadata home.
+- Represent repo/workspace roots explicitly in the DB because sessions may span multiple workspaces.
+- Use `org_id` and related links as sync filters.
+
+## Core domain model
+
+Important IDs and entities:
+
+- `OrgId` — sync boundary, similar to a repo/org namespace.
+- `ProjectId` — groups missions.
+- `MissionId` — human-managed unit of work; replaces earlier “work item” language.
+- `SessionId` — agent or human execution/work session.
+- `ArtifactId` — decisions, notes, reviews, test results, etc.
+
+Mission statuses:
+
+- `planned`
+- `active`
+- `blocked`
+- `completed`
+- `archived`
+
+Evidence availability:
+
+- `local_pointer` — default; Brick stores metadata and path/URI only.
+- `local_blob` — copied into content-addressed local blob storage.
+- `remote_blob` — available remotely.
+
+## CLI shape
+
+Current major command groups:
+
+```bash
+brick init
+brick org ...
+brick project ...
+brick mission ...
+brick session ...
+brick artifact ...
+brick evidence ...
+brick import ...
+brick source ...
+brick history ...
+brick sync ...
+brick maintenance ...
+```
+
+Old commands were intentionally replaced, not kept as aliases.
+
+## Source profiles, discovery, and ORGII migration
+
+Repo-level config:
+
+```text
+.brick/config.toml
+```
+
+Source profiles:
+
+```text
+.brick/sources/<name>.toml
+```
+
+`SourceProfile` includes:
+
+- `name`
+- `app_id`
+- `actor_id`
+- `actor_type`
+- `store_root`
+- `session_db_path`
+- `session_log_path`
+- `evidence_root`
+- `cursor_state_db_path`
+- `default_full_evidence_upload`
+- `notes`
+
+Implemented source discovery lives in:
+
+```text
+crates/core/src/source_discovery.rs
+```
+
+It scans common default paths for:
+
+- ORGII
+- Cursor
+- Claude Code
+- Codex
+- OpenCode
+
+Important ORGII context:
+
+- ORGII already has hardcoded external-history readers and metadata caches for Cursor IDE, Codex App, Claude Code, OpenCode, and Windsurf.
+- Cursor uses `cursor_session_cache` after read-only delta sync from Cursor `state.vscdb`.
+- Non-Cursor imported history uses `imported_history_session_cache` keyed by source and source session ID.
+- The source-specific loading mechanisms currently live in ORGII: when a user opens an external session, ORGII knows how to re-open the native DB/JSONL/source path, parse the relevant transcript/window, and produce `ActivityChunk` records for rendering.
+- Those loaders are not just cache helpers. They are the operational source readers for external history replay, so migration must move/abstract them into Brick history providers rather than only copying metadata schemas.
+- ORGII caches metadata rows and reads transcript chunks lazily from source paths/DBs when rendering read-only history.
+- Brick should eventually absorb/migrate the entire ORGII external-history subsystem, not only scan/cache tables.
+- Scope includes scanners, delta caches, source-specific parsers, source-specific loading/windowing mechanisms, chunk loaders, `ActivityChunk` normalization, recent paths, impact stats, analysis backfills, diagnostics, and source-specific debug helpers.
+- In that future, ORGII is just one consumer of Brick-provided metadata/transcripts, like any other UI, rather than the owner of external-history indexing/parsing/loading/backfill logic.
+
+Relevant CLI:
+
+```bash
+brick source scan
+brick source scan --write-defaults
+```
+
+`brick init` runs discovery automatically:
+
+- In an interactive TTY, it can prompt the user to select discovered sources with arrow keys / space / enter.
+- In non-TTY/script mode, it prints findings and does not block.
+
+## Consolidated ORGII external-history offload plan
+
+The subagent audits converged on the same boundary: this is not just a scanner migration. Brick should absorb ORGII's portable external-history subsystem, while ORGII keeps app/UI/runtime orchestration.
+
+### Move into Brick
+
+Portable external-history core:
+
+- Source discovery and configured source roots.
+- Source-specific scanners for Cursor IDE, Claude Code, Codex App, OpenCode, and Windsurf.
+- Delta-sync/cache algorithms: source path, mtime, size, fingerprint, parser version, live IDs, pruning, and changed-record detection.
+- Source-specific parsers and raw DTOs.
+- Source-specific loading/windowing mechanisms that currently live in ORGII and reopen native DB/JSONL records on demand.
+- `ActivityChunk` creation/normalization for read-only replay.
+- Recent-path aggregation and repo/workspace inference.
+- Impact stats: touched files, files changed, lines added/removed, model/token metadata.
+- Parser diagnostics, parse errors, source status, and cache/debug commands.
+- Cursor turn-summary/window APIs as source-history read APIs, not as UI state.
+
+Potentially move later, depending on product boundary:
+
+- Analysis/backfill logic that reopens external histories, converts chunks into raw activity, extracts edits/shell commits, writes inferred artifacts/checkpoints, and computes watermarks.
+- If moved, Brick needs equivalent operational controls for memory gates, panic isolation, and long-running analysis status.
+
+### Keep in ORGII
+
+ORGII should remain responsible for:
+
+- Tauri command registration and compatibility wrappers while the UI migrates.
+- UI session list merging, pagination atoms, display groups, icons, and read-only routing.
+- EventStore/rendering pipeline and `processChunksRust` until a later UI refactor.
+- ORGII-owned live/runtime sessions.
+- Cursor live automation: debug-port lifecycle, send/watch/unwatch, model/mode setting.
+- ORGII repo/workspace import side effects from recent paths.
+- UI dashboards and app-specific diagnostics/toasts.
+
+### Brick API surface needed by ORGII
+
+Add a Brick-owned history query surface, with JSON output first so ORGII can shell out before taking a Rust crate dependency:
+
+```bash
+brick history sources --format json
+brick history sessions --source <source_id> --limit 200 --offset 0 --format json
+brick history recent-paths --source <source_id|all> --limit 20 --format json
+brick history chunks --source <source_id> --session-id <id> --format json
+```
+
+Cursor-specific read APIs should be preserved because ORGII's Cursor UI uses windowed loading:
+
+```bash
+brick history cursor initial-window --session-id <id> --recent-limit 100 --format json
+brick history cursor full-refresh --session-id <id> --format json
+brick history cursor turn-window --session-id <id> --user-bubble-id <id> --format json
+```
+
+The DTOs should initially match ORGII-compatible wire shapes:
+
+- source catalog rows
+- session rows/pages
+- recent paths
+- `ActivityChunk`
+- Cursor initial/full/turn windows
+- parser/cache diagnostics
+
+### Recommended migration stages
+
+1. Add `BRICK_HOME` and a unified metadata DB for external source metadata/cache. — first skeleton implemented.
+2. Add JSON history commands and make ORGII wrappers shell out behind feature flags. — first read-only JSON surface implemented; ORGII wrappers still pending.
+3. Move shared external-history DTOs and cache algorithms into Brick.
+4. Port file-based sources first: Claude Code and Codex App.
+5. Add dedupe on `(source_id, external_session_id)` and a `--force` path.
+6. Port OpenCode and Windsurf DB readers.
+7. Port Cursor IDE read-only history: list, initial window, full refresh, turn window.
+8. Keep Cursor live automation in ORGII.
+9. Move/rewrite analysis backfill only after deciding whether Brick owns orgtrack analysis artifacts.
+10. Remove ORGII external-history scanners/caches after source-by-source parity and fallback retirement.
+
+### Important schema implication
+
+Brick needs more than the existing event projection DB. Add persistent local metadata/cache tables that are not provenance claims:
+
+- `source_profiles`
+- `source_roots`
+- `source_scans`
+- `source_sessions`
+- `source_session_resources`
+- `workspace_roots`
+- `git_repositories`
+- `source_session_workspace_roots`
+- `source_session_git_repositories`
+- `brick_session_source_sessions`
+
+Keep the semantic split clear:
+
+- Source cache rows mean Brick observed external app metadata.
+- JSONL provenance events mean Brick recorded an accountability/provenance claim.
+
+## History JSON command surface
+
+First read-only history surface is implemented in:
+
+```text
+crates/cli/src/history.rs
+```
+
+CLI:
+
+```bash
+brick history sources --format json
+brick history sessions --source <source_id> --limit 20 --offset 0 --format json
+brick history recent-paths --source all --limit 20 --format json
+brick history chunks --source <source_id> --session-id <native-id> --format json
+```
+
+Current behavior:
+
+- `sources` emits configured source profile rows.
+- `sessions` adapts native source session file listing into stable JSON DTOs.
+- `recent-paths` aggregates recent native session paths across one source or all sources.
+- `chunks` currently returns an empty chunk array after validating the source profile exists; source-specific chunk loading remains pending.
+- This surface is intended as the first ORGII-compatible bridge contract, not the final source parser/cache implementation.
+
+## Native source session import
+
+First native importer slice is implemented in:
+
+```text
+crates/core/src/native_source.rs
+```
+
+Current behavior:
+
+- Lists native session files under the selected profile’s `session_log_path` and/or `evidence_root`.
+- Supports files ending in:
+  - `.jsonl`
+  - `.json`
+  - `.txt`
+  - `.log`
+  - `.md`
+  - `.markdown`
+- Uses filename stem as `external_session_id`.
+- Sorts recent files by modified time.
+- Ingest records metadata-only evidence pointers by default.
+- `native ingest` creates a new Brick `SessionId` unless `--session` is explicitly passed.
+
+CLI:
+
+```bash
+brick --source claude_code import native list --limit 20
+brick --source claude_code import native ingest --external-session-id <native-id> --mission <mission_id>
+```
+
+Smoke coverage was added in:
+
+```text
+scripts/smoke_mvp.sh
+```
+
+The smoke now creates a fake `claude_code` source profile, lists a native JSONL transcript, ingests it, and verifies sync/indexing with two sessions.
+
+## Verification status
+
+The following passed after the native importer work:
+
+```bash
+cargo fmt
+cargo check
+cargo test
+cargo doc --no-deps
+scripts/smoke_mvp.sh
+```
+
+The following passed after integrating the metadata DB and history JSON surface:
+
+```bash
+cargo fmt
+cargo check
+cargo run -q -p brick -- history sources --format json
+cargo test -p brick-core -p brick
+cargo doc --no-deps
+scripts/smoke_mvp.sh
+```
+
+Lints were checked for edited files with no errors.
+
+## Important files changed recently
+
+First ORGII offload slice:
+
+- `crates/core/src/global_home.rs`
+- `crates/core/src/metadata_db.rs`
+- `crates/cli/src/history.rs`
+- `crates/core/src/lib.rs`
+- `crates/cli/src/args.rs`
+- `crates/cli/src/main.rs`
+- `crates/cli/Cargo.toml`
+- `README.md`
+- `docs/architecture/handoff-summary--0618.md`
+
+Native import work:
+
+- `crates/core/src/native_source.rs`
+- `crates/core/src/lib.rs`
+- `crates/cli/src/args.rs`
+- `crates/cli/src/commands.rs`
+- `README.md`
+- `scripts/smoke_mvp.sh`
+
+Earlier product model / source discovery work:
+
+- `crates/protocol/src/ids.rs`
+- `crates/protocol/src/events.rs`
+- `crates/protocol/src/payloads.rs`
+- `crates/protocol/src/trace_event.rs`
+- `crates/core/src/index_types.rs`
+- `crates/core/src/index.rs`
+- `crates/core/src/sqlite_schema.rs`
+- `crates/core/src/sqlite_index.rs`
+- `crates/core/src/source_profile.rs`
+- `crates/core/src/source_discovery.rs`
+- `crates/core/src/store.rs`
+- `crates/core/src/attachment_store.rs`
+- `crates/cli/src/source.rs`
+- `crates/cli/src/main.rs`
+
+## Known gaps / recommended next steps
+
+### 1. Finish global metadata integration
+
+First-stage `BRICK_HOME` resolution and metadata DB schema/API are implemented, but the rest of Brick still primarily uses repo-local source profile files and provenance queues.
+
+Needed work:
+
+- Wire source discovery/import/history flows into `MetadataDb` instead of only TOML profiles and direct file scans.
+- Persist scan rows, source roots, workspace roots, repo contexts, and Brick-session links.
+- Decide when repo-local `.brick` is bootstrap/config only versus when it owns repo-local provenance events.
+- Model many-to-many relationships between source sessions and workspace roots/repos during actual scans.
+- Sync by `org_id` / project / mission / repo context filters rather than by physical repo-local storage.
+
+### 2. Migrate ORGII external-history subsystem into Brick
+
+Port the complete ORGII external-history subsystem into Brick rather than maintaining duplicate systems:
+
+- Cursor `state.vscdb` read-only delta sync.
+- Cursor `cursor_session_cache`-style metadata table.
+- Generic imported history cache table keyed by `(source, source_session_id)`.
+- Signature-based change detection using source path, mtime, size, fingerprint, and parser version.
+- Source-specific parsers for Cursor IDE, Codex App, Claude Code, OpenCode, and Windsurf.
+- Lazy transcript/chunk loading from original source paths/DBs.
+- `ActivityChunk` normalization and source-specific chunk windowing.
+- Recent path aggregation and repo/workspace inference.
+- Impact statistics: touched files, files changed, lines added/removed, model/tokens.
+- Analysis/backfill jobs that currently re-open external history to enrich session metadata.
+- Diagnostics/debug endpoints around source parse/cache state.
+
+After this, ORGII should use Brick as the external-history API and keep `.orgii` for ORGII-owned runtime state only.
+
+### 3. Native import deduplication
+
+Current `native ingest` can import the same native session repeatedly. Add a dedupe check using:
+
+```text
+(app_id, app_session_id)
+```
+
+Suggested behavior:
+
+- If matching session exists, print it and do not append new events.
+- Add `--force` to import again.
+- Add tests and smoke coverage.
+
+### 4. Better native metadata extraction
+
+Current native list uses file stem as ID/title. Improve per source:
+
+- Claude Code JSONL:
+  - parse timestamps
+  - parse cwd/repo path if available
+  - parse first user message/title
+  - parse model/token metadata when present
+- Codex JSONL:
+  - parse `turn_context` for cwd/model
+  - parse rollout file metadata
+- Generic JSONL:
+  - infer title from first meaningful message
+
+### 5. Cursor native DB importer
+
+`source_discovery` already finds Cursor `state.vscdb`. Add read-only listing/import for Cursor sessions from that DB or from ORGII-style session state if available.
+
+### 6. OpenCode native DB importer
+
+`source_discovery` already finds `opencode.db`. Add an OpenCode-specific DB reader for session metadata and transcript pointers.
+
+### 7. Interactive native pick
+
+Add a TTY command such as:
+
+```bash
+brick --source claude_code import native pick --mission <mission_id>
+```
+
+It should show a multi-select list of native sessions and ingest selected sessions.
+
+### 8. Server auth and repo/org permissions
+
+The server is intentionally unauthenticated MVP. Before real team/self-host usage, add:
+
+- repo/org authorization
+- write tokens
+- read tokens
+- push/pull auth headers
+- audit events for sync identity
+
+## Design cautions
+
+- Treat ORGII external-history code as a whole subsystem: scan, parse, cache, source-specific loading/windowing, chunk load, recent paths, impact stats, backfill, and diagnostics move together into Brick over time.
+- Be explicit that today these source-specific loading mechanisms still live in `.orgii`/ORGII code; the migration target is to make Brick own them and expose a stable history provider API.
+- Leave ORGII-only app/runtime behavior in ORGII: UI state, Tauri registration, ORGII-owned live sessions, repo import UI, Cursor live send/watch automation, and rendering/event-store plumbing until a later UI refactor.
+- Do not duplicate local transcripts by default.
+- Do not silently swallow source parsing errors if the user explicitly selected a source/session.
+- Keep repo-local `.brick/` ignored by Git when repo-local bootstrap/config exists.
+- Prefer a unified global/configured Brick root for metadata caches.
+- Keep source-profile config in TOML unless/until the unified DB fully replaces file profiles.
+- Keep local views derived and rebuildable.
+- Avoid adding aliases for removed old commands; this repo has not shipped, so prefer clean command shape.
+- Prefer typed enums/constants for domain values.
+
+## Useful commands for the next agent
+
+```bash
+cargo fmt
+cargo check
+cargo test
+cargo doc --no-deps
+scripts/smoke_mvp.sh
+```
+
+List native sessions from a configured profile:
+
+```bash
+cargo run -p brick -- --source claude_code import native list --limit 20
+```
+
+Ingest one native session:
+
+```bash
+cargo run -p brick -- --source claude_code import native ingest --external-session-id <native-id> --mission <mission_id>
+```
+
+Check source discovery:
+
+```bash
+cargo run -p brick -- source scan
+```

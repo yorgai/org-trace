@@ -6,10 +6,12 @@
 
 mod attachment_store;
 mod diff_capture;
+mod global_home;
 mod identity;
 mod index;
 mod index_types;
 mod log_store;
+mod metadata_db;
 mod native_source;
 mod repo;
 mod repo_context;
@@ -25,9 +27,11 @@ mod store_options;
 
 pub use attachment_store::*;
 pub use diff_capture::*;
+pub use global_home::*;
 pub use identity::*;
 pub use index_types::*;
 pub use log_store::*;
+pub use metadata_db::*;
 pub use native_source::*;
 pub use repo::*;
 pub use repo_context::*;

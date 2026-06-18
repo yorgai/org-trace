@@ -12,6 +12,7 @@ brick-core = { path = "../core" }
 brick-importers = { path = "../importers" }
 brick-protocol = { path = "../protocol" }
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.3.0", features = ["json"] }
 dialoguer = "0.12.0"

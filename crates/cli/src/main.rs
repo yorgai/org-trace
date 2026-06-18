@@ -19,6 +19,7 @@ mod args;
 mod commands;
 mod context;
 mod db;
+mod history;
 mod inspect;
 mod output;
 mod source;
@@ -31,6 +32,7 @@ use commands::{
 };
 use context::{handle_context, handle_session_read};
 use db::handle_db;
+use history::handle_history;
 use inspect::{
     handle_index, show_artifact, show_file, show_mission, show_org, show_project, show_session,
 };
@@ -60,7 +62,7 @@ fn main() -> Result<()> {
         }
     }
     let selected_source_profile = match &command {
-        Command::Source { .. } => None,
+        Command::Source { .. } | Command::History { .. } => None,
         _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
     };
@@ -167,6 +169,7 @@ fn main() -> Result<()> {
             &store,
             selected_source_profile.as_ref(),
         )?,
+        Command::History { command } => handle_history(command, &source_profiles)?,
         Command::Sync { command } => match command {
             SyncCommand::Run(args) => handle_sync(&store, args.dry_run, args.remote, args.repo_id)?,
             SyncCommand::Push(args) => {

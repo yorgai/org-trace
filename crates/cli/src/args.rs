@@ -93,6 +93,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ImportCommand,
     },
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
@@ -418,6 +422,46 @@ pub enum SourceCommand {
         #[arg(long)]
         name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HistoryCommand {
+    Sources {
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    Sessions {
+        #[arg(long)]
+        source: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    RecentPaths {
+        #[arg(long)]
+        source: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    Chunks {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum HistoryFormatArg {
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
