@@ -33,6 +33,13 @@ You can still override paths manually when the scanner does not find the desired
 cargo run -p brick -- source configure --name cursor --app-id cursor --actor-id agent-1 --actor-type agent --evidence-root ~/.orgii --cursor-state-db-path "$HOME/Library/Application Support/Cursor/User/globalStorage/state.vscdb" --default-full-evidence-upload false --notes "Cursor agent"
 ```
 
+Native source profiles can be listed and ingested without manually locating each transcript file. Ingest records a Brick session plus a metadata-only log pointer by default:
+
+```bash
+cargo run -p brick -- --source claude_code import native list --limit 20
+cargo run -p brick -- --source claude_code import native ingest --external-session-id <native-id> --mission "$mission_id"
+```
+
 Create an Org, Project, Mission, agent-friendly current Session, and Artifacts:
 
 ```bash

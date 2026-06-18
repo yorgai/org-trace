@@ -425,7 +425,35 @@ pub enum ImportCommand {
     Cursor(AgentImportArgs),
     Codex(AgentImportArgs),
     ClaudeCode(AgentImportArgs),
+    Native {
+        #[command(subcommand)]
+        command: NativeImportCommand,
+    },
     Ci(CiImportArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NativeImportCommand {
+    List(NativeImportListArgs),
+    Ingest(NativeImportIngestArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NativeImportListArgs {
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct NativeImportIngestArgs {
+    #[arg(long)]
+    pub external_session_id: String,
+
+    #[arg(long)]
+    pub mission: Option<String>,
+
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Args)]

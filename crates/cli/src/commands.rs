@@ -6,7 +6,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use brick_core::{
-    capture_diff, capture_repo_context, BrickConfig, DiffCaptureRequest, LocalStore, SourceProfile,
+    capture_diff, capture_repo_context, list_native_source_sessions, BrickConfig,
+    DiffCaptureRequest, LocalStore, NativeSourceSession, SourceProfile,
 };
 use brick_importers::{import_traces, ImportRequest, ImportSource};
 use brick_protocol::{
@@ -21,8 +22,8 @@ use brick_protocol::{
 
 use crate::args::{
     AgentImportArgs, ArtifactCommand, ArtifactKindArg, CiImportArgs, DiffTargetArg,
-    EvidenceCommand, IdentityArgs, ImportCommand, MissionCommand, MissionStatusArg, OrgCommand,
-    ProjectCommand, SessionCommand, SessionLogFormatArg,
+    EvidenceCommand, IdentityArgs, ImportCommand, MissionCommand, MissionStatusArg,
+    NativeImportCommand, OrgCommand, ProjectCommand, SessionCommand, SessionLogFormatArg,
 };
 use crate::context::{parse_optional_id, resolve_cli_identity};
 use crate::output::print_session_env;
@@ -507,11 +508,18 @@ pub fn handle_import(
     store: &LocalStore,
     source_profile: Option<&SourceProfile>,
 ) -> Result<()> {
+    let command = match command {
+        ImportCommand::Native { command } => {
+            return handle_native_import(command, identity_args, store, source_profile);
+        }
+        command => command,
+    };
     let (source, paths, session, mission, app_session_id, app_session_name) = match command {
         ImportCommand::Cursor(args) => agent_import_parts(ImportSource::Cursor, args),
         ImportCommand::Codex(args) => agent_import_parts(ImportSource::Codex, args),
         ImportCommand::ClaudeCode(args) => agent_import_parts(ImportSource::ClaudeCode, args),
         ImportCommand::Ci(args) => ci_import_parts(args),
+        ImportCommand::Native { .. } => unreachable!("native import handled before file import"),
     };
     let session_id = parse_optional_id::<SessionId>(session.as_deref(), "session")?;
     let mission_id = parse_optional_id::<MissionId>(mission.as_deref(), "mission")?;
@@ -537,6 +545,117 @@ pub fn handle_import(
     }
     println!("imported_event_count={}", result.imported_event_count());
     Ok(())
+}
+
+fn handle_native_import(
+    command: NativeImportCommand,
+    identity_args: &IdentityArgs,
+    store: &LocalStore,
+    source_profile: Option<&SourceProfile>,
+) -> Result<()> {
+    let profile = source_profile.ok_or_else(|| {
+        anyhow!("native import requires a selected source profile; pass --source <name>")
+    })?;
+    match command {
+        NativeImportCommand::List(args) => {
+            let sessions = list_native_source_sessions(profile, Some(args.limit))?;
+            println!("native_session_count={}", sessions.len());
+            for session in sessions {
+                print_native_source_session(&session);
+            }
+            Ok(())
+        }
+        NativeImportCommand::Ingest(args) => {
+            let session = list_native_source_sessions(profile, None)?
+                .into_iter()
+                .find(|session| session.external_session_id == args.external_session_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "native session not found for external_session_id={}",
+                        args.external_session_id
+                    )
+                })?;
+            let requested_session_id =
+                parse_optional_id::<SessionId>(args.session.as_deref(), "session")?;
+            let native_session_id = requested_session_id.unwrap_or_default();
+            let mission_id = parse_optional_id::<MissionId>(args.mission.as_deref(), "mission")?;
+            let identity = resolve_cli_identity(
+                store,
+                identity_args,
+                mission_id,
+                Some(native_session_id),
+                Some(profile),
+            )?;
+            let pointer = store.attachment_store().inspect_file(&session.path)?;
+            let brick_session_id = identity.session_id.clone();
+            let started = TraceEvent::session_started(
+                identity.actor.clone(),
+                brick_session_id.clone(),
+                identity.mission_id.clone(),
+                SessionStartedPayload {
+                    session_name: session.title.clone(),
+                    source: brick_protocol::SessionSource {
+                        app_id: Some(session.source_app_id.clone()),
+                        app_session_id: Some(session.external_session_id.clone()),
+                        app_session_name: session.title.clone(),
+                        runtime_id: None,
+                    },
+                    repo_context_id: None,
+                },
+            )
+            .context("failed to build native imported session.started event")?;
+            let log = TraceEvent::session_log_uploaded(
+                identity.actor,
+                identity.session_id,
+                SessionLogUploadedPayload {
+                    log_ref_id: LogRefId::new(),
+                    original_path: pointer.original_path.display().to_string(),
+                    format: infer_native_log_format(&session.path),
+                    source: session.source_app_id,
+                    sha256: pointer.sha256,
+                    size_bytes: pointer.size_bytes,
+                    storage_uri: format!("file://{}", session.path.display()),
+                    local_path: String::new(),
+                    external_uri: Some(format!("file://{}", session.path.display())),
+                    availability: EvidenceAvailability::LocalPointer,
+                    repo_context_id: None,
+                },
+            )
+            .context("failed to build native imported session.log_uploaded event")?;
+            store.append_event(&started)?;
+            store.append_event(&log)?;
+            println!("imported_event_count=2");
+            println!("session_id={brick_session_id}");
+            println!("external_session_id={}", session.external_session_id);
+            println!("path={}", session.path.display());
+            Ok(())
+        }
+    }
+}
+
+fn print_native_source_session(session: &NativeSourceSession) {
+    println!(
+        "native_session={} app_id={} size_bytes={} path={}",
+        session.external_session_id,
+        session.source_app_id,
+        session.size_bytes,
+        session.path.display()
+    );
+}
+
+fn infer_native_log_format(path: &std::path::Path) -> SessionLogFormat {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jsonl") => SessionLogFormat::Jsonl,
+        Some("json") => SessionLogFormat::Unknown,
+        Some("txt" | "log") => SessionLogFormat::Text,
+        Some("md" | "markdown") => SessionLogFormat::Markdown,
+        _ => SessionLogFormat::Unknown,
+    }
 }
 
 fn agent_import_parts(

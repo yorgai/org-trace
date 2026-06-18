@@ -90,7 +90,11 @@ printf 'working change\n' >> tracked.txt
 
 run brick --store-root "${STORE_ONE}" init
 run brick source config --default-full-evidence-upload false --metadata-only-local true
+NATIVE_LOG_ROOT="${TMP_ROOT}/native-claude/projects/repo"
+mkdir -p "${NATIVE_LOG_ROOT}"
+printf '{"role":"assistant","message":"native smoke"}\n' > "${NATIVE_LOG_ROOT}/native-smoke.jsonl"
 run brick source configure --name cursor --app-id cursor --actor-id smoke-agent --actor-type agent --store-root "${STORE_ONE}" --evidence-root "${TMP_ROOT}/.orgii" --default-full-evidence-upload false --notes "Smoke source"
+run brick source configure --name claude_code --app-id claude_code --actor-id smoke-agent --actor-type agent --store-root "${STORE_ONE}" --session-log-path "${TMP_ROOT}/native-claude/projects" --default-full-evidence-upload false --notes "Native smoke source"
 run brick source use --name cursor
 run brick --source cursor source show --name cursor
 
@@ -160,6 +164,8 @@ cat > "${CI_FIXTURE}" <<'JSON'
 }
 JSON
 run brick --source cursor import cursor --path "${CURSOR_FIXTURE}" --session "${session_id}" --mission "${mission_id}" --app-session-id cursor-smoke --app-session-name "Cursor Smoke"
+run brick --source claude_code import native list --limit 5
+run brick --source claude_code import native ingest --external-session-id native-smoke --mission "${mission_id}"
 run brick --source cursor import ci --path "${CI_FIXTURE}" --mission "${mission_id}" --session "${session_id}"
 run brick --source cursor maintenance index rebuild
 run brick --source cursor maintenance db rebuild
