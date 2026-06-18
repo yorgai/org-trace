@@ -1,0 +1,46 @@
+{
+  "source": "opencode",
+  "description": "Generated OpenCode SQLite fixture from SQL spec covering session, message, and part tables with text, reasoning, tool chunks, and token totals.",
+  "format": "opencode_sqlite",
+  "dbSpecPath": "db-spec/opencode.sql",
+  "profile": {},
+  "expected": {
+    "sessions": [
+      {
+        "externalSessionId": "opencode-session-1",
+        "title": "Build OpenCode fixture",
+        "parserVersion": "opencode-sqlite-v1",
+        "model": "anthropic/claude-example",
+        "inputTokens": 15,
+        "outputTokens": 7,
+        "repoPath": "/workspace/opencode-repo",
+        "branch": null
+      }
+    ],
+    "chunks": {
+      "opencode-session-1": [
+        {
+          "actionType": "raw",
+          "function": "user_message",
+          "text": "Run OpenCode fixture"
+        },
+        {
+          "actionType": "assistant",
+          "function": "assistant",
+          "text": "I will run the command."
+        },
+        {
+          "actionType": "thinking",
+          "function": "thinking",
+          "text": "Need a shell command."
+        },
+        {
+          "actionType": "tool_call",
+          "function": "run_command_line",
+          "command": "cargo test -p brick-core external_source_provider_fixtures_match_expected_metadata_and_chunks",
+          "output": "ok"
+        }
+      ]
+    }
+  }
+}

@@ -44,6 +44,7 @@ The read-through history surface refreshes native source metadata into `<BRICK_H
 
 ```bash
 cargo run -q -p brick -- history sources --format json
+cargo run -q -p brick -- history doctor --source all --format json
 cargo run -q -p brick -- history sessions --source claude_code --limit 20 --format json
 cargo run -q -p brick -- history plans --source cursor_ide --limit 20 --offset 0 --format json
 cargo run -q -p brick -- history recent-paths --source all --limit 20 --format json

@@ -69,6 +69,10 @@ Terminology:
 | `source_message_id` / `sourceMessageId` | Optional native message/tool call ID where the provider exposes one. |
 | `source_part_id` / `sourcePartId` | Optional native part/bubble ID where the provider exposes one. |
 
+### Source diagnostics JSON
+
+`brick history doctor --source <source|all> --format json` returns raw diagnostic rows for configured source providers. It is intentionally JSON-only and does not apply app rendering semantics. Each row reports profile presence/selection, provider and parser kind, configured path fields with existence/readability checks, provider metadata listing status or structured error string, indexed source-session/source-plan counts from `metadata.sqlite` when available, provider notes, and accumulated errors.
+
 ### Session export formatting
 
 `brick history export` is the specific-session export surface. JSON is canonical and loss-minimized. CSV is a convenience formatting for audit tables and spreadsheets.
@@ -77,7 +81,9 @@ Terminology:
 | --- | --- | --- |
 | JSON | `brick history export --source <source> --session-id <id> --schema audit-v1 --format json` | Full structured audit packet. |
 | JSON metadata | `brick history export --source <source> --session-id <id> --schema source-metadata-v1 --format json` | Current source metadata index row plus chunks when supported. |
-| CSV | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | One row per formatted chunk with repeated session metadata/token/impact columns. If no chunks are available, emit one metadata-only row. |
+| CSV | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | One row per formatted chunk with repeated session metadata/token/impact columns and chunk source-pointer columns. If no chunks are available, emit one metadata-only row with empty chunk/source-pointer cells. |
+
+CSV chunk source-pointer columns are named `chunk_source_id`, `chunk_source_path`, `source_record_key`, `source_line_number`, `source_message_id`, and `source_part_id`. They are raw audit pointers back into native storage, not stable UI anchors: JSONL providers generally populate path plus line number, Cursor-family providers populate DB path plus KV row keys, and DB-backed providers populate DB path plus native message/part IDs where available.
 
 Future formats should be added as formatting adapters over the same source metadata and chunk DTOs, not as provider-specific CLI paths.
 

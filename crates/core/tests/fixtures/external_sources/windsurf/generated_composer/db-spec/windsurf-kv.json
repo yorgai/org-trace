@@ -1,0 +1,77 @@
+{
+  "rows": [
+    {
+      "key": "composerData:windsurf-composer-1",
+      "value": {
+        "composerId": "windsurf-composer-1",
+        "name": "Implement Windsurf fixture",
+        "createdAt": 1766100000000,
+        "lastUpdatedAt": 1766100060000,
+        "modelConfig": {
+          "modelName": "windsurf-example-model"
+        },
+        "contextTokensUsed": 42000,
+        "trackedGitRepos": [
+          {
+            "repoPath": "/workspace/windsurf-repo",
+            "branches": [
+              {
+                "branchName": "feature/windsurf"
+              }
+            ]
+          }
+        ],
+        "filesChangedCount": 1,
+        "totalLinesAdded": 5,
+        "totalLinesRemoved": 1,
+        "touchedFiles": [
+          "src/windsurf.rs"
+        ],
+        "fullConversationHeadersOnly": [
+          {
+            "bubbleId": "windsurf-user-1"
+          },
+          {
+            "bubbleId": "windsurf-assistant-1"
+          },
+          {
+            "bubbleId": "windsurf-tool-1"
+          }
+        ]
+      }
+    },
+    {
+      "key": "bubbleId:windsurf-composer-1:windsurf-user-1",
+      "value": {
+        "bubbleId": "windsurf-user-1",
+        "type": 1,
+        "createdAt": 1766100001000,
+        "text": "Update Windsurf provider"
+      }
+    },
+    {
+      "key": "bubbleId:windsurf-composer-1:windsurf-assistant-1",
+      "value": {
+        "bubbleId": "windsurf-assistant-1",
+        "type": 2,
+        "createdAt": 1766100002000,
+        "text": "I will update the provider."
+      }
+    },
+    {
+      "key": "bubbleId:windsurf-composer-1:windsurf-tool-1",
+      "value": {
+        "bubbleId": "windsurf-tool-1",
+        "type": 2,
+        "createdAt": 1766100003000,
+        "toolFormerData": {
+          "name": "edit_file_v2",
+          "params": {
+            "target_file": "src/windsurf.rs"
+          },
+          "result": "updated"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,118 @@
+{
+  "rows": [
+    {
+      "key": "composer.composerHeaders",
+      "value": {
+        "allComposers": {
+          "cursor-composer-1": {
+            "name": "Implement Cursor fixture",
+            "createdAt": 1766000000000,
+            "lastUpdatedAt": 1766000060000,
+            "trackedGitRepos": [
+              {
+                "repoPath": "/workspace/repo",
+                "branches": [
+                  {
+                    "branchName": "feature/cursor"
+                  }
+                ]
+              }
+            ],
+            "modelConfig": {
+              "modelName": "cursor-example-model"
+            },
+            "filesChangedCount": 2,
+            "totalLinesAdded": 8,
+            "totalLinesRemoved": 3
+          }
+        }
+      }
+    },
+    {
+      "key": "composerData:cursor-composer-1",
+      "value": {
+        "composerId": "cursor-composer-1",
+        "fullConversationHeadersOnly": [
+          {
+            "bubbleId": "cursor-user-1"
+          },
+          {
+            "bubbleId": "cursor-assistant-1"
+          },
+          {
+            "bubbleId": "cursor-tool-1"
+          }
+        ]
+      }
+    },
+    {
+      "key": "bubbleId:cursor-composer-1:cursor-user-1",
+      "value": {
+        "bubbleId": "cursor-user-1",
+        "type": 1,
+        "createdAt": 1766000001000,
+        "content": "composer.content.1111111111111111"
+      }
+    },
+    {
+      "key": "bubbleId:cursor-composer-1:cursor-assistant-1",
+      "value": {
+        "bubbleId": "cursor-assistant-1",
+        "type": 2,
+        "createdAt": 1766000002000,
+        "text": "I will inspect the workspace."
+      }
+    },
+    {
+      "key": "bubbleId:cursor-composer-1:cursor-tool-1",
+      "value": {
+        "bubbleId": "cursor-tool-1",
+        "type": 2,
+        "createdAt": 1766000003000,
+        "toolFormerData": {
+          "name": "run_terminal_command",
+          "params": {
+            "contentId": "2222222222222222"
+          },
+          "result": {
+            "contentKey": "composer.content.3333333333333333"
+          }
+        }
+      }
+    },
+    {
+      "key": "composer.content.1111111111111111",
+      "value": "Use the generated Cursor fixture"
+    },
+    {
+      "key": "composer.content.2222222222222222",
+      "value": "{\"command\":\"pwd\"}"
+    },
+    {
+      "key": "composer.content.3333333333333333",
+      "value": {
+        "text": "workspace path"
+      }
+    },
+    {
+      "key": "composer.planRegistry",
+      "value": {
+        "plans": {
+          "plan-cursor-1": {
+            "title": "Cursor fixture plan",
+            "uri": {
+              "external": "file:///workspace/repo/.cursor/plans/plan-cursor-1.plan.md",
+              "fsPath": "/workspace/repo/.cursor/plans/plan-cursor-1.plan.md"
+            },
+            "createdBy": "cursor-composer-1",
+            "builtBy": {
+              "cursor-composer-1": [
+                "todo-fixture"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

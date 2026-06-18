@@ -80,7 +80,7 @@ This document tracks Brick's source-session metadata structure and how each nati
 - `plans[]` rows with the raw source-plan metadata fields: `plan_id` / `external_plan_id`, title, source path or URI, source mtime, parser version, lifecycle timestamps, and provider `metadata_json`.
 - `edges[]` rows for the returned plan page, keyed by `external_plan_id` and preserving native `external_session_id` even when no matching `source_sessions` row exists. Edge rows include role, optional `todo_ids_json`, lifecycle timestamps, and provider `metadata_json`.
 
-This slice intentionally exposes only raw JSON. It does not assign UI labels, task status, renderer hints, or app-specific plan semantics.
+This slice intentionally exposes only raw JSON. It does not assign UI labels, task status, renderer hints, or app-specific plan semantics. A future `history plan-export --source <source> --plan-id <id> --format json` can narrow the same raw row/edge DTOs to one plan, but should remain metadata-plus-edges only unless a separate evidence-copy command explicitly opts into plan file contents.
 
 ## Token accounting
 
@@ -173,7 +173,7 @@ Brick keeps the public export surface intentionally small. Source-specific provi
 | --- | --- | --- | --- |
 | `audit-v1` | `brick history export --source <source> --session-id <id> --schema audit-v1 --format json` | Stable cross-provider audit packet for humans, reviewers, and ORGII ingestion. | Normalized source, session, token, impact, evidence, and chunk sections. |
 | `source-metadata-v1` | `brick history export --source <source> --session-id <id> --schema source-metadata-v1 --format json` | Loss-minimized export of the current metadata index row for debugging and provider parity checks. | Mirrors first-class `source_sessions` metadata plus provider extras. |
-| CSV formatting | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | Spreadsheet/audit-table export for a specific session. | One row per chunk, with repeated session metadata/token/impact columns; metadata-only sources emit one row with empty chunk columns. |
+| CSV formatting | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | Spreadsheet/audit-table export for a specific session. | One row per chunk, with repeated session metadata/token/impact columns and raw chunk source-pointer columns; metadata-only sources emit one row with empty chunk/source-pointer columns. |
 
 Both schemas include a `chunks` array. Chunk objects may include optional raw source pointers (`source_id`, `source_path`, `source_record_key`, `source_line_number`, `source_message_id`, `source_part_id`) when the provider can identify the native record without expensive reconstruction. For Claude Code and Codex App, Brick lazily formats JSONL transcript records into chunk JSON and records path/line pointers. DB-backed providers attach DB paths and native row/key IDs where available. This preserves the final audit shape while keeping full transcript content out of `metadata.sqlite`.
 

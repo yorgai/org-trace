@@ -4,15 +4,16 @@
 //! implementation adapts configured source profiles and native session file
 //! listings into stable JSON DTOs that can be consumed by ORGII-style callers.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use brick_core::{
-    format_source_session_chunks, list_source_plans, list_source_sessions, ActivityChunk,
-    MetadataDb, NativeSourceSession, SourcePlanListQuery, SourcePlanRecord,
+    format_source_session_chunks, list_source_plans, list_source_sessions, metadata_db_path,
+    ActivityChunk, MetadataDb, NativeSourceSession, SourcePlanListQuery, SourcePlanRecord,
     SourcePlanSessionEdgeRecord, SourceProfile, SourceProfileStore, SourceSessionListQuery,
     SourceSessionRecord, SourceSessionUpsert,
 };
@@ -249,6 +250,64 @@ pub struct SourceMetadataSessionRow {
     pub metadata_json: Option<Value>,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct HistoryDoctorResponse {
+    pub source: String,
+    pub metadata_db_path: Option<String>,
+    pub selected_profile: Option<String>,
+    pub rows: Vec<HistoryDoctorRow>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct HistoryDoctorRow {
+    pub source_id: String,
+    pub status: String,
+    pub provider_kind: String,
+    pub parser_kind: String,
+    pub profile: DoctorProfileDiagnostic,
+    pub configured_paths: Vec<DoctorPathDiagnostic>,
+    pub provider_metadata: DoctorProviderMetadataDiagnostic,
+    pub indexed_counts: DoctorIndexedCounts,
+    pub notes: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DoctorProfileDiagnostic {
+    pub exists: bool,
+    pub selected: bool,
+    pub app_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub actor_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DoctorPathDiagnostic {
+    pub field: String,
+    pub required: bool,
+    pub configured: bool,
+    pub path: Option<String>,
+    pub exists: Option<bool>,
+    pub readable: Option<bool>,
+    pub kind: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DoctorProviderMetadataDiagnostic {
+    pub status: String,
+    pub session_rows: Option<usize>,
+    pub plan_rows: Option<usize>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DoctorIndexedCounts {
+    pub source_sessions: Option<usize>,
+    pub source_plans: Option<usize>,
+    pub error: Option<String>,
+}
+
 /// Executes read-only history subcommands and emits machine-readable JSON.
 pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) -> Result<()> {
     match command {
@@ -314,6 +373,10 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
                 &selected_profiles,
                 limit,
             )?)
+        }
+        HistoryCommand::Doctor { source, format } => {
+            ensure_json(format);
+            print_json(&build_doctor_response(profiles, &source)?)
         }
         HistoryCommand::Chunks {
             source,
@@ -468,6 +531,309 @@ fn build_recent_paths_response(
     })
 }
 
+fn build_doctor_response(
+    profiles: &SourceProfileStore,
+    source: &str,
+) -> Result<HistoryDoctorResponse> {
+    let selected_profile = profiles.selected_profile_name()?;
+    let rows = doctor_profiles(profiles, source, selected_profile.as_deref())?
+        .into_iter()
+        .map(|(profile, exists)| build_doctor_row(profile, exists, selected_profile.as_deref()))
+        .collect();
+    Ok(HistoryDoctorResponse {
+        source: source.to_string(),
+        metadata_db_path: metadata_db_path()
+            .map(|path| path.display().to_string())
+            .ok(),
+        selected_profile,
+        rows,
+    })
+}
+
+fn doctor_profiles(
+    profiles: &SourceProfileStore,
+    source: &str,
+    selected: Option<&str>,
+) -> Result<Vec<(SourceProfile, bool)>> {
+    if source == "all" {
+        return profiles.list_profiles().map(|profiles| {
+            profiles
+                .into_iter()
+                .map(|profile| (profile, true))
+                .collect()
+        });
+    }
+    match profiles.read_profile(source)? {
+        Some(profile) => Ok(vec![(profile, true)]),
+        None => Ok(vec![(missing_source_profile(source, selected), false)]),
+    }
+}
+
+fn missing_source_profile(source: &str, selected: Option<&str>) -> SourceProfile {
+    SourceProfile {
+        name: source.to_string(),
+        app_id: None,
+        actor_id: None,
+        actor_type: None,
+        store_root: None,
+        session_db_path: None,
+        session_log_path: None,
+        evidence_root: None,
+        cursor_state_db_path: None,
+        default_full_evidence_upload: None,
+        notes: selected.map(|name| format!("selected profile is {name}")),
+    }
+}
+
+fn build_doctor_row(
+    profile: SourceProfile,
+    profile_exists: bool,
+    selected: Option<&str>,
+) -> HistoryDoctorRow {
+    let provider_kind = provider_kind(&profile.name).to_string();
+    let parser_kind = parser_kind(&profile.name).to_string();
+    let configured_paths = doctor_path_diagnostics(&profile);
+    let mut errors = configured_paths
+        .iter()
+        .filter_map(|path| path.error.clone())
+        .collect::<Vec<_>>();
+    if !profile_exists {
+        errors.push(format!("source profile not found: {}", profile.name));
+    }
+    let provider_metadata = if profile_exists {
+        doctor_provider_metadata(&profile)
+    } else {
+        DoctorProviderMetadataDiagnostic {
+            status: "skipped".to_string(),
+            session_rows: None,
+            plan_rows: None,
+            error: Some("profile missing".to_string()),
+        }
+    };
+    if let Some(error) = &provider_metadata.error {
+        errors.push(error.clone());
+    }
+    let indexed_counts = doctor_indexed_counts(&profile.name);
+    let mut notes = provider_notes(&profile);
+    if !profile_exists {
+        notes.push(
+            "run `brick source scan --write-defaults` or `brick source configure`".to_string(),
+        );
+    }
+    let status = if errors.is_empty() { "ok" } else { "error" }.to_string();
+
+    HistoryDoctorRow {
+        source_id: profile.name.clone(),
+        status,
+        provider_kind,
+        parser_kind,
+        profile: DoctorProfileDiagnostic {
+            exists: profile_exists,
+            selected: selected == Some(profile.name.as_str()),
+            app_id: profile.app_id,
+            actor_id: profile.actor_id,
+            actor_type: profile
+                .actor_type
+                .map(format_actor_type)
+                .map(str::to_string),
+        },
+        configured_paths,
+        provider_metadata,
+        indexed_counts,
+        notes,
+        errors,
+    }
+}
+
+fn doctor_provider_metadata(profile: &SourceProfile) -> DoctorProviderMetadataDiagnostic {
+    let sessions = list_source_sessions(profile, Some(1));
+    let plans = list_source_plans(profile);
+    match (sessions, plans) {
+        (Ok(sessions), Ok(plans)) => DoctorProviderMetadataDiagnostic {
+            status: "ok".to_string(),
+            session_rows: Some(sessions.len()),
+            plan_rows: Some(plans.len()),
+            error: None,
+        },
+        (session_result, plan_result) => DoctorProviderMetadataDiagnostic {
+            status: "error".to_string(),
+            session_rows: session_result.as_ref().ok().map(Vec::len),
+            plan_rows: plan_result.as_ref().ok().map(Vec::len),
+            error: Some(
+                [session_result.err(), plan_result.err()]
+                    .into_iter()
+                    .flatten()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        },
+    }
+}
+
+fn doctor_indexed_counts(source_id: &str) -> DoctorIndexedCounts {
+    match MetadataDb::open_global() {
+        Ok(metadata_db) => DoctorIndexedCounts {
+            source_sessions: metadata_db.count_source_sessions(Some(source_id)).ok(),
+            source_plans: metadata_db.count_source_plans(Some(source_id)).ok(),
+            error: None,
+        },
+        Err(error) => DoctorIndexedCounts {
+            source_sessions: None,
+            source_plans: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn doctor_path_diagnostics(profile: &SourceProfile) -> Vec<DoctorPathDiagnostic> {
+    source_path_specs(profile)
+        .into_iter()
+        .map(|(field, required, path)| doctor_path_diagnostic(field, required, path))
+        .collect()
+}
+
+fn doctor_path_diagnostic(
+    field: &str,
+    required: bool,
+    path: Option<&Path>,
+) -> DoctorPathDiagnostic {
+    let Some(path) = path else {
+        return DoctorPathDiagnostic {
+            field: field.to_string(),
+            required,
+            configured: false,
+            path: None,
+            exists: None,
+            readable: None,
+            kind: None,
+            error: required.then(|| format!("required source path not configured: {field}")),
+        };
+    };
+    let metadata = fs::metadata(path);
+    let (exists, readable, kind, error) = match metadata {
+        Ok(metadata) => {
+            let kind = if metadata.is_dir() {
+                Some("directory".to_string())
+            } else if metadata.is_file() {
+                Some("file".to_string())
+            } else {
+                Some("other".to_string())
+            };
+            (Some(true), Some(path_readable(path, &metadata)), kind, None)
+        }
+        Err(error) => (
+            Some(false),
+            Some(false),
+            None,
+            Some(format!(
+                "failed to read {field} at {}: {error}",
+                path.display()
+            )),
+        ),
+    };
+    DoctorPathDiagnostic {
+        field: field.to_string(),
+        required,
+        configured: true,
+        path: Some(path.display().to_string()),
+        exists,
+        readable,
+        kind,
+        error,
+    }
+}
+
+fn path_readable(path: &Path, metadata: &fs::Metadata) -> bool {
+    if metadata.is_dir() {
+        fs::read_dir(path).is_ok()
+    } else {
+        fs::File::open(path).is_ok()
+    }
+}
+
+fn source_path_specs(profile: &SourceProfile) -> Vec<(&'static str, bool, Option<&Path>)> {
+    match profile.name.as_str() {
+        "cursor_ide" | "windsurf" => vec![
+            (
+                "cursor_state_db_path",
+                true,
+                profile.cursor_state_db_path.as_deref(),
+            ),
+            ("session_db_path", false, profile.session_db_path.as_deref()),
+        ],
+        "opencode" => vec![
+            ("session_db_path", true, profile.session_db_path.as_deref()),
+            (
+                "session_log_path",
+                false,
+                profile.session_log_path.as_deref(),
+            ),
+            ("evidence_root", false, profile.evidence_root.as_deref()),
+        ],
+        "claude_code" | "codex_app" => vec![
+            (
+                "session_log_path",
+                true,
+                profile.session_log_path.as_deref(),
+            ),
+            ("evidence_root", false, profile.evidence_root.as_deref()),
+        ],
+        _ => vec![
+            (
+                "session_log_path",
+                false,
+                profile.session_log_path.as_deref(),
+            ),
+            ("session_db_path", false, profile.session_db_path.as_deref()),
+            ("evidence_root", false, profile.evidence_root.as_deref()),
+            (
+                "cursor_state_db_path",
+                false,
+                profile.cursor_state_db_path.as_deref(),
+            ),
+        ],
+    }
+}
+
+fn provider_kind(source_id: &str) -> &'static str {
+    match source_id {
+        "claude_code" => "claude_code_jsonl",
+        "codex_app" => "codex_app_jsonl",
+        "cursor_ide" => "cursor_family_sqlite",
+        "windsurf" => "cursor_family_sqlite",
+        "opencode" => "opencode_sqlite",
+        _ => "generic_native_files",
+    }
+}
+
+fn parser_kind(source_id: &str) -> &'static str {
+    match source_id {
+        "claude_code" => "claude-code-jsonl-v1",
+        "codex_app" => "codex-app-jsonl-v1",
+        "cursor_ide" => "cursor-ide-composer-headers-v1",
+        "windsurf" => "windsurf-composer-data-v1",
+        "opencode" => "opencode-sqlite-v1",
+        _ => "native-file-v1",
+    }
+}
+
+fn provider_notes(profile: &SourceProfile) -> Vec<String> {
+    let mut notes = Vec::new();
+    match profile.name.as_str() {
+        "cursor_ide" => notes.push("requires Cursor state.vscdb with composer headers".to_string()),
+        "windsurf" => notes.push("requires Windsurf state.vscdb composerData rows".to_string()),
+        "opencode" => notes.push("requires OpenCode opencode.db session table".to_string()),
+        "claude_code" => notes.push("scans Claude Code JSONL transcript files".to_string()),
+        "codex_app" => notes.push("scans Codex App JSONL session files".to_string()),
+        _ => notes.push("uses generic native file listing".to_string()),
+    }
+    if let Some(note) = &profile.notes {
+        notes.push(note.clone());
+    }
+    notes
+}
+
 fn print_export(
     schema: HistoryExportSchemaArg,
     format: HistoryExportFormatArg,
@@ -495,7 +861,7 @@ fn print_export_csv(record: &SourceSessionRecord, chunks: &[ActivityChunkDto]) -
             .collect::<Vec<_>>()
     };
     println!(
-        "source_id,app_id,external_session_id,title,model,created_at,updated_at,repo_path,branch,input_tokens,output_tokens,total_tokens,files_changed,lines_added,lines_removed,touched_files,source_path,chunk_id,chunk_created_at,chunk_action_type,chunk_function,chunk_args_json,chunk_result_json"
+        "source_id,app_id,external_session_id,title,model,created_at,updated_at,repo_path,branch,input_tokens,output_tokens,total_tokens,files_changed,lines_added,lines_removed,touched_files,source_path,chunk_id,chunk_created_at,chunk_action_type,chunk_function,chunk_source_id,chunk_source_path,source_record_key,source_line_number,source_message_id,source_part_id,chunk_args_json,chunk_result_json"
     );
     for row in rows {
         println!("{}", row.join(","));
@@ -552,6 +918,25 @@ fn export_csv_row(record: &SourceSessionRecord, chunk: Option<&ActivityChunkDto>
             .unwrap_or_default(),
         chunk
             .map(|chunk| chunk.function.clone())
+            .unwrap_or_default(),
+        chunk
+            .and_then(|chunk| chunk.source_id.clone())
+            .unwrap_or_default(),
+        chunk
+            .and_then(|chunk| chunk.source_path.clone())
+            .unwrap_or_default(),
+        chunk
+            .and_then(|chunk| chunk.source_record_key.clone())
+            .unwrap_or_default(),
+        chunk
+            .and_then(|chunk| chunk.source_line_number)
+            .map(|line_number| line_number.to_string())
+            .unwrap_or_default(),
+        chunk
+            .and_then(|chunk| chunk.source_message_id.clone())
+            .unwrap_or_default(),
+        chunk
+            .and_then(|chunk| chunk.source_part_id.clone())
             .unwrap_or_default(),
         chunk_args_json,
         chunk_result_json,
@@ -982,6 +1367,102 @@ mod tests {
     }
 
     #[test]
+    fn doctor_reports_missing_profile_as_structured_error() {
+        let repo_root = temp_repo_root("doctor-missing");
+        let profiles = SourceProfileStore::new(&repo_root);
+
+        let response = build_doctor_response(&profiles, "claude_code").expect("build doctor");
+
+        assert_eq!(response.source, "claude_code");
+        assert_eq!(response.rows.len(), 1);
+        let row = &response.rows[0];
+        assert_eq!(row.source_id, "claude_code");
+        assert_eq!(row.status, "error");
+        assert_eq!(row.provider_kind, "claude_code_jsonl");
+        assert_eq!(row.parser_kind, "claude-code-jsonl-v1");
+        assert!(!row.profile.exists);
+        assert!(row
+            .errors
+            .iter()
+            .any(|error| error.contains("source profile not found")));
+        assert!(row
+            .configured_paths
+            .iter()
+            .any(|path| path.field == "session_log_path" && path.required && !path.configured));
+        let serialized = serde_json::to_value(&response).expect("serialize doctor");
+        assert_eq!(
+            serialized["rows"][0]["provider_metadata"]["status"],
+            "skipped"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_configured_file_source_health() {
+        let repo_root = temp_repo_root("doctor-source");
+        let profiles = SourceProfileStore::new(&repo_root);
+        let session_dir = repo_root.join("claude");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::write(
+            session_dir.join("session-1.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .expect("write session");
+        let mut source_profile = profile("claude_code");
+        source_profile.app_id = Some("claude_code".to_string());
+        source_profile.session_log_path = Some(session_dir.clone());
+        source_profile.session_db_path = None;
+        profiles
+            .write_profile(&source_profile)
+            .expect("write source profile");
+        profiles.use_profile("claude_code").expect("select source");
+
+        let response = build_doctor_response(&profiles, "all").expect("build doctor");
+
+        assert_eq!(response.source, "all");
+        assert_eq!(response.selected_profile.as_deref(), Some("claude_code"));
+        assert_eq!(response.rows.len(), 1);
+        let row = &response.rows[0];
+        assert_eq!(row.status, "ok");
+        assert!(row.profile.exists);
+        assert!(row.profile.selected);
+        assert_eq!(row.provider_metadata.status, "ok");
+        assert_eq!(row.provider_metadata.session_rows, Some(1));
+        assert_eq!(row.provider_metadata.plan_rows, Some(0));
+        let session_path = row
+            .configured_paths
+            .iter()
+            .find(|path| path.field == "session_log_path")
+            .expect("session_log_path diagnostic");
+        assert!(session_path.configured);
+        assert_eq!(session_path.exists, Some(true));
+        assert_eq!(session_path.readable, Some(true));
+        assert_eq!(session_path.kind.as_deref(), Some("directory"));
+        assert!(row.errors.is_empty());
+    }
+
+    #[test]
+    fn doctor_reports_missing_required_provider_path() {
+        let mut source_profile = profile("opencode");
+        source_profile.session_db_path = None;
+        source_profile.session_log_path = None;
+        source_profile.evidence_root = None;
+
+        let row = build_doctor_row(source_profile, true, None);
+
+        assert_eq!(row.status, "error");
+        assert_eq!(row.provider_kind, "opencode_sqlite");
+        assert!(row
+            .configured_paths
+            .iter()
+            .any(|path| path.field == "session_db_path" && path.required && !path.configured));
+        assert!(row
+            .errors
+            .iter()
+            .any(|error| error.contains("required source path not configured: session_db_path")));
+        assert_eq!(row.provider_metadata.status, "error");
+    }
+
+    #[test]
     fn sessions_page_applies_limit_offset_and_has_more() {
         let root = temp_repo_root("sessions-root");
         let session_dir = root.join("native");
@@ -1225,12 +1706,20 @@ mod tests {
 
     #[test]
     fn export_csv_row_flattens_session_and_chunk_fields() {
-        let chunk = user_message_chunk(
+        let mut chunk = user_message_chunk(
             "session-1",
             "claudecode",
             0,
             "2026-06-18T01:00:00Z",
             "hello, \"world\"",
+        );
+        chunk.set_source_pointer(
+            "claude_code",
+            &PathBuf::from("/tmp/session-1.jsonl"),
+            Some("session-1:7"),
+            Some(7),
+            Some("message-1"),
+            Some("part-1"),
         );
         let row = export_csv_row(&source_session_record_for_export(), Some(&chunk));
 
@@ -1240,9 +1729,15 @@ mod tests {
         assert_eq!(row[11], "125");
         assert_eq!(row[15], "src/lib.rs;README.md");
         assert_eq!(row[20], FUNCTION_USER_MESSAGE);
-        assert!(row[22].starts_with('"'));
-        assert!(row[22].contains("hello,"));
-        assert!(row[22].contains("world"));
+        assert_eq!(row[21], "claude_code");
+        assert_eq!(row[22], "/tmp/session-1.jsonl");
+        assert_eq!(row[23], "session-1:7");
+        assert_eq!(row[24], "7");
+        assert_eq!(row[25], "message-1");
+        assert_eq!(row[26], "part-1");
+        assert!(row[28].starts_with('"'));
+        assert!(row[28].contains("hello,"));
+        assert!(row[28].contains("world"));
     }
 
     #[test]

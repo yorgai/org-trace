@@ -1,0 +1,7 @@
+{"timestamp":"2026-06-18T02:00:00Z","payload":{"type":"user_message","id":"user-1","message":"Patch the greeting","cwd":"/workspace/repo","model":"codex-example-model"}}
+{"timestamp":"2026-06-18T02:00:05Z","payload":{"type":"reasoning","id":"reasoning-1","summary":[{"text":"Need to update one fixture file."}]}}
+{"timestamp":"2026-06-18T02:00:10Z","payload":{"type":"agent_message","id":"assistant-1","message":"I will apply a small patch."}}
+{"timestamp":"2026-06-18T02:00:15Z","payload":{"type":"function_call","call_id":"call-apply-patch","name":"apply_patch","arguments":"{\"patch\":\"diff --git a/src/greeting.rs b/src/greeting.rs\\n--- a/src/greeting.rs\\n+++ b/src/greeting.rs\\n@@ -1 +1 @@\\n-old greeting\\n+new greeting\"}"}}
+{"timestamp":"2026-06-18T02:00:16Z","payload":{"type":"function_call_output","call_id":"call-apply-patch","output":"Applied patch"}}
+{"timestamp":"2026-06-18T02:00:20Z","payload":{"type":"message","id":"assistant-2","role":"assistant","content":[{"type":"text","text":"Patch applied."}]}}
+{"timestamp":"2026-06-18T02:00:30Z","payload":{"type":"token_count","total_token_usage":{"input_tokens":31,"output_tokens":12}}}

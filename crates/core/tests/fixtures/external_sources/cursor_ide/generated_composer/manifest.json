@@ -1,0 +1,64 @@
+{
+  "source": "cursor_ide",
+  "description": "Generated Cursor IDE state.vscdb fixture from text KV spec covering composer headers, composerData, bubbleId rows, content blobs, and plan registry.",
+  "format": "cursor_kv_sqlite",
+  "dbSpecPath": "db-spec/cursor-kv.json",
+  "profile": {},
+  "expected": {
+    "sessions": [
+      {
+        "externalSessionId": "cursor-composer-1",
+        "title": "Implement Cursor fixture",
+        "parserVersion": "cursor-ide-composer-headers-v1",
+        "model": "cursor-example-model",
+        "inputTokens": null,
+        "outputTokens": null,
+        "repoPath": "/workspace/repo",
+        "branch": "feature/cursor",
+        "filesChanged": 2,
+        "linesAdded": 8,
+        "linesRemoved": 3,
+        "touchedFiles": []
+      }
+    ],
+    "chunks": {
+      "cursor-composer-1": [
+        {
+          "actionType": "raw",
+          "function": "user_message",
+          "text": "Use the generated Cursor fixture"
+        },
+        {
+          "actionType": "assistant",
+          "function": "assistant",
+          "text": "I will inspect the workspace."
+        },
+        {
+          "actionType": "tool_call",
+          "function": "run_command_line",
+          "command": "pwd",
+          "output": "workspace path"
+        }
+      ]
+    },
+    "plans": [
+      {
+        "externalPlanId": "plan-cursor-1",
+        "title": "Cursor fixture plan",
+        "sourcePath": "/workspace/repo/.cursor/plans/plan-cursor-1.plan.md",
+        "sourceUri": "file:///workspace/repo/.cursor/plans/plan-cursor-1.plan.md",
+        "parserVersion": "cursor-ide-plan-registry-v1",
+        "edges": [
+          {
+            "externalSessionId": "cursor-composer-1",
+            "role": "created_by"
+          },
+          {
+            "externalSessionId": "cursor-composer-1",
+            "role": "built_by"
+          }
+        ]
+      }
+    ]
+  }
+}

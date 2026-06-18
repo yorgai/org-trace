@@ -1,0 +1,45 @@
+{
+  "source": "windsurf",
+  "description": "Generated Windsurf state.vscdb fixture from text KV spec using Cursor-family composerData and bubbleId rows.",
+  "format": "cursor_kv_sqlite",
+  "dbSpecPath": "db-spec/windsurf-kv.json",
+  "profile": {},
+  "expected": {
+    "sessions": [
+      {
+        "externalSessionId": "windsurf-composer-1",
+        "title": "Implement Windsurf fixture",
+        "parserVersion": "windsurf-composer-data-v1",
+        "model": "windsurf-example-model",
+        "inputTokens": 42000,
+        "outputTokens": null,
+        "repoPath": "/workspace/windsurf-repo",
+        "branch": "feature/windsurf",
+        "filesChanged": 1,
+        "linesAdded": 5,
+        "linesRemoved": 1,
+        "touchedFiles": ["src/windsurf.rs"]
+      }
+    ],
+    "chunks": {
+      "windsurf-composer-1": [
+        {
+          "actionType": "raw",
+          "function": "user_message",
+          "text": "Update Windsurf provider"
+        },
+        {
+          "actionType": "assistant",
+          "function": "assistant",
+          "text": "I will update the provider."
+        },
+        {
+          "actionType": "tool_call",
+          "function": "edit_file_by_replace",
+          "targetFile": "src/windsurf.rs",
+          "output": "updated"
+        }
+      ]
+    }
+  }
+}

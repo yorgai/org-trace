@@ -2,7 +2,7 @@
 
 Brick is a local-first provenance system with a small self-hosted sync surface. The MVP records accountable work as immutable events, derives query views from those events, and keeps local operation useful without a server.
 
-See `architecture.md` for the source metadata index architecture, naming glossary, and Mermaid diagrams. See `session-metadata.md` for the source-session metadata structure and per-source extraction map. See `source-querying.md` for platform-specific querying methods and history JSON/CSV contracts. See `orgtrack-core-offload.md` for the ORGII `orgtrack-core` migration inventory.
+See `architecture.md` for the source metadata index architecture, naming glossary, and Mermaid diagrams. See `session-metadata.md` for the source-session metadata structure and per-source extraction map. See `source-querying.md` for platform-specific querying methods and history JSON/CSV contracts. See `orgii-adapter-contract.md` for the ORGII adapter integration contract. See `orgtrack-core-offload.md` for the ORGII `orgtrack-core` migration inventory.
 
 ## Current phase status
 

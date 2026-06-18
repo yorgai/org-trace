@@ -458,6 +458,12 @@ pub enum HistoryCommand {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
+    Doctor {
+        #[arg(long)]
+        source: String,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     Chunks {
         #[arg(long)]
         source: String,

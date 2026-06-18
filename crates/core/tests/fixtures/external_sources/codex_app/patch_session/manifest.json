@@ -1,0 +1,55 @@
+{
+  "source": "codex_app",
+  "description": "Generated Codex App JSONL transcript covering token_count, user and assistant text, reasoning, and apply_patch impact.",
+  "format": "jsonl",
+  "profile": {
+    "sessionLogPath": "logs"
+  },
+  "expected": {
+    "sessions": [
+      {
+        "externalSessionId": "codex-patch-session",
+        "title": "Patch the greeting",
+        "parserVersion": "codex-app-jsonl-v1",
+        "model": "codex-example-model",
+        "inputTokens": 31,
+        "outputTokens": 12,
+        "repoPath": "/workspace/repo",
+        "branch": null,
+        "filesChanged": 1,
+        "linesAdded": 1,
+        "linesRemoved": 1,
+        "touchedFiles": ["src/greeting.rs"]
+      }
+    ],
+    "chunks": {
+      "codex-patch-session": [
+        {
+          "actionType": "raw",
+          "function": "user_message",
+          "text": "Patch the greeting"
+        },
+        {
+          "actionType": "thinking",
+          "function": "thinking",
+          "text": "Need to update one fixture file."
+        },
+        {
+          "actionType": "assistant",
+          "function": "assistant",
+          "text": "I will apply a small patch."
+        },
+        {
+          "actionType": "tool_call",
+          "function": "edit_file_by_replace",
+          "output": "Applied patch"
+        },
+        {
+          "actionType": "assistant",
+          "function": "assistant",
+          "text": "Patch applied."
+        }
+      ]
+    }
+  }
+}
