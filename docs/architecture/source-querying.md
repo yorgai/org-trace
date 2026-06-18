@@ -158,6 +158,13 @@ Recovery flow:
 4. Persist plan/session edges into Brick source metadata or a dedicated planning-edge index.
 5. Use the larger composer/bubble rows only for full transcript-to-chunk JSON formatting, not as the only source for plan relationship recovery.
 
+First slice implemented in Brick:
+
+- `metadata.sqlite` schema version `2` adds `source_plans` and `source_plan_session_edges`.
+- Cursor plan registry refresh accepts both compact `composer.planRegistry` objects and per-plan `composer.planRegistry.{planId}` keys.
+- Plan-session edge roles are typed as `created_by`, `edited_by`, `referenced_by`, and `built_by`; `built_by` preserves Cursor todo IDs in `todo_ids_json`.
+- Edges store native `external_session_id` directly and intentionally do not require a matching `source_sessions` row, so relationships survive missing or partially unreadable session headers.
+
 ### Cursor chunk formatting
 
 | Step | Details |
@@ -168,7 +175,8 @@ Recovery flow:
 | User chunks | Bubble type `1` becomes `actionType = raw`, `function = user_message`. |
 | Assistant chunks | Bubble type `2` text becomes `actionType = assistant`, `function = assistant`. |
 | Tool chunks | Assistant bubbles with `toolFormerData` become `actionType = tool_call`; tool args/results are parsed from JSON strings and canonicalized. |
-| Windowed export | Cursor needs initial-window, full-refresh, and turn-window APIs because ORGII UI does not always load all bubbles at once. |
+| Content blobs | During raw chunk formatting, string references to `composer.content.{hash}` and embedded hash-like content IDs in content/key/hash fields are resolved from `cursorDiskKV`. Resolved blob values are parsed as JSON when possible, then reduced to text for message content/tool output or parsed as JSON for tool args. This remains an audit formatter, not a Cursor UI replay/reconstruction layer. |
+| Windowed export | Cursor still needs initial-window, full-refresh, and turn-window APIs because ORGII UI does not always load all bubbles at once. |
 
 ## Claude Code
 
@@ -264,12 +272,12 @@ Recovery flow:
 | --- | --- |
 | Source ID | `opencode` |
 | Native storage | OpenCode SQLite DB `opencode.db`. Candidate roots include `~/.local/share/opencode/opencode.db`, macOS application support paths, Windows roaming/local paths, and Linux config/data paths. |
-| Native query method | Open DB read-only. Query `session` for metadata. Query `part` joined to `message` for chunks. |
-| Native raw format | SQLite tables `session`, `message`, and `part`; JSON stored in `message.data`, `part.data`, and `session.model`. |
+| Native query method | Open DB read-only from `session_db_path` or configured path containing `opencode.db`. Query `session` for metadata with conservative schema introspection. Query `part` joined to `message` for chunks when `message_id` plus a session ID column are available. |
+| Native raw format | SQLite tables `session`, `message`, and `part`; first slice assumes `session.id` and optionally reads `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, archive flags, and token columns. JSON is expected in `message.data`, `part.data`, and sometimes `session.model`, but provider falls back to plain strings where feasible. |
 | ORGII implementation | `orgtrack-core/src/sources/opencode/history.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`. |
 | Brick target | DB-backed OpenCode provider with per-session metadata rows and lazy DB chunk loading. |
-| JSON export | Sessions, recent paths, full chunks. Source pointers should include DB path, session row ID, message ID, and part ID. |
+| JSON export | Sessions, recent paths, and first-pass full chunks. Source pointer enrichment for DB row/message/part IDs remains a follow-up because the current `ActivityChunk` DTO has no explicit source pointer fields. |
 
 ### OpenCode metadata fields
 
@@ -288,14 +296,14 @@ Recovery flow:
 | `tokens_reasoning` | Reasoning tokens. | add to `outputTokens`. |
 | `time_created` | Created time. | `createdAt`. |
 | `time_updated` | Updated time. | `updatedAt`; fallback to `time_created`. |
-| `time_archived` | Archive marker. | filter archived sessions by default. |
+| `time_archived` | Archive marker. | Filter archived sessions by default when present; also recognizes boolean-ish `archived`, `is_archived`, and `isArchived` columns. |
 
 ### OpenCode chunk formatting
 
 | Step | Details |
 | --- | --- |
 | Session ID | ORGII prefix is `opencodeapp-{session.id}`; Brick can preserve or expose native ID with source. |
-| Native query | `SELECT p.id, p.message_id, json_extract(m.data, '$.role'), p.data, p.time_created FROM part p JOIN message m ON m.id = p.message_id WHERE p.session_id = ? ORDER BY p.time_created ASC, p.id ASC`. |
+| Native query | Fixture-supported first slice introspects columns and effectively queries `part p JOIN message m ON m.id = p.message_id`, filtering on `p.session_id` or `m.session_id`, ordering by `p.time_created` when present and `p.id` as a tie-breaker. |
 | Text chunks | `part.type = text` and role `user` -> `raw/user_message`; otherwise -> `assistant/assistant`. |
 | Reasoning chunks | `part.type = reasoning` -> `thinking/thinking`. |
 | Tool chunks | `part.type = tool` -> `tool_call`. |
@@ -315,7 +323,7 @@ Recovery flow:
 | ORGII implementation | `orgtrack-core/src/sources/windsurf/history.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`. |
 | Brick target | Cursor-family DB provider variant; share key grammar with Cursor where possible, with Windsurf-specific path discovery and tool mapping. |
-| JSON export | Sessions, recent paths, full chunks. Initial/turn windows can be added if UI needs parity with Cursor. |
+| JSON export | Sessions and full chunks. Brick first slice reads `composerData:%` for metadata and shares the Cursor-family composer/bubble formatter for raw chunk JSON. Initial/turn windows can be added if UI needs parity with Cursor. |
 
 ### Windsurf metadata fields
 
@@ -363,11 +371,11 @@ Recovery flow:
 
 | Source | Brick today | ORGII today | Target |
 | --- | --- | --- | --- |
-| Cursor IDE | Metadata provider reads `composer.composerHeaders.allComposers`; first raw chunk formatter reads composer/bubble KV rows; windowing/content blob dereference pending. | Mature metadata scan, DB parsing, lazy chunks, window APIs, turn summaries. | Add window modes and content blob dereferencing next. |
+| Cursor IDE | Metadata provider reads `composer.composerHeaders.allComposers`; raw chunk formatter reads composer/bubble KV rows and dereferences `composer.content.{hash}`-style blobs; plan registry refresh persists `source_plans` and typed plan-session edges. Windowing remains pending. | Mature metadata scan, DB parsing, lazy chunks, window APIs, turn summaries. | Add window modes and richer plan/task export next. |
 | Claude Code | Generic file listing and metadata index upsert. | Mature JSONL metadata scan, impact stats, lazy chunks. | Port first. |
 | Codex App | Generic file listing and metadata index upsert. | Mature JSONL metadata scan, impact stats, lazy chunks. | Port first. |
-| OpenCode | Discovery only for DB candidates. | DB metadata scan and lazy chunks. | Port after file-based sources. |
-| Windsurf | Not implemented. | Cursor-family DB metadata scan and lazy chunks. | Port before/alongside Cursor. |
+| OpenCode | DB metadata provider registered as `opencode`; reads `session` metadata, aggregates token columns from `session` or `part`, filters archived sessions, and provides first-pass lazy chunks from `message` + `part`. | DB metadata scan and lazy chunks. | Add source pointer metadata and validate against more real-world schema variants. |
+| Windsurf | First provider reads `composerData:%` rows from `cursorDiskKV`, extracts core metadata/context tokens/impact fields, and shares Cursor-family full-session raw chunk formatting for composer/bubble rows, including shared content-blob resolution. | Cursor-family DB metadata scan and lazy chunks. | Validate content ID/blob patterns against real Windsurf fixtures and add native path discovery defaults next. |
 | ORGII runtime | Not a native external source. | ORGII owns runtime. | ORGII emits/exports to Brick explicitly. |
 
 ## Brick treatment rules

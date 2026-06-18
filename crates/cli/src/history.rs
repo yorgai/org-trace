@@ -11,8 +11,8 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use brick_core::{
-    format_source_session_chunks, list_source_sessions, ActivityChunk, MetadataDb,
-    NativeSourceSession, SourceProfile, SourceProfileStore, SourceSessionListQuery,
+    format_source_session_chunks, list_source_plans, list_source_sessions, ActivityChunk,
+    MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore, SourceSessionListQuery,
     SourceSessionRecord, SourceSessionUpsert,
 };
 use brick_protocol::ActorType;
@@ -617,6 +617,9 @@ fn refresh_profiles_to_metadata(
         for session in list_source_sessions(profile, Some(limit))? {
             let upsert = source_session_upsert(&profile.name, session);
             metadata_db.upsert_source_session(&upsert)?;
+        }
+        for plan in list_source_plans(profile)? {
+            metadata_db.upsert_source_plan_with_edges(&plan)?;
         }
     }
     Ok(())

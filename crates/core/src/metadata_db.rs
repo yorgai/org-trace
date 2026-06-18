@@ -12,10 +12,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
-use crate::{metadata_db_path, metadata_db_path_in_home};
+use crate::{
+    metadata_db_path, metadata_db_path_in_home, SourcePlanRecord, SourcePlanSessionEdgeRecord,
+    SourcePlanWithEdgesUpsert,
+};
 
 /// Current schema version for the unified metadata database.
-pub const METADATA_DB_SCHEMA_VERSION: u16 = 1;
+pub const METADATA_DB_SCHEMA_VERSION: u16 = 2;
 
 const METADATA_KEY_SCHEMA_VERSION: &str = "schema_version";
 const METADATA_KEY_RESET_AT: &str = "reset_at";
@@ -278,6 +281,140 @@ impl MetadataDb {
     ) -> Result<Option<SourceSessionRecord>> {
         read_source_session(&self.connection, source_id, external_session_id)
     }
+
+    /// Inserts or updates one source-plan row and replaces its recovered session edges.
+    pub fn upsert_source_plan_with_edges(
+        &mut self,
+        input: &SourcePlanWithEdgesUpsert,
+    ) -> Result<SourcePlanRecord> {
+        let transaction = self
+            .connection
+            .transaction()
+            .context("failed to start metadata source-plan upsert")?;
+        let now = Utc::now();
+        let metadata_json = serialize_metadata_json(input.plan.metadata_json.as_ref())?;
+        transaction.execute(
+            "INSERT INTO source_plans (
+                source_id, external_plan_id, title, source_path, source_uri, source_mtime,
+                parser_version, discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(source_id, external_plan_id) DO UPDATE SET
+                title = excluded.title,
+                source_path = excluded.source_path,
+                source_uri = excluded.source_uri,
+                source_mtime = excluded.source_mtime,
+                parser_version = excluded.parser_version,
+                discovered_at = excluded.discovered_at,
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at,
+                metadata_json = excluded.metadata_json",
+            params![
+                input.plan.source_id,
+                input.plan.external_plan_id,
+                input.plan.title,
+                input
+                    .plan
+                    .source_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                input.plan.source_uri,
+                input.plan.source_mtime.map(|value| value.to_rfc3339()),
+                input.plan.parser_version,
+                input.plan.discovered_at.to_rfc3339(),
+                input.plan.last_seen_at.to_rfc3339(),
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+                metadata_json,
+            ],
+        )?;
+        let source_plan_id = read_source_plan_id(
+            &transaction,
+            &input.plan.source_id,
+            &input.plan.external_plan_id,
+        )?
+        .context("metadata source-plan row missing after upsert")?;
+        transaction.execute(
+            "DELETE FROM source_plan_session_edges WHERE source_plan_id = ?1",
+            params![source_plan_id],
+        )?;
+        for edge in &input.edges {
+            if edge.source_id != input.plan.source_id
+                || edge.external_plan_id != input.plan.external_plan_id
+            {
+                anyhow::bail!(
+                    "source plan edge key does not match plan key: {}/{}",
+                    edge.source_id,
+                    edge.external_plan_id
+                );
+            }
+            let todo_ids_json = serialize_metadata_json(edge.todo_ids_json.as_ref())?;
+            let edge_metadata_json = serialize_metadata_json(edge.metadata_json.as_ref())?;
+            transaction.execute(
+                "INSERT INTO source_plan_session_edges (
+                    source_plan_id, external_session_id, role, todo_ids_json,
+                    discovered_at, last_seen_at, created_at, updated_at, metadata_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    source_plan_id,
+                    edge.external_session_id,
+                    edge.role.as_str(),
+                    todo_ids_json,
+                    edge.discovered_at.to_rfc3339(),
+                    edge.last_seen_at.to_rfc3339(),
+                    now.to_rfc3339(),
+                    now.to_rfc3339(),
+                    edge_metadata_json,
+                ],
+            )?;
+        }
+        let record = read_source_plan(
+            &transaction,
+            &input.plan.source_id,
+            &input.plan.external_plan_id,
+        )?;
+        transaction
+            .commit()
+            .context("failed to commit metadata source-plan upsert")?;
+        record.context("metadata source-plan row missing after upsert")
+    }
+
+    /// Lists source-plan rows in deterministic most-recent-first order.
+    pub fn list_source_plans(&self, source_id: Option<&str>) -> Result<Vec<SourcePlanRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, external_plan_id, title, source_path, source_uri, source_mtime,
+                    parser_version, discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             FROM source_plans
+             WHERE (?1 IS NULL OR source_id = ?1)
+             ORDER BY last_seen_at DESC, source_id ASC, external_plan_id ASC",
+        )?;
+        let rows = statement.query_map(params![source_id], source_plan_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.context("failed to read metadata source-plan row")?);
+        }
+        Ok(records)
+    }
+
+    /// Lists recovered source plan-to-session edges.
+    pub fn list_source_plan_session_edges(
+        &self,
+        source_id: Option<&str>,
+    ) -> Result<Vec<SourcePlanSessionEdgeRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.source_id, p.external_plan_id, e.external_session_id, e.role, e.todo_ids_json,
+                    e.discovered_at, e.last_seen_at, e.created_at, e.updated_at, e.metadata_json
+             FROM source_plan_session_edges e
+             JOIN source_plans p ON p.source_plan_id = e.source_plan_id
+             WHERE (?1 IS NULL OR p.source_id = ?1)
+             ORDER BY p.source_id ASC, p.external_plan_id ASC, e.external_session_id ASC, e.role ASC",
+        )?;
+        let rows = statement.query_map(params![source_id], source_plan_session_edge_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.context("failed to read metadata source-plan edge row")?);
+        }
+        Ok(records)
+    }
 }
 
 fn prepare_schema(connection: &Connection) -> Result<()> {
@@ -361,6 +498,36 @@ fn create_schema(connection: &Connection) -> Result<()> {
              metadata_json TEXT,
              UNIQUE(source_id, external_session_id)
          );
+         CREATE TABLE IF NOT EXISTS source_plans (
+             source_plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             source_id TEXT NOT NULL,
+             external_plan_id TEXT NOT NULL,
+             title TEXT,
+             source_path TEXT,
+             source_uri TEXT,
+             source_mtime TEXT,
+             parser_version TEXT,
+             discovered_at TEXT NOT NULL,
+             last_seen_at TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             metadata_json TEXT,
+             UNIQUE(source_id, external_plan_id)
+         );
+         CREATE TABLE IF NOT EXISTS source_plan_session_edges (
+             source_plan_session_edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             source_plan_id INTEGER NOT NULL,
+             external_session_id TEXT NOT NULL,
+             role TEXT NOT NULL,
+             todo_ids_json TEXT,
+             discovered_at TEXT NOT NULL,
+             last_seen_at TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             metadata_json TEXT,
+             UNIQUE(source_plan_id, external_session_id, role),
+             FOREIGN KEY(source_plan_id) REFERENCES source_plans(source_plan_id) ON DELETE CASCADE
+         );
          CREATE TABLE IF NOT EXISTS source_session_resources (
              resource_id INTEGER PRIMARY KEY AUTOINCREMENT,
              source_session_id INTEGER NOT NULL,
@@ -411,7 +578,10 @@ fn create_schema(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_source_sessions_source ON source_sessions(source_id, last_seen_at);
          CREATE INDEX IF NOT EXISTS idx_source_sessions_path ON source_sessions(source_path);
          CREATE INDEX IF NOT EXISTS idx_source_sessions_repo_path ON source_sessions(source_id, repo_path);
-         CREATE INDEX IF NOT EXISTS idx_source_sessions_fingerprint ON source_sessions(source_fingerprint);",
+         CREATE INDEX IF NOT EXISTS idx_source_sessions_fingerprint ON source_sessions(source_fingerprint);
+         CREATE INDEX IF NOT EXISTS idx_source_plans_source ON source_plans(source_id, last_seen_at);
+         CREATE INDEX IF NOT EXISTS idx_source_plans_path ON source_plans(source_path);
+         CREATE INDEX IF NOT EXISTS idx_source_plan_edges_session ON source_plan_session_edges(external_session_id, role);", 
     )?;
     upsert_metadata(
         connection,
@@ -484,6 +654,93 @@ fn upsert_metadata(connection: &Connection, key: &str, value: &str) -> Result<()
         params![key, value],
     )?;
     Ok(())
+}
+
+fn read_source_plan_id(
+    connection: &Connection,
+    source_id: &str,
+    external_plan_id: &str,
+) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT source_plan_id FROM source_plans WHERE source_id = ?1 AND external_plan_id = ?2",
+            params![source_id, external_plan_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read metadata source-plan ID")
+}
+
+fn read_source_plan(
+    connection: &Connection,
+    source_id: &str,
+    external_plan_id: &str,
+) -> Result<Option<SourcePlanRecord>> {
+    connection
+        .query_row(
+            "SELECT source_id, external_plan_id, title, source_path, source_uri, source_mtime,
+                    parser_version, discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             FROM source_plans
+             WHERE source_id = ?1 AND external_plan_id = ?2",
+            params![source_id, external_plan_id],
+            source_plan_from_row,
+        )
+        .optional()
+        .context("failed to read metadata source-plan row")
+}
+
+fn source_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourcePlanRecord> {
+    let source_path: Option<String> = row.get(3)?;
+    let source_mtime: Option<String> = row.get(5)?;
+    let discovered_at: String = row.get(7)?;
+    let last_seen_at: String = row.get(8)?;
+    let created_at: String = row.get(9)?;
+    let updated_at: String = row.get(10)?;
+    let metadata_json: Option<String> = row.get(11)?;
+    Ok(SourcePlanRecord {
+        source_id: row.get(0)?,
+        external_plan_id: row.get(1)?,
+        title: row.get(2)?,
+        source_path: source_path.map(PathBuf::from),
+        source_uri: row.get(4)?,
+        source_mtime: parse_optional_datetime(source_mtime)?,
+        parser_version: row.get(6)?,
+        discovered_at: parse_datetime(discovered_at)?,
+        last_seen_at: parse_datetime(last_seen_at)?,
+        created_at: parse_datetime(created_at)?,
+        updated_at: parse_datetime(updated_at)?,
+        metadata_json: parse_metadata_json(metadata_json)?,
+    })
+}
+
+fn source_plan_session_edge_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SourcePlanSessionEdgeRecord> {
+    let role: String = row.get(3)?;
+    let todo_ids_json: Option<String> = row.get(4)?;
+    let discovered_at: String = row.get(5)?;
+    let last_seen_at: String = row.get(6)?;
+    let created_at: String = row.get(7)?;
+    let updated_at: String = row.get(8)?;
+    let metadata_json: Option<String> = row.get(9)?;
+    Ok(SourcePlanSessionEdgeRecord {
+        source_id: row.get(0)?,
+        external_plan_id: row.get(1)?,
+        external_session_id: row.get(2)?,
+        role: role.parse().map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::<dyn std::error::Error + Send + Sync>::from(err),
+            )
+        })?,
+        todo_ids_json: parse_metadata_json(todo_ids_json)?,
+        discovered_at: parse_datetime(discovered_at)?,
+        last_seen_at: parse_datetime(last_seen_at)?,
+        created_at: parse_datetime(created_at)?,
+        updated_at: parse_datetime(updated_at)?,
+        metadata_json: parse_metadata_json(metadata_json)?,
+    })
 }
 
 fn read_source_session(
@@ -630,6 +887,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::{SourcePlanSessionEdgeUpsert, SourcePlanWithEdgesUpsert};
 
     const TEST_SOURCE_ID: &str = "test-source";
     const TEST_EXTERNAL_SESSION_ID: &str = "external-1";
@@ -754,6 +1012,75 @@ mod tests {
                 .expect("count source sessions"),
             1
         );
+    }
+
+    #[test]
+    fn upserts_source_plans_and_preserves_unresolved_session_edges() {
+        let path = temp_home("plan-edges").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 18, 2, 3, 4)
+            .single()
+            .expect("valid plan timestamp");
+        let input = SourcePlanWithEdgesUpsert {
+            plan: crate::SourcePlanUpsert {
+                source_id: TEST_SOURCE_ID.to_string(),
+                external_plan_id: "plan-1".to_string(),
+                title: Some("Plan one".to_string()),
+                source_path: Some(PathBuf::from("/tmp/plan-1.plan.md")),
+                source_uri: Some("file:///tmp/plan-1.plan.md".to_string()),
+                source_mtime: Some(now),
+                parser_version: Some("plan-parser-v1".to_string()),
+                discovered_at: now,
+                last_seen_at: now,
+                metadata_json: Some(json!({ "kind": "cursor-plan" })),
+            },
+            edges: vec![
+                SourcePlanSessionEdgeUpsert {
+                    source_id: TEST_SOURCE_ID.to_string(),
+                    external_plan_id: "plan-1".to_string(),
+                    external_session_id: "missing-session".to_string(),
+                    role: crate::SourcePlanSessionEdgeRole::ReferencedBy,
+                    todo_ids_json: None,
+                    discovered_at: now,
+                    last_seen_at: now,
+                    metadata_json: None,
+                },
+                SourcePlanSessionEdgeUpsert {
+                    source_id: TEST_SOURCE_ID.to_string(),
+                    external_plan_id: "plan-1".to_string(),
+                    external_session_id: "builder-session".to_string(),
+                    role: crate::SourcePlanSessionEdgeRole::BuiltBy,
+                    todo_ids_json: Some(json!(["todo-1"])),
+                    discovered_at: now,
+                    last_seen_at: now,
+                    metadata_json: None,
+                },
+            ],
+        };
+
+        let plan = db
+            .upsert_source_plan_with_edges(&input)
+            .expect("upsert source plan");
+        let plans = db
+            .list_source_plans(Some(TEST_SOURCE_ID))
+            .expect("list source plans");
+        let edges = db
+            .list_source_plan_session_edges(Some(TEST_SOURCE_ID))
+            .expect("list source plan edges");
+
+        assert_eq!(plan.external_plan_id, "plan-1");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            edge.external_session_id == "missing-session"
+                && edge.role == crate::SourcePlanSessionEdgeRole::ReferencedBy
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.external_session_id == "builder-session"
+                && edge.role == crate::SourcePlanSessionEdgeRole::BuiltBy
+                && edge.todo_ids_json == Some(json!(["todo-1"]))
+        }));
     }
 
     #[test]

@@ -2,13 +2,18 @@ use anyhow::Result;
 
 use std::path::Path;
 
-use crate::{list_native_source_sessions, ActivityChunk, NativeSourceSession, SourceProfile};
+use crate::{
+    list_native_source_sessions, ActivityChunk, NativeSourceSession, SourcePlanWithEdgesUpsert,
+    SourceProfile,
+};
 
-use super::{claude_code, codex_app, cursor_ide};
+use super::{claude_code, codex_app, cursor_ide, opencode, windsurf};
 
 const SOURCE_CLAUDE_CODE: &str = "claude_code";
 const SOURCE_CODEX_APP: &str = "codex_app";
 const SOURCE_CURSOR_IDE: &str = "cursor_ide";
+const SOURCE_OPENCODE: &str = "opencode";
+const SOURCE_WINDSURF: &str = "windsurf";
 
 /// Lists native sessions through the app-specific provider for a source profile.
 pub fn list_source_sessions(
@@ -19,7 +24,17 @@ pub fn list_source_sessions(
         SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit),
         SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit),
         SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit),
+        SOURCE_OPENCODE => opencode::list_sessions(profile, limit),
+        SOURCE_WINDSURF => windsurf::list_sessions(profile, limit),
         _ => list_native_source_sessions(profile, limit),
+    }
+}
+
+/// Lists source plans and recovered plan-session edges through supported providers.
+pub fn list_source_plans(profile: &SourceProfile) -> Result<Vec<SourcePlanWithEdgesUpsert>> {
+    match profile.name.as_str() {
+        SOURCE_CURSOR_IDE => cursor_ide::list_plans(profile),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -33,6 +48,8 @@ pub fn format_source_session_chunks(
         SOURCE_CLAUDE_CODE => claude_code::format_chunks(external_session_id, source_path),
         SOURCE_CODEX_APP => codex_app::format_chunks(external_session_id, source_path),
         SOURCE_CURSOR_IDE => cursor_ide::format_chunks(external_session_id, source_path),
+        SOURCE_OPENCODE => opencode::format_chunks(external_session_id, source_path),
+        SOURCE_WINDSURF => windsurf::format_chunks(external_session_id, source_path),
         _ => Ok(Vec::new()),
     }
 }

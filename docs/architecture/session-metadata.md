@@ -43,6 +43,35 @@ This document tracks Brick's source-session metadata structure and how each nati
 | `updated_at` | RFC3339 text | Metadata row update time. | internal |
 | `metadata_json` | JSON nullable | Provider extras that are not first-class yet. | future `source_metadata` |
 
+## Core table shape: `source_plans`
+
+`source_plans` is the minimal durable index for native planning artifacts. It is keyed by `(source_id, external_plan_id)` and stores the plan evidence pointer plus parser metadata.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `source_id` | text | Brick source ID, currently populated by `cursor_ide`. |
+| `external_plan_id` | text | Native Cursor plan ID. |
+| `title` | text nullable | Plan title/name when present; falls back to plan ID. |
+| `source_path` | text nullable | Plan Markdown path such as `.cursor/plans/<plan>.plan.md` when exposed by Cursor. |
+| `source_uri` | text nullable | Plan URI when available or derived from `source_path`. |
+| `source_mtime` | RFC3339 text nullable | Backing Cursor state DB mtime for this first slice. |
+| `parser_version` | text nullable | Plan parser version, currently `cursor-ide-plan-registry-v1`. |
+| `discovered_at`, `last_seen_at`, `created_at`, `updated_at` | RFC3339 text | Metadata lifecycle timestamps. |
+| `metadata_json` | JSON nullable | Provider extras, including the raw plan registry entry for now. |
+
+## Core table shape: `source_plan_session_edges`
+
+`source_plan_session_edges` stores recovered plan-to-session relationships. It deliberately does **not** require a matching `source_sessions` row so unresolved Cursor session IDs survive partial or damaged session header recovery.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `source_plan_id` | integer FK | Local source plan row. |
+| `external_session_id` | text | Native session/composer ID, preserved even when no session header row exists. |
+| `role` | text enum | One of `created_by`, `edited_by`, `referenced_by`, or `built_by`. |
+| `todo_ids_json` | JSON nullable | For `built_by`, Cursor todo IDs executed by that session. |
+| `discovered_at`, `last_seen_at`, `created_at`, `updated_at` | RFC3339 text | Edge lifecycle timestamps. |
+| `metadata_json` | JSON nullable | Provider-specific edge extras. |
+
 ## Token accounting
 
 Token fields are optional because not every source exposes them.
@@ -101,10 +130,10 @@ Token fields are optional because not every source exposes them.
 | Native storage | Cursor `state.vscdb` SQLite `cursorDiskKV`. |
 | Primary resilient session metadata path | `composer.composerHeaders.allComposers` for `name`, `createdAt`, `lastUpdatedAt`, `workspaceIdentifier`, `trackedGitRepos`, `subtitle`, `mode`, `isArchived`. |
 | Full composer/chunk source path | `composerData:{composerId}`, `bubbleId:{composerId}:{bubbleId}`, and content blob keys for full chunk JSON formatting. |
-| Plan/session edges | `composer.planRegistry.{planId}` gives `uri.fsPath`, `createdBy`, `editedBy[]`, `referencedBy[]`, and `builtBy{sessionId: todoIds[]}`. Resolve session IDs through `composer.composerHeaders.allComposers`. |
+| Plan/session edges | `composer.planRegistry` or `composer.planRegistry.{planId}` gives `uri.fsPath`, `createdBy`, `editedBy[]`, `referencedBy[]`, and `builtBy{sessionId: todoIds[]}`. Brick persists rows in `source_plans` and `source_plan_session_edges`, preserving unresolved session IDs even when `composer.composerHeaders.allComposers` has no matching header. |
 | Token metadata | `contextTokensUsed` when available; Cursor does not always expose input/output split. Store split only when available; otherwise keep provider-specific values in `metadata_json`. |
 | Impact metadata | Composer fields such as `totalLinesAdded`, `totalLinesRemoved`, and `filesChangedCount` when available. |
-| Full chunks | Lazy DB-to-chunk JSON formatting with window modes. |
+| Full chunks | Lazy DB-to-chunk JSON formatting resolves `composer.content.{hash}`-style text/JSON blobs in message/tool payloads for raw audit chunks. Window modes remain pending. |
 
 ### Windsurf
 
@@ -114,17 +143,17 @@ Token fields are optional because not every source exposes them.
 | Query method | Cursor-family composer/bubble key grammar. |
 | Core metadata | `composerId`, `name`, `createdAt`, `lastUpdatedAt`, `modelConfig.modelName`, `contextTokensUsed`, `trackedGitRepos`, `workspaceIdentifier`. |
 | Token metadata | `contextTokensUsed` when available; keep input/output split null unless source exposes split. |
-| Full chunks | Lazy Cursor-family DB-to-chunk JSON formatting. |
+| Full chunks | Lazy Cursor-family DB-to-chunk JSON formatting is implemented for composer/bubble rows and uses the shared Cursor-family content-blob resolver; validate Windsurf-specific content ID patterns with fixtures. |
 
 ### OpenCode
 
 | Metadata | How Brick should extract it |
 | --- | --- |
 | Native storage | `opencode.db` SQLite. |
-| Query method | `session` table for metadata; `message` and `part` tables for chunks. |
-| Core metadata | `session.id`, `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, archive flags. |
-| Token metadata | `tokens_input + tokens_cache_read + tokens_cache_write` as input; `tokens_output + tokens_reasoning` as output. |
-| Full chunks | Lazy DB-to-chunk JSON formatting from `part` joined to `message`. |
+| Query method | `session` table for metadata via schema introspection; `message` and `part` tables for chunks when the DB exposes `message_id` and `session_id` on either `part` or `message`. |
+| Core metadata | Requires `session.id`; optionally maps `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, and archive flags (`time_archived`, `archived`, `is_archived`, `isArchived`). |
+| Token metadata | Maps `tokens_input + tokens_cache_read + tokens_cache_write` as input and `tokens_output + tokens_reasoning` as output from `session` when present; otherwise aggregates matching columns from `part` joined to `message`. |
+| Full chunks | First-pass lazy DB-to-chunk JSON formatting from `part` joined to `message`; source pointer enrichment and broader schema validation remain follow-ups. |
 
 ## Shared session export formats
 
@@ -144,6 +173,6 @@ Both schemas include a `chunks` array. For Claude Code and Codex App, Brick lazi
 | --- | --- | --- | --- |
 | Claude Code | First JSONL metadata parser in Brick. | Input/output extracted from `message.usage`. | JSONL-to-chunk JSON formatting. |
 | Codex App | First JSONL metadata parser in Brick. | Input/output extracted from `token_count`. | JSONL-to-chunk JSON formatting. |
-| Cursor IDE | First provider reads `composer.composerHeaders.allComposers`. | Split not available in first provider; context token handling remains pending. | First full-session raw formatter reads `composerData:{composerId}` and `bubbleId:{composerId}:{bubbleId}`; window modes and content blob dereferencing remain pending. |
-| Windsurf | Documented; not ported yet. | Context token metadata documented. | Planned. |
-| OpenCode | Documented; not ported yet. | Input/output strategy documented. | Planned. |
+| Cursor IDE | Provider reads `composer.composerHeaders.allComposers` for sessions and `composer.planRegistry` / `composer.planRegistry.{planId}` for durable plan and plan-session edge rows. | Split not available in first provider; context token handling remains pending. | Full-session raw formatter reads `composerData:{composerId}` and `bubbleId:{composerId}:{bubbleId}` and dereferences `composer.content.{hash}`-style blobs for message/tool text and JSON; window modes remain pending. |
+| Windsurf | First provider reads `composerData:%` rows from `cursorDiskKV` and extracts composer metadata. | `contextTokensUsed` is mapped to input tokens when present; output split remains null. | Shared Cursor-family composer/bubble formatter implemented with content-blob resolver; Windsurf fixture validation pending. |
+| OpenCode | First DB metadata provider ported and registered. | Input/output extracted from `session` tokens or aggregated from `part` tokens. | First-pass lazy DB-to-chunk JSON formatting; source pointer metadata and additional schema variants pending. |

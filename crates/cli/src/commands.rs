@@ -6,8 +6,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use brick_core::{
-    capture_diff, capture_repo_context, list_source_sessions, BrickConfig, DiffCaptureRequest,
-    LocalStore, MetadataDb, NativeSourceSession, SourceProfile, SourceSessionUpsert,
+    capture_diff, capture_repo_context, list_source_plans, list_source_sessions, BrickConfig,
+    DiffCaptureRequest, LocalStore, MetadataDb, NativeSourceSession, SourceProfile,
+    SourceSessionUpsert,
 };
 use brick_importers::{import_traces, ImportRequest, ImportSource};
 use brick_protocol::{
@@ -644,6 +645,9 @@ fn index_native_source_sessions<'a>(
     let mut metadata_db = MetadataDb::open_global()?;
     for session in sessions {
         metadata_db.upsert_source_session(&native_source_session_upsert(profile, session))?;
+    }
+    for plan in list_source_plans(profile)? {
+        metadata_db.upsert_source_plan_with_edges(&plan)?;
     }
     Ok(())
 }
