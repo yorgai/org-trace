@@ -440,6 +440,16 @@ pub enum HistoryCommand {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
+    Plans {
+        #[arg(long)]
+        source: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     RecentPaths {
         #[arg(long)]
         source: String,

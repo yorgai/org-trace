@@ -10,6 +10,9 @@ use brick_core::{
     discover_sources, BrickConfig, DiscoveredPathKind, DiscoveredSource, EvidenceConfig,
     SourceProfile, SourceProfileStore,
 };
+
+#[cfg(test)]
+use brick_core::{DiscoveredSourceKind, DiscoveredSourcePath};
 use brick_protocol::ActorType;
 
 use crate::args::{SourceCommand, SourceConfigArgs, SourceConfigureArgs, SourceScanArgs};
@@ -258,5 +261,74 @@ fn format_actor_type(actor_type: ActorType) -> &'static str {
         ActorType::Human => "human",
         ActorType::Agent => "agent",
         ActorType::System => "system",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn discovered_source(
+        source: DiscoveredSourceKind,
+        paths: Vec<(DiscoveredPathKind, &str)>,
+    ) -> DiscoveredSource {
+        DiscoveredSource {
+            source,
+            paths: paths
+                .into_iter()
+                .map(|(kind, path)| DiscoveredSourcePath {
+                    kind,
+                    path: PathBuf::from(path),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn opencode_discovery_writes_usable_session_db_profile() {
+        let discovered = discovered_source(
+            DiscoveredSourceKind::OpenCode,
+            vec![(
+                DiscoveredPathKind::SessionDatabase,
+                "/Users/me/.local/share/opencode/opencode.db",
+            )],
+        );
+
+        let profile = profile_from_discovered_source(&discovered);
+
+        assert_eq!(profile.name, "opencode");
+        assert_eq!(profile.app_id.as_deref(), Some("opencode"));
+        assert_eq!(
+            profile.session_db_path.as_deref(),
+            Some(std::path::Path::new(
+                "/Users/me/.local/share/opencode/opencode.db"
+            ))
+        );
+        assert_eq!(profile.session_log_path, None);
+    }
+
+    #[test]
+    fn windsurf_discovery_writes_cursor_state_db_profile() {
+        let discovered = discovered_source(
+            DiscoveredSourceKind::Windsurf,
+            vec![(
+                DiscoveredPathKind::CursorStateDatabase,
+                "/Users/me/.config/Windsurf/User/globalStorage/state.vscdb",
+            )],
+        );
+
+        let profile = profile_from_discovered_source(&discovered);
+
+        assert_eq!(profile.name, "windsurf");
+        assert_eq!(profile.app_id.as_deref(), Some("windsurf"));
+        assert_eq!(
+            profile.cursor_state_db_path.as_deref(),
+            Some(std::path::Path::new(
+                "/Users/me/.config/Windsurf/User/globalStorage/state.vscdb"
+            ))
+        );
+        assert_eq!(profile.session_db_path, None);
     }
 }

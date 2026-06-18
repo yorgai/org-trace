@@ -72,6 +72,16 @@ This document tracks Brick's source-session metadata structure and how each nati
 | `discovered_at`, `last_seen_at`, `created_at`, `updated_at` | RFC3339 text | Edge lifecycle timestamps. |
 | `metadata_json` | JSON nullable | Provider-specific edge extras. |
 
+## Raw plan history JSON
+
+`brick history plans --source <source> --limit <n> --offset <n> --format json` is the audit-oriented read surface for indexed plans. The command refreshes the selected source first, then returns:
+
+- `source_id`, `limit`, `offset`, `total`, and `has_more` for pagination.
+- `plans[]` rows with the raw source-plan metadata fields: `plan_id` / `external_plan_id`, title, source path or URI, source mtime, parser version, lifecycle timestamps, and provider `metadata_json`.
+- `edges[]` rows for the returned plan page, keyed by `external_plan_id` and preserving native `external_session_id` even when no matching `source_sessions` row exists. Edge rows include role, optional `todo_ids_json`, lifecycle timestamps, and provider `metadata_json`.
+
+This slice intentionally exposes only raw JSON. It does not assign UI labels, task status, renderer hints, or app-specific plan semantics.
+
 ## Token accounting
 
 Token fields are optional because not every source exposes them.
@@ -153,7 +163,7 @@ Token fields are optional because not every source exposes them.
 | Query method | `session` table for metadata via schema introspection; `message` and `part` tables for chunks when the DB exposes `message_id` and `session_id` on either `part` or `message`. |
 | Core metadata | Requires `session.id`; optionally maps `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, and archive flags (`time_archived`, `archived`, `is_archived`, `isArchived`). |
 | Token metadata | Maps `tokens_input + tokens_cache_read + tokens_cache_write` as input and `tokens_output + tokens_reasoning` as output from `session` when present; otherwise aggregates matching columns from `part` joined to `message`. |
-| Full chunks | First-pass lazy DB-to-chunk JSON formatting from `part` joined to `message`; source pointer enrichment and broader schema validation remain follow-ups. |
+| Full chunks | First-pass lazy DB-to-chunk JSON formatting from `part` joined to `message`; chunk pointers include DB path plus native message/part IDs. Broader schema validation remains a follow-up. |
 
 ## Shared session export formats
 
@@ -165,7 +175,7 @@ Brick keeps the public export surface intentionally small. Source-specific provi
 | `source-metadata-v1` | `brick history export --source <source> --session-id <id> --schema source-metadata-v1 --format json` | Loss-minimized export of the current metadata index row for debugging and provider parity checks. | Mirrors first-class `source_sessions` metadata plus provider extras. |
 | CSV formatting | `brick history export --source <source> --session-id <id> --schema audit-v1 --format csv` | Spreadsheet/audit-table export for a specific session. | One row per chunk, with repeated session metadata/token/impact columns; metadata-only sources emit one row with empty chunk columns. |
 
-Both schemas include a `chunks` array. For Claude Code and Codex App, Brick lazily formats JSONL transcript records into chunk JSON. Metadata-only providers keep the array empty until their source-record-to-chunk JSON formatter lands. This preserves the final audit shape while keeping full transcript content out of `metadata.sqlite`.
+Both schemas include a `chunks` array. Chunk objects may include optional raw source pointers (`source_id`, `source_path`, `source_record_key`, `source_line_number`, `source_message_id`, `source_part_id`) when the provider can identify the native record without expensive reconstruction. For Claude Code and Codex App, Brick lazily formats JSONL transcript records into chunk JSON and records path/line pointers. DB-backed providers attach DB paths and native row/key IDs where available. This preserves the final audit shape while keeping full transcript content out of `metadata.sqlite`.
 
 ## Current implementation status
 

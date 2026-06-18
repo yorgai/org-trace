@@ -142,7 +142,17 @@ pub(super) fn format_chunks(
     let mut chunks = Vec::new();
     let mut sequence = 0_usize;
     for row in rows {
-        if let Some(chunk) = chunk_from_part(row?, external_session_id, sequence) {
+        if let Some(mut chunk) = chunk_from_part(row?, external_session_id, sequence) {
+            let message_id = chunk.source_message_id.clone();
+            let part_id = chunk.source_part_id.clone();
+            chunk.set_source_pointer(
+                OPENCODE_SOURCE_ID,
+                db_path,
+                None,
+                None,
+                message_id.as_deref(),
+                part_id.as_deref(),
+            );
             chunks.push(chunk);
             sequence += 1;
         }
@@ -389,7 +399,7 @@ fn part_type_expression(part_schema: &TableSchema) -> String {
 #[derive(Debug)]
 struct OpenCodePartRow {
     part_id: String,
-    _message_id: String,
+    message_id: String,
     role: Option<String>,
     part_type: Option<String>,
     part_data: Option<String>,
@@ -400,7 +410,7 @@ struct OpenCodePartRow {
 fn opencode_chunk_row(row: &Row<'_>) -> rusqlite::Result<OpenCodePartRow> {
     Ok(OpenCodePartRow {
         part_id: string_cell(row, 0)?,
-        _message_id: string_cell(row, 1)?,
+        message_id: string_cell(row, 1)?,
         role: optional_string_cell(row, 2)?,
         part_type: optional_string_cell(row, 3)?,
         part_data: optional_string_cell(row, 4)?,
@@ -433,7 +443,7 @@ fn chunk_from_part(
         .clone()
         .or_else(|| string_field(&part_data, &["type", "kind"]))
         .unwrap_or_else(|| infer_part_type(&part_data));
-    match part_type.as_str() {
+    let mut chunk = match part_type.as_str() {
         "text" | "message" => text_from_part(&part_data).map(|text| {
             if role.as_deref() == Some("user") {
                 user_message_chunk(
@@ -490,7 +500,10 @@ fn chunk_from_part(
                 )
             }
         }),
-    }
+    }?;
+    chunk.source_message_id = Some(row.message_id);
+    chunk.source_part_id = Some(row.part_id);
+    Some(chunk)
 }
 
 fn tool_call_from_part(row: &OpenCodePartRow, value: &Value) -> Option<(ImportedToolCall, String)> {
@@ -862,5 +875,17 @@ mod tests {
         assert_eq!(chunks[3].function, FUNCTION_RUN_COMMAND_LINE);
         assert_eq!(chunks[3].args["command"], "cargo test");
         assert_eq!(chunks[3].result["output"], "ok");
+        assert_eq!(chunks[0].source_id.as_deref(), Some(OPENCODE_SOURCE_ID));
+        assert_eq!(
+            chunks[0].source_path.as_deref(),
+            Some(path.display().to_string().as_str())
+        );
+        assert_eq!(chunks[0].source_message_id.as_deref(), Some("message-user"));
+        assert_eq!(chunks[0].source_part_id.as_deref(), Some("part-user"));
+        assert_eq!(
+            chunks[3].source_message_id.as_deref(),
+            Some("message-assistant")
+        );
+        assert_eq!(chunks[3].source_part_id.as_deref(), Some("part-tool"));
     }
 }

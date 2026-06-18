@@ -1,0 +1,42 @@
+{
+  "source": "claude_code",
+  "description": "Tiny sanitized Claude Code JSONL transcript with one user turn, one assistant turn, and one shell tool call.",
+  "format": "jsonl",
+  "profile": {
+    "sessionLogPath": "logs"
+  },
+  "expected": {
+    "sessions": [
+      {
+        "externalSessionId": "session-basic",
+        "title": "Run tests",
+        "parserVersion": "claude-code-jsonl-v1",
+        "model": "claude-sonnet-example",
+        "inputTokens": 15,
+        "outputTokens": 7,
+        "repoPath": "/workspace/repo",
+        "branch": "feature/example"
+      }
+    ],
+    "chunks": {
+      "session-basic": [
+        {
+          "actionType": "raw",
+          "function": "user_message",
+          "text": "Run tests"
+        },
+        {
+          "actionType": "assistant",
+          "function": "assistant",
+          "text": "I will run the test suite."
+        },
+        {
+          "actionType": "tool_call",
+          "function": "run_command_line",
+          "command": "cargo test",
+          "output": "test result placeholder"
+        }
+      ]
+    }
+  }
+}

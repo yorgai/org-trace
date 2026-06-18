@@ -12,7 +12,8 @@ use std::time::UNIX_EPOCH;
 use anyhow::{anyhow, Result};
 use brick_core::{
     format_source_session_chunks, list_source_plans, list_source_sessions, ActivityChunk,
-    MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore, SourceSessionListQuery,
+    MetadataDb, NativeSourceSession, SourcePlanListQuery, SourcePlanRecord,
+    SourcePlanSessionEdgeRecord, SourceProfile, SourceProfileStore, SourceSessionListQuery,
     SourceSessionRecord, SourceSessionUpsert,
 };
 use brick_protocol::ActorType;
@@ -81,6 +82,49 @@ pub struct HistorySessionRow {
     pub lines_added: Option<u64>,
     pub lines_removed: Option<u64>,
     pub touched_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HistoryPlansResponse {
+    pub source_id: String,
+    pub limit: usize,
+    pub offset: usize,
+    pub total: usize,
+    pub has_more: bool,
+    pub plans: Vec<HistoryPlanRow>,
+    pub edges: Vec<HistoryPlanSessionEdgeRow>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HistoryPlanRow {
+    pub source_id: String,
+    pub plan_id: String,
+    pub external_plan_id: String,
+    pub title: Option<String>,
+    pub source_path: Option<String>,
+    pub source_uri: Option<String>,
+    pub source_mtime: Option<String>,
+    pub parser_version: Option<String>,
+    pub discovered_at: String,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata_json: Option<Value>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HistoryPlanSessionEdgeRow {
+    pub source_id: String,
+    pub plan_id: String,
+    pub external_plan_id: String,
+    pub external_session_id: String,
+    pub role: String,
+    pub todo_ids_json: Option<Value>,
+    pub discovered_at: String,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata_json: Option<Value>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -233,6 +277,23 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
                 offset,
             )?)
         }
+        HistoryCommand::Plans {
+            source,
+            limit,
+            offset,
+            format,
+        } => {
+            ensure_json(format);
+            let profile = read_profile(profiles, &source)?;
+            let mut metadata_db = MetadataDb::open_global()?;
+            refresh_profiles_to_metadata(&mut metadata_db, std::slice::from_ref(&profile), 0)?;
+            print_json(&build_plans_response(
+                &metadata_db,
+                &profile,
+                limit,
+                offset,
+            )?)
+        }
         HistoryCommand::RecentPaths {
             source,
             limit,
@@ -334,6 +395,44 @@ fn build_sessions_response(
         total,
         has_more,
         sessions,
+    })
+}
+
+fn build_plans_response(
+    metadata_db: &MetadataDb,
+    profile: &SourceProfile,
+    limit: usize,
+    offset: usize,
+) -> Result<HistoryPlansResponse> {
+    let records = metadata_db.list_source_plans(&SourcePlanListQuery {
+        source_id: Some(profile.name.clone()),
+        limit,
+        offset,
+    })?;
+    let total = metadata_db.count_source_plans(Some(&profile.name))?;
+    let external_plan_ids = records
+        .iter()
+        .map(|record| record.external_plan_id.clone())
+        .collect::<Vec<_>>();
+    let edges = if external_plan_ids.is_empty() {
+        Vec::new()
+    } else {
+        metadata_db
+            .list_source_plan_session_edges(Some(&profile.name), &external_plan_ids)?
+            .into_iter()
+            .map(plan_session_edge_row)
+            .collect::<Vec<_>>()
+    };
+    let plans = records.into_iter().map(plan_row).collect::<Vec<_>>();
+    let has_more = offset.saturating_add(plans.len()) < total;
+    Ok(HistoryPlansResponse {
+        source_id: profile.name.clone(),
+        limit,
+        offset,
+        total,
+        has_more,
+        plans,
+        edges,
     })
 }
 
@@ -708,6 +807,40 @@ fn recent_path_row(record: SourceSessionRecord) -> HistoryRecentPathRow {
     }
 }
 
+fn plan_row(record: SourcePlanRecord) -> HistoryPlanRow {
+    HistoryPlanRow {
+        source_id: record.source_id.clone(),
+        plan_id: record.external_plan_id.clone(),
+        external_plan_id: record.external_plan_id,
+        title: record.title,
+        source_path: display_path(record.source_path),
+        source_uri: record.source_uri,
+        source_mtime: record.source_mtime.map(|time| time.to_rfc3339()),
+        parser_version: record.parser_version,
+        discovered_at: record.discovered_at.to_rfc3339(),
+        last_seen_at: record.last_seen_at.to_rfc3339(),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+        metadata_json: record.metadata_json,
+    }
+}
+
+fn plan_session_edge_row(record: SourcePlanSessionEdgeRecord) -> HistoryPlanSessionEdgeRow {
+    HistoryPlanSessionEdgeRow {
+        source_id: record.source_id.clone(),
+        plan_id: record.external_plan_id.clone(),
+        external_plan_id: record.external_plan_id,
+        external_session_id: record.external_session_id,
+        role: record.role.as_str().to_string(),
+        todo_ids_json: record.todo_ids_json,
+        discovered_at: record.discovered_at.to_rfc3339(),
+        last_seen_at: record.last_seen_at.to_rfc3339(),
+        created_at: record.created_at.to_rfc3339(),
+        updated_at: record.updated_at.to_rfc3339(),
+        metadata_json: record.metadata_json,
+    }
+}
+
 fn source_path_display(record: &SourceSessionRecord) -> String {
     record
         .source_path
@@ -800,6 +933,7 @@ mod tests {
 
     use brick_core::{user_message_chunk, ACTION_TYPE_RAW, FUNCTION_USER_MESSAGE};
     use chrono::TimeZone;
+    use serde_json::json;
 
     use super::*;
 
@@ -915,6 +1049,61 @@ mod tests {
         assert_eq!(response.paths.len(), 2);
         assert!(response.paths.iter().any(|row| row.source_id == "first"));
         assert!(response.paths.iter().any(|row| row.source_id == "second"));
+    }
+
+    #[test]
+    fn plans_response_includes_rows_and_unresolved_edges() {
+        let root = temp_repo_root("plans-root");
+        let mut metadata_db =
+            MetadataDb::open_path(root.join("metadata.sqlite")).expect("open metadata DB");
+        let profile = profile("cursor_ide");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 18, 2, 3, 4)
+            .single()
+            .expect("valid plan timestamp");
+
+        metadata_db
+            .upsert_source_plan_with_edges(&brick_core::SourcePlanWithEdgesUpsert {
+                plan: brick_core::SourcePlanUpsert {
+                    source_id: profile.name.clone(),
+                    external_plan_id: "plan-1".to_string(),
+                    title: Some("Plan one".to_string()),
+                    source_path: Some(PathBuf::from("/tmp/plan-1.plan.md")),
+                    source_uri: Some("file:///tmp/plan-1.plan.md".to_string()),
+                    source_mtime: Some(now),
+                    parser_version: Some("cursor-ide-plan-registry-v1".to_string()),
+                    discovered_at: now,
+                    last_seen_at: now,
+                    metadata_json: Some(json!({ "raw": true })),
+                },
+                edges: vec![brick_core::SourcePlanSessionEdgeUpsert {
+                    source_id: profile.name.clone(),
+                    external_plan_id: "plan-1".to_string(),
+                    external_session_id: "missing-session".to_string(),
+                    role: brick_core::SourcePlanSessionEdgeRole::ReferencedBy,
+                    todo_ids_json: Some(json!(["todo-1"])),
+                    discovered_at: now,
+                    last_seen_at: now,
+                    metadata_json: Some(json!({ "edge": true })),
+                }],
+            })
+            .expect("upsert source plan");
+
+        let response =
+            build_plans_response(&metadata_db, &profile, 20, 0).expect("build plans response");
+        let serialized = serde_json::to_value(&response).expect("serialize plans response");
+
+        assert_eq!(response.source_id, "cursor_ide");
+        assert_eq!(response.total, 1);
+        assert!(!response.has_more);
+        assert_eq!(response.plans[0].plan_id, "plan-1");
+        assert_eq!(
+            response.plans[0].source_path.as_deref(),
+            Some("/tmp/plan-1.plan.md")
+        );
+        assert_eq!(response.edges[0].external_session_id, "missing-session");
+        assert_eq!(response.edges[0].role, "referenced_by");
+        assert_eq!(serialized["edges"][0]["todo_ids_json"], json!(["todo-1"]));
     }
 
     #[test]

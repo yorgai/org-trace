@@ -1,5 +1,7 @@
 //! External history chunk JSON formatting helpers.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -29,6 +31,18 @@ pub struct ActivityChunk {
     pub thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_record_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_line_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_part_id: Option<String>,
 }
 
 impl ActivityChunk {
@@ -43,7 +57,30 @@ impl ActivityChunk {
             created_at: chrono::Utc::now().to_rfc3339(),
             thread_id: None,
             process_id: None,
+            source_id: None,
+            source_path: None,
+            source_record_key: None,
+            source_line_number: None,
+            source_message_id: None,
+            source_part_id: None,
         }
+    }
+
+    pub fn set_source_pointer(
+        &mut self,
+        source_id: &str,
+        source_path: &Path,
+        source_record_key: Option<&str>,
+        source_line_number: Option<u64>,
+        source_message_id: Option<&str>,
+        source_part_id: Option<&str>,
+    ) {
+        self.source_id = Some(source_id.to_string());
+        self.source_path = Some(source_path.display().to_string());
+        self.source_record_key = source_record_key.map(ToOwned::to_owned);
+        self.source_line_number = source_line_number;
+        self.source_message_id = source_message_id.map(ToOwned::to_owned);
+        self.source_part_id = source_part_id.map(ToOwned::to_owned);
     }
 }
 

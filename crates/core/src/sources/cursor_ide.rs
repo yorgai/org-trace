@@ -22,7 +22,7 @@ const CURSOR_PLAN_REGISTRY_KEY: &str = "composer.planRegistry";
 const CURSOR_PLAN_REGISTRY_PREFIX: &str = "composer.planRegistry.";
 const CURSOR_IDE_HEADERS_PARSER_VERSION: &str = "cursor-ide-composer-headers-v1";
 const CURSOR_IDE_PLAN_REGISTRY_PARSER_VERSION: &str = "cursor-ide-plan-registry-v1";
-const CURSOR_IDE_PROVIDER_SLUG: &str = "cursor";
+const CURSOR_IDE_PROVIDER_SLUG: &str = CURSOR_IDE_SOURCE_ID;
 
 pub(super) fn list_sessions(
     profile: &SourceProfile,
@@ -87,6 +87,7 @@ pub(super) fn format_chunks(
     format_cursor_family_chunks(
         external_session_id,
         source_path,
+        CURSOR_IDE_SOURCE_ID,
         CURSOR_IDE_PROVIDER_SLUG,
         "Cursor IDE",
     )
@@ -633,5 +634,21 @@ mod tests {
         assert_eq!(chunks[2].function, FUNCTION_RUN_COMMAND_LINE);
         assert_eq!(chunks[2].args["command"], "ls");
         assert_eq!(chunks[2].result["output"], "README.md");
+        assert_eq!(chunks[0].source_id.as_deref(), Some(CURSOR_IDE_SOURCE_ID));
+        assert_eq!(
+            chunks[0].source_path.as_deref(),
+            Some(path.display().to_string().as_str())
+        );
+        assert_eq!(
+            chunks[0].source_record_key.as_deref(),
+            Some("bubbleId:composer-1:user-1")
+        );
+        assert_eq!(chunks[0].source_part_id.as_deref(), Some("user-1"));
+        assert_eq!(
+            chunks[2].source_record_key.as_deref(),
+            Some("bubbleId:composer-1:tool-1")
+        );
+        assert_eq!(chunks[2].source_message_id.as_deref(), Some("tool-1"));
+        assert_eq!(chunks[2].source_part_id.as_deref(), Some("tool-1"));
     }
 }

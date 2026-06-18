@@ -18,7 +18,7 @@ Brick is at an MVP phase for local-first trace capture plus unauthenticated self
 
 ## MVP walkthrough
 
-From a Git repository, initialize Brick and configure a source profile. `init` scans common local agent stores (ORGII, Cursor, Claude Code, Codex, and OpenCode). In an interactive terminal it lets you select discovered sources with arrow keys, space, and enter; in scripts it prints findings without blocking.
+From a Git repository, initialize Brick and configure a source profile. `init` scans common local agent stores (ORGII, Cursor, Claude Code, Codex, Windsurf, and OpenCode). In an interactive terminal it lets you select discovered sources with arrow keys, space, and enter; in scripts it prints findings without blocking.
 
 ```bash
 cargo run -p brick -- init
@@ -45,6 +45,7 @@ The read-through history surface refreshes native source metadata into `<BRICK_H
 ```bash
 cargo run -q -p brick -- history sources --format json
 cargo run -q -p brick -- history sessions --source claude_code --limit 20 --format json
+cargo run -q -p brick -- history plans --source cursor_ide --limit 20 --offset 0 --format json
 cargo run -q -p brick -- history recent-paths --source all --limit 20 --format json
 cargo run -q -p brick -- history chunks --source claude_code --session-id <native-id> --format json
 cargo run -q -p brick -- history chunks --source codex_app --session-id <native-id> --format json
@@ -121,11 +122,11 @@ Artifacts are the work products and proof attached to Missions and Sessions. The
 
 Local writes use append-only JSONL under `.brick/provenance/` by default. `brick init` automatically adds `.brick/` to the repository `.gitignore` idempotently, because Brick local state is not source code and should not be committed. The effective store root resolves in this order: `--store-root`, `BRICK_STORE_ROOT`, selected source profile `store_root`, then repo-local `.brick/provenance`.
 
-Repo-level behavior lives in `.brick/config.toml`; source-specific paths live in `.brick/sources/<name>.toml`. `brick init` and `brick source scan` discover common external stores such as `~/.orgii`, ORGII `sessions.db`, Cursor `state.vscdb`, Claude Code `~/.claude/projects`, Codex `sessions/`, and OpenCode `opencode.db`. Local Brick events default to metadata-only pointers with hashes, sizes, source paths, and availability. Full transcript or recording bytes are copied into local content-addressed blobs only when `--copy` is passed or the config/source profile opts into `default_full_evidence_upload = true`.
+Repo-level behavior lives in `.brick/config.toml`; source-specific paths live in `.brick/sources/<name>.toml`. `brick init` and `brick source scan` discover common external stores such as `~/.orgii`, ORGII `sessions.db`, Cursor `state.vscdb`, Claude Code `~/.claude/projects`, Codex `sessions/`, Windsurf `state.vscdb`, and OpenCode `opencode.db`. Local Brick events default to metadata-only pointers with hashes, sizes, source paths, and availability. Full transcript or recording bytes are copied into local content-addressed blobs only when `--copy` is passed or the config/source profile opts into `default_full_evidence_upload = true`.
 
 `index.json`, `brick.sqlite`, and `views/` are derived indexes under the effective store. Rebuilding them never mutates the source event log. `views/` contains agent-readable Markdown files for orgs, projects, missions, sessions, and artifacts. Pull writes remote events to separate inbound logs and deduplicates them by event ID when rebuilding indexes.
 
-Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `brick history sessions`, `brick history recent-paths`, and `brick import native list/ingest` refresh native source-session rows into that metadata index before returning results.
+Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `brick history sessions`, `brick history plans`, `brick history recent-paths`, and `brick import native list/ingest` refresh native source-session or source-plan rows into that metadata index before returning results.
 
 ## Documentation
 

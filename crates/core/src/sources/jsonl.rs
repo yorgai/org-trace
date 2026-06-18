@@ -10,10 +10,16 @@ use crate::NativeSessionMetadata;
 
 pub(super) const TITLE_LIMIT: usize = 200;
 
-pub(super) fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
+#[derive(Debug, Clone)]
+pub(super) struct JsonlRecord {
+    pub value: Value,
+    pub line_number: u64,
+}
+
+pub(super) fn read_jsonl_records(path: &Path) -> Result<Vec<JsonlRecord>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read JSONL source file {}", path.display()))?;
-    let mut values = Vec::new();
+    let mut records = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -26,9 +32,16 @@ pub(super) fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
                 path.display()
             )
         })?;
-        values.push(value);
+        records.push(JsonlRecord {
+            value,
+            line_number: (line_index + 1) as u64,
+        });
     }
-    Ok(values)
+    Ok(records)
+}
+
+pub(super) fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
+    read_jsonl_records(path).map(|records| records.into_iter().map(|record| record.value).collect())
 }
 
 pub(super) fn update_session_times(

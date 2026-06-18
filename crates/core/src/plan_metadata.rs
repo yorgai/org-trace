@@ -44,6 +44,14 @@ pub struct SourcePlanRecord {
     pub metadata_json: Option<Value>,
 }
 
+/// Optional filters for listing source-plan rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourcePlanListQuery {
+    pub source_id: Option<String>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
 /// Input for creating or updating a source plan-to-session edge row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourcePlanSessionEdgeUpsert {

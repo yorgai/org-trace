@@ -137,6 +137,7 @@ pub(in crate::sources) fn composer_header_session(
 pub(in crate::sources) fn format_chunks(
     external_session_id: &str,
     source_path: Option<&Path>,
+    source_id: &str,
     provider_slug: &str,
     source_label: &str,
 ) -> Result<Vec<ActivityChunk>> {
@@ -165,35 +166,62 @@ pub(in crate::sources) fn format_chunks(
             .with_context(|| format!("failed to parse {source_label} bubble JSON"))?;
         let bubble = content_resolver.resolve_value(&bubble)?;
         if let Some(tool_call) = tool_call_from_bubble(bubble_id, &bubble) {
-            chunks.push(tool_call_chunk(
+            let mut chunk = tool_call_chunk(
                 external_session_id,
                 provider_slug,
                 sequence,
                 &tool_call,
                 &tool_result_text(&bubble),
-            ));
+            );
+            chunk.set_source_pointer(
+                source_id,
+                state_db_path,
+                Some(&bubble_key),
+                None,
+                Some(&tool_call.call_id),
+                Some(bubble_id),
+            );
+            chunks.push(chunk);
             continue;
         }
         let created_at = created_at(&bubble);
         if bubble_is_user(&bubble) {
             if let Some(message) = text(&bubble) {
-                chunks.push(user_message_chunk(
+                let mut chunk = user_message_chunk(
                     external_session_id,
                     provider_slug,
                     sequence,
                     &created_at,
                     &message,
-                ));
+                );
+                chunk.set_source_pointer(
+                    source_id,
+                    state_db_path,
+                    Some(&bubble_key),
+                    None,
+                    None,
+                    Some(bubble_id),
+                );
+                chunks.push(chunk);
             }
         } else if bubble_is_assistant(&bubble) {
             if let Some(message) = text(&bubble) {
-                chunks.push(assistant_message_chunk(
+                let mut chunk = assistant_message_chunk(
                     external_session_id,
                     provider_slug,
                     sequence,
                     &created_at,
                     &message,
-                ));
+                );
+                chunk.set_source_pointer(
+                    source_id,
+                    state_db_path,
+                    Some(&bubble_key),
+                    None,
+                    None,
+                    Some(bubble_id),
+                );
+                chunks.push(chunk);
             }
         }
     }

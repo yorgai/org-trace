@@ -13,8 +13,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::{
-    metadata_db_path, metadata_db_path_in_home, SourcePlanRecord, SourcePlanSessionEdgeRecord,
-    SourcePlanWithEdgesUpsert,
+    metadata_db_path, metadata_db_path_in_home, SourcePlanListQuery, SourcePlanRecord,
+    SourcePlanSessionEdgeRecord, SourcePlanWithEdgesUpsert,
 };
 
 /// Current schema version for the unified metadata database.
@@ -379,15 +379,21 @@ impl MetadataDb {
     }
 
     /// Lists source-plan rows in deterministic most-recent-first order.
-    pub fn list_source_plans(&self, source_id: Option<&str>) -> Result<Vec<SourcePlanRecord>> {
+    pub fn list_source_plans(&self, query: &SourcePlanListQuery) -> Result<Vec<SourcePlanRecord>> {
+        let limit = normalized_limit(query.limit);
+        let offset = normalized_offset(query.offset);
         let mut statement = self.connection.prepare(
             "SELECT source_id, external_plan_id, title, source_path, source_uri, source_mtime,
                     parser_version, discovered_at, last_seen_at, created_at, updated_at, metadata_json
              FROM source_plans
              WHERE (?1 IS NULL OR source_id = ?1)
-             ORDER BY last_seen_at DESC, source_id ASC, external_plan_id ASC",
+             ORDER BY last_seen_at DESC, source_id ASC, external_plan_id ASC
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = statement.query_map(params![source_id], source_plan_from_row)?;
+        let rows = statement.query_map(
+            params![query.source_id, limit, offset],
+            source_plan_from_row,
+        )?;
         let mut records = Vec::new();
         for row in rows {
             records.push(row.context("failed to read metadata source-plan row")?);
@@ -395,10 +401,21 @@ impl MetadataDb {
         Ok(records)
     }
 
+    /// Counts source-plan rows for pagination metadata.
+    pub fn count_source_plans(&self, source_id: Option<&str>) -> Result<usize> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM source_plans WHERE (?1 IS NULL OR source_id = ?1)",
+            params![source_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        usize::try_from(count).context("metadata source-plan count exceeds usize")
+    }
+
     /// Lists recovered source plan-to-session edges.
     pub fn list_source_plan_session_edges(
         &self,
         source_id: Option<&str>,
+        external_plan_ids: &[String],
     ) -> Result<Vec<SourcePlanSessionEdgeRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT p.source_id, p.external_plan_id, e.external_session_id, e.role, e.todo_ids_json,
@@ -411,7 +428,11 @@ impl MetadataDb {
         let rows = statement.query_map(params![source_id], source_plan_session_edge_from_row)?;
         let mut records = Vec::new();
         for row in rows {
-            records.push(row.context("failed to read metadata source-plan edge row")?);
+            let record = row.context("failed to read metadata source-plan edge row")?;
+            if external_plan_ids.is_empty() || external_plan_ids.contains(&record.external_plan_id)
+            {
+                records.push(record);
+            }
         }
         Ok(records)
     }
@@ -1063,10 +1084,14 @@ mod tests {
             .upsert_source_plan_with_edges(&input)
             .expect("upsert source plan");
         let plans = db
-            .list_source_plans(Some(TEST_SOURCE_ID))
+            .list_source_plans(&SourcePlanListQuery {
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                limit: 10,
+                offset: 0,
+            })
             .expect("list source plans");
         let edges = db
-            .list_source_plan_session_edges(Some(TEST_SOURCE_ID))
+            .list_source_plan_session_edges(Some(TEST_SOURCE_ID), &[])
             .expect("list source plan edges");
 
         assert_eq!(plan.external_plan_id, "plan-1");
@@ -1081,6 +1106,71 @@ mod tests {
                 && edge.role == crate::SourcePlanSessionEdgeRole::BuiltBy
                 && edge.todo_ids_json == Some(json!(["todo-1"]))
         }));
+    }
+
+    #[test]
+    fn lists_source_plans_with_pagination_and_filters_edges_to_page() {
+        let path = temp_home("plan-pagination").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let base = Utc
+            .with_ymd_and_hms(2026, 6, 18, 2, 3, 4)
+            .single()
+            .expect("valid plan timestamp");
+
+        for index in 0..3 {
+            let plan_id = format!("plan-{index}");
+            db.upsert_source_plan_with_edges(&SourcePlanWithEdgesUpsert {
+                plan: crate::SourcePlanUpsert {
+                    source_id: TEST_SOURCE_ID.to_string(),
+                    external_plan_id: plan_id.clone(),
+                    title: Some(plan_id.clone()),
+                    source_path: Some(PathBuf::from(format!("/tmp/{plan_id}.plan.md"))),
+                    source_uri: None,
+                    source_mtime: Some(base),
+                    parser_version: Some("plan-parser-v1".to_string()),
+                    discovered_at: base,
+                    last_seen_at: base + chrono::Duration::seconds(index),
+                    metadata_json: None,
+                },
+                edges: vec![SourcePlanSessionEdgeUpsert {
+                    source_id: TEST_SOURCE_ID.to_string(),
+                    external_plan_id: plan_id.clone(),
+                    external_session_id: format!("session-{index}"),
+                    role: crate::SourcePlanSessionEdgeRole::ReferencedBy,
+                    todo_ids_json: None,
+                    discovered_at: base,
+                    last_seen_at: base,
+                    metadata_json: None,
+                }],
+            })
+            .expect("upsert source plan");
+        }
+
+        let plans = db
+            .list_source_plans(&SourcePlanListQuery {
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                limit: 1,
+                offset: 1,
+            })
+            .expect("list source plans");
+        let plan_ids = plans
+            .iter()
+            .map(|plan| plan.external_plan_id.clone())
+            .collect::<Vec<_>>();
+        let edges = db
+            .list_source_plan_session_edges(Some(TEST_SOURCE_ID), &plan_ids)
+            .expect("list source plan edges");
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].external_plan_id, "plan-1");
+        assert_eq!(
+            db.count_source_plans(Some(TEST_SOURCE_ID))
+                .expect("count source plans"),
+            3
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].external_plan_id, "plan-1");
+        assert_eq!(edges[0].external_session_id, "session-1");
     }
 
     #[test]

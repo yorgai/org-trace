@@ -11,10 +11,11 @@ use crate::{
 };
 
 use super::jsonl::{
-    read_jsonl_values, set_first_path, set_first_string, set_first_string_value, text_from_value,
-    token_value, truncate_title, update_session_times,
+    read_jsonl_records, read_jsonl_values, set_first_path, set_first_string,
+    set_first_string_value, text_from_value, token_value, truncate_title, update_session_times,
 };
 
+const CLAUDE_CODE_SOURCE_ID: &str = "claude_code";
 const CLAUDE_CODE_JSONL_PARSER_VERSION: &str = "claude-code-jsonl-v1";
 const CLAUDE_CODE_PROVIDER_SLUG: &str = "claudecode";
 
@@ -32,12 +33,13 @@ pub(super) fn format_chunks(
     let path = source_path.ok_or_else(|| {
         anyhow!("Claude Code source path missing for session: {external_session_id}")
     })?;
-    let lines = read_jsonl_values(path)?;
+    let records = read_jsonl_records(path)?;
     let mut chunks = Vec::new();
-    let mut pending_tool_calls = HashMap::<String, ImportedToolCall>::new();
+    let mut pending_tool_calls = HashMap::<String, (ImportedToolCall, u64)>::new();
     let mut sequence = 0_usize;
 
-    for value in lines {
+    for record in records {
+        let value = record.value;
         let created_at = value
             .get("timestamp")
             .and_then(Value::as_str)
@@ -52,24 +54,42 @@ pub(super) fn format_chunks(
         {
             "user" => {
                 if let Some((call_id, output)) = claude_tool_result_text(message.get("content")) {
-                    if let Some(call) = pending_tool_calls.remove(&call_id) {
-                        chunks.push(tool_call_chunk(
+                    if let Some((call, line_number)) = pending_tool_calls.remove(&call_id) {
+                        let mut chunk = tool_call_chunk(
                             external_session_id,
                             CLAUDE_CODE_PROVIDER_SLUG,
                             sequence,
                             &call,
                             &output,
-                        ));
+                        );
+                        chunk.set_source_pointer(
+                            CLAUDE_CODE_SOURCE_ID,
+                            path,
+                            None,
+                            Some(line_number),
+                            Some(&call.call_id),
+                            None,
+                        );
+                        chunks.push(chunk);
                         sequence += 1;
                     }
                 } else if let Some(text) = message.get("content").and_then(text_from_value) {
-                    chunks.push(user_message_chunk(
+                    let mut chunk = user_message_chunk(
                         external_session_id,
                         CLAUDE_CODE_PROVIDER_SLUG,
                         sequence,
                         created_at,
                         &text,
-                    ));
+                    );
+                    chunk.set_source_pointer(
+                        CLAUDE_CODE_SOURCE_ID,
+                        path,
+                        None,
+                        Some(record.line_number),
+                        None,
+                        None,
+                    );
+                    chunks.push(chunk);
                     sequence += 1;
                 }
             }
@@ -78,31 +98,50 @@ pub(super) fn format_chunks(
                     match item.get("type").and_then(Value::as_str).unwrap_or_default() {
                         "text" => {
                             if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                chunks.push(assistant_message_chunk(
+                                let mut chunk = assistant_message_chunk(
                                     external_session_id,
                                     CLAUDE_CODE_PROVIDER_SLUG,
                                     sequence,
                                     created_at,
                                     text,
-                                ));
+                                );
+                                chunk.set_source_pointer(
+                                    CLAUDE_CODE_SOURCE_ID,
+                                    path,
+                                    None,
+                                    Some(record.line_number),
+                                    None,
+                                    item.get("id").and_then(Value::as_str),
+                                );
+                                chunks.push(chunk);
                                 sequence += 1;
                             }
                         }
                         "thinking" => {
                             if let Some(text) = item.get("thinking").and_then(Value::as_str) {
-                                chunks.push(thinking_chunk(
+                                let mut chunk = thinking_chunk(
                                     external_session_id,
                                     CLAUDE_CODE_PROVIDER_SLUG,
                                     sequence,
                                     created_at,
                                     text,
-                                ));
+                                );
+                                chunk.set_source_pointer(
+                                    CLAUDE_CODE_SOURCE_ID,
+                                    path,
+                                    None,
+                                    Some(record.line_number),
+                                    None,
+                                    item.get("id").and_then(Value::as_str),
+                                );
+                                chunks.push(chunk);
                                 sequence += 1;
                             }
                         }
                         "tool_use" => {
                             if let Some(call) = claude_tool_call_from_item(item, created_at) {
-                                pending_tool_calls.insert(call.call_id.clone(), call);
+                                pending_tool_calls
+                                    .insert(call.call_id.clone(), (call, record.line_number));
                             }
                         }
                         _ => {}
@@ -113,14 +152,23 @@ pub(super) fn format_chunks(
         }
     }
 
-    for call in pending_tool_calls.into_values() {
-        chunks.push(tool_call_chunk(
+    for (call, line_number) in pending_tool_calls.into_values() {
+        let mut chunk = tool_call_chunk(
             external_session_id,
             CLAUDE_CODE_PROVIDER_SLUG,
             sequence,
             &call,
             "",
-        ));
+        );
+        chunk.set_source_pointer(
+            CLAUDE_CODE_SOURCE_ID,
+            path,
+            None,
+            Some(line_number),
+            Some(&call.call_id),
+            None,
+        );
+        chunks.push(chunk);
         sequence += 1;
     }
     Ok(chunks)
@@ -335,6 +383,14 @@ mod tests {
         assert_eq!(chunks[2].function, FUNCTION_RUN_COMMAND_LINE);
         assert_eq!(chunks[2].args["command"], "cargo test");
         assert_eq!(chunks[2].result["output"], "ok");
+        assert_eq!(chunks[0].source_id.as_deref(), Some(CLAUDE_CODE_SOURCE_ID));
+        assert_eq!(
+            chunks[0].source_path.as_deref(),
+            Some(transcript_path.display().to_string().as_str())
+        );
+        assert_eq!(chunks[0].source_line_number, Some(1));
+        assert_eq!(chunks[2].source_line_number, Some(2));
+        assert_eq!(chunks[2].source_message_id.as_deref(), Some("tool-1"));
     }
 
     #[test]

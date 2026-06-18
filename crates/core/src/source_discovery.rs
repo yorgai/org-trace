@@ -1,8 +1,9 @@
 //! Built-in discovery of local agent history and evidence stores.
 //!
-//! Discovery is intentionally read-only. It only reports candidate paths that
-//! already exist so `brick init` can help users decide what to include without
-//! copying transcripts or recordings into Brick.
+//! Discovery is intentionally read-only. It builds deterministic candidate sets
+//! for known source storage locations and only reports paths that already exist
+//! so `brick init` can help users decide what to include without copying
+//! transcripts or recordings into Brick.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ pub enum DiscoveredSourceKind {
     Cursor,
     ClaudeCode,
     Codex,
+    Windsurf,
     OpenCode,
 }
 
@@ -28,6 +30,7 @@ impl DiscoveredSourceKind {
             DiscoveredSourceKind::Cursor => "cursor",
             DiscoveredSourceKind::ClaudeCode => "claude_code",
             DiscoveredSourceKind::Codex => "codex",
+            DiscoveredSourceKind::Windsurf => "windsurf",
             DiscoveredSourceKind::OpenCode => "opencode",
         }
     }
@@ -44,6 +47,7 @@ impl DiscoveredSourceKind {
             DiscoveredSourceKind::Cursor => "Cursor",
             DiscoveredSourceKind::ClaudeCode => "Claude Code",
             DiscoveredSourceKind::Codex => "Codex",
+            DiscoveredSourceKind::Windsurf => "Windsurf",
             DiscoveredSourceKind::OpenCode => "OpenCode",
         }
     }
@@ -112,6 +116,11 @@ pub fn discover_sources() -> Vec<DiscoveredSource> {
         &mut sources,
         DiscoveredSourceKind::Codex,
         codex_paths(&home),
+    );
+    push_source(
+        &mut sources,
+        DiscoveredSourceKind::Windsurf,
+        windsurf_paths(&home),
     );
     push_source(
         &mut sources,
@@ -190,10 +199,17 @@ fn codex_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
         .collect()
 }
 
+fn windsurf_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
+    windsurf_state_db_candidates(home)
+        .into_iter()
+        .map(|candidate| path(DiscoveredPathKind::CursorStateDatabase, candidate))
+        .collect()
+}
+
 fn opencode_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
     opencode_db_candidates(home)
         .into_iter()
-        .map(|candidate| path(DiscoveredPathKind::HistoryDatabase, candidate))
+        .map(|candidate| path(DiscoveredPathKind::SessionDatabase, candidate))
         .collect()
 }
 
@@ -228,18 +244,57 @@ fn codex_session_dir_candidates(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn windsurf_state_db_candidates(home: &Path) -> Vec<PathBuf> {
+    app_state_db_candidates(home, "Windsurf", &[".windsurf"])
+}
+
 fn opencode_db_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![home.join(".local/share/opencode/opencode.db")];
-    if cfg!(target_os = "macos") {
-        paths.push(home.join("Library/Application Support/opencode/opencode.db"));
-        paths.push(home.join("Library/Application Support/ai.opencode.desktop/opencode.db"));
-    } else if cfg!(target_os = "windows") {
-        paths.push(home.join("AppData/Roaming/opencode/opencode.db"));
-        paths.push(home.join("AppData/Local/opencode/opencode.db"));
-    } else {
-        paths.push(home.join(".config/opencode/opencode.db"));
-    }
-    paths
+    opencode_roots(home)
+        .into_iter()
+        .map(|root| root.join("opencode.db"))
+        .collect()
+}
+
+fn opencode_roots(home: &Path) -> Vec<PathBuf> {
+    let fallback_roots = [home.join(".opencode"), home.join(".local/share/opencode")];
+    let platform_roots = platform_data_roots(home, "opencode", &["ai.opencode.desktop"]);
+    unique_paths(fallback_roots.into_iter().chain(platform_roots).collect())
+}
+
+fn app_state_db_candidates(home: &Path, app_name: &str, fallback_roots: &[&str]) -> Vec<PathBuf> {
+    let roots = fallback_roots
+        .iter()
+        .map(|root| home.join(root))
+        .chain(platform_data_roots(home, app_name, &[]))
+        .collect();
+    unique_paths(roots)
+        .into_iter()
+        .map(|root| root.join("User/globalStorage/state.vscdb"))
+        .collect()
+}
+
+fn platform_data_roots(home: &Path, app_name: &str, alternate_app_names: &[&str]) -> Vec<PathBuf> {
+    std::iter::once(app_name)
+        .chain(alternate_app_names.iter().copied())
+        .flat_map(|name| {
+            [
+                home.join("Library/Application Support").join(name),
+                home.join("AppData/Roaming").join(name),
+                home.join("AppData/Local").join(name),
+                home.join(".config").join(name),
+                home.join(".local/share").join(name),
+            ]
+        })
+        .collect()
+}
+
+fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().fold(Vec::new(), |mut unique, path| {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+        unique
+    })
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -265,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn windsurf_candidates_include_state_db_files() {
+        let home = Path::new("/Users/me");
+        let rendered = windsurf_state_db_candidates(home)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(rendered
+            .iter()
+            .any(|path| path.contains("Windsurf/User/globalStorage/state.vscdb")));
+        assert!(rendered
+            .iter()
+            .any(|path| path.contains(".windsurf/User/globalStorage/state.vscdb")));
+        assert!(rendered.iter().all(|path| path.ends_with("state.vscdb")));
+    }
+
+    #[test]
     fn opencode_candidates_include_db_files() {
         let home = Path::new("/Users/me");
         let rendered = opencode_db_candidates(home)
@@ -275,6 +347,19 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|path| path.contains("opencode/opencode.db")));
+        assert!(rendered
+            .iter()
+            .any(|path| path.contains(".opencode/opencode.db")));
         assert!(rendered.iter().all(|path| path.ends_with("opencode.db")));
+    }
+
+    #[test]
+    fn opencode_discovery_paths_map_to_session_db_path() {
+        let home = Path::new("/Users/me");
+        let paths = opencode_paths(home);
+
+        assert!(paths
+            .iter()
+            .all(|candidate| candidate.kind == DiscoveredPathKind::SessionDatabase));
     }
 }

@@ -37,6 +37,7 @@ pub(super) fn format_chunks(
     format_cursor_family_chunks(
         external_session_id,
         source_path,
+        WINDSURF_SOURCE_ID,
         WINDSURF_PROVIDER_SLUG,
         "Windsurf",
     )

@@ -62,10 +62,12 @@ Terminology:
 | `args` | Tool args or normalized message args. |
 | `result` | Message/tool result payload. |
 | `createdAt` / `created_at` | RFC3339 timestamp. |
-| `source` | Optional Brick source ID. |
-| `sourcePath` | Optional native evidence pointer. |
-| `sourceLineNumber` | Optional JSONL line number for file-backed sources. |
-| `sourceRecordKey` | Optional DB row/key pointer for DB-backed sources. |
+| `source_id` / `sourceId` | Optional Brick/source-provider ID. |
+| `source_path` / `sourcePath` | Optional native file or DB path evidence pointer. |
+| `source_record_key` / `sourceRecordKey` | Optional native row/key pointer, such as Cursor-family `bubbleId:{composerId}:{bubbleId}`. |
+| `source_line_number` / `sourceLineNumber` | Optional JSONL line number for file-backed sources. |
+| `source_message_id` / `sourceMessageId` | Optional native message/tool call ID where the provider exposes one. |
+| `source_part_id` / `sourcePartId` | Optional native part/bubble ID where the provider exposes one. |
 
 ### Session export formatting
 
@@ -191,7 +193,7 @@ First slice implemented in Brick:
 | ORGII implementation | `orgtrack-core/src/sources/claude_code/history.rs`. Older stats scanner: `orgtrack-core/src/sources/claude_code/db.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`; older stats path also writes `claude_session_cache`. |
 | Brick target | One Claude provider that combines modern JSONL-to-JSON formatting with optional `sessions-index.json` scan optimization. |
-| JSON export | Sessions, recent paths, full chunks. Optional chunk source pointers should include JSONL path and line number. |
+| JSON export | Sessions, recent paths, full chunks. Chunk source pointers include JSONL path and line number where available. |
 
 ### Claude metadata fields
 
@@ -236,7 +238,7 @@ First slice implemented in Brick:
 | ORGII implementation | `orgtrack-core/src/sources/codex/app.rs`. Older generic CLI scanner also scans Codex in `orgtrack-core/src/sources/cli_session_db.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`; older stats path writes `cli_session_cache`. |
 | Brick target | Canonical Codex provider should use the modern `codex_app` parser; deprecate duplicate generic stats path after parity. |
-| JSON export | Sessions, recent paths, full chunks with optional JSONL line pointers. |
+| JSON export | Sessions, recent paths, full chunks with JSONL path and line pointers. |
 
 ### Codex metadata fields
 
@@ -271,13 +273,13 @@ First slice implemented in Brick:
 | Column | Details |
 | --- | --- |
 | Source ID | `opencode` |
-| Native storage | OpenCode SQLite DB `opencode.db`. Candidate roots include `~/.local/share/opencode/opencode.db`, macOS application support paths, Windows roaming/local paths, and Linux config/data paths. |
+| Native storage | OpenCode SQLite DB `opencode.db`. Candidate roots include fallback roots (`~/.opencode/opencode.db`, `~/.local/share/opencode/opencode.db`), macOS application support paths, Windows roaming/local paths, and Linux config/data paths. Discovered defaults write the DB file to `session_db_path`. |
 | Native query method | Open DB read-only from `session_db_path` or configured path containing `opencode.db`. Query `session` for metadata with conservative schema introspection. Query `part` joined to `message` for chunks when `message_id` plus a session ID column are available. |
 | Native raw format | SQLite tables `session`, `message`, and `part`; first slice assumes `session.id` and optionally reads `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, archive flags, and token columns. JSON is expected in `message.data`, `part.data`, and sometimes `session.model`, but provider falls back to plain strings where feasible. |
 | ORGII implementation | `orgtrack-core/src/sources/opencode/history.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`. |
 | Brick target | DB-backed OpenCode provider with per-session metadata rows and lazy DB chunk loading. |
-| JSON export | Sessions, recent paths, and first-pass full chunks. Source pointer enrichment for DB row/message/part IDs remains a follow-up because the current `ActivityChunk` DTO has no explicit source pointer fields. |
+| JSON export | Sessions, recent paths, and first-pass full chunks. Chunk source pointers include DB path plus message and part IDs when exposed by the schema. |
 
 ### OpenCode metadata fields
 
@@ -317,7 +319,7 @@ First slice implemented in Brick:
 | Column | Details |
 | --- | --- |
 | Source ID | `windsurf` |
-| Native storage | Windsurf `state.vscdb`. macOS: `~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb`; Linux: `~/.config/Windsurf/User/globalStorage/state.vscdb`; Windows: `~/AppData/Roaming/Windsurf/User/globalStorage/state.vscdb`; fallback: `~/.windsurf/User/globalStorage/state.vscdb`. |
+| Native storage | Windsurf `state.vscdb`. Candidate roots include macOS `~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb`, Linux config/data paths, Windows roaming/local paths, and fallback `~/.windsurf/User/globalStorage/state.vscdb`. Discovered defaults write the DB file to `cursor_state_db_path`. |
 | Native query method | Open SQLite read-only. Query metadata with `SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%'`. Load one composer with `composerData:{composerId}`. Load bubbles with batched `bubbleId:{composerId}:{bubbleId}` keys. |
 | Native raw format | Cursor-like `cursorDiskKV` JSON strings. Composer rows include `composerId`, `name`, timestamps, model config, headers, tracked repos, workspace identifier, subagent info. Bubble rows include `type`, `bubbleId`, `createdAt`, `text`, and optional `toolFormerData`. |
 | ORGII implementation | `orgtrack-core/src/sources/windsurf/history.rs`. |
@@ -366,6 +368,33 @@ First slice implemented in Brick:
 | Query method | ORGII internal APIs and session persistence, not external native app scraping. |
 | Brick treatment | Do not make Brick scrape ORGII runtime state by default. ORGII should explicitly emit Brick provenance events or export evidence when needed. |
 | JSON export | Brick can ingest ORGII-origin events, but ORGII remains runtime owner. |
+
+## Provider fixture validation
+
+Provider parity tests use sanitized fixture scenarios under `crates/core/tests/fixtures/external_sources`. The fixture tree is intentionally text-first so Brick can validate real-ish source schemas without committing private native history or large binary databases.
+
+Convention:
+
+```text
+crates/core/tests/fixtures/external_sources/
+  <source_id>/
+    <scenario_name>/
+      manifest.json
+      logs/                  # JSONL/text fixtures
+      db-spec/               # SQL/JSON specs for generated SQLite DBs
+```
+
+Each `manifest.json` declares the source, fixture format, relative profile path hints, and expected session/chunk fields. JSONL-backed providers can commit tiny sanitized transcripts directly. SQLite-backed providers should commit SQL or JSON specs and let tests generate temporary DBs, rather than committing `state.vscdb`, `opencode.db`, WAL, or SHM files.
+
+Sanitization rules before adding fixtures:
+
+1. Keep only the smallest records needed for the parser behavior under test.
+2. Replace private prompts, file contents, command output, paths, repo names, users, hosts, URLs, tokens, and organization names with deterministic placeholders.
+3. Normalize timestamps and IDs to stable synthetic values.
+4. Use paths such as `/workspace/repo`, branches such as `feature/example`, and model names such as `example-model` unless the exact value is required to test parsing.
+5. Review generated expected metadata/chunks before committing.
+
+The current committed example is `claude_code/basic_session`, a tiny JSONL transcript that exercises metadata extraction and chunk formatting. Next fixtures should add one generated SQLite scenario each for Cursor IDE, Windsurf, and OpenCode, plus a tiny Codex App JSONL scenario that covers `token_count` and `apply_patch` impact parsing.
 
 ## Implementation status
 
