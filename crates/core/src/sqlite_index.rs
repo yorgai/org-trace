@@ -8,20 +8,20 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use brick_protocol::{
-    ActorType, ArtifactKind, DiffFileChangeKind, DiffTarget, EventType, SessionLogFormat,
-    TraceEvent,
+    ActorType, ArtifactKind, DiffFileChangeKind, DiffTarget, EventType, EvidenceAvailability,
+    MissionStatus, SessionLogFormat, TraceEvent,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
-    sqlite_schema::{clear_tables, create_schema},
-    IndexedArtifact, IndexedAttachment, IndexedDiff, IndexedFile, IndexedMission,
-    IndexedRepoContext, IndexedSession, IndexedSessionLog, TraceIndex,
+    sqlite_schema::{clear_tables, create_schema, reset_schema},
+    IndexedArtifact, IndexedAttachment, IndexedDiff, IndexedFile, IndexedMission, IndexedOrg,
+    IndexedProject, IndexedRepoContext, IndexedSession, IndexedSessionLog, TraceIndex,
 };
 
 /// Current schema version for the rebuildable SQLite cache.
-pub const SQLITE_INDEX_SCHEMA_VERSION: u16 = 1;
+pub const SQLITE_INDEX_SCHEMA_VERSION: u16 = 2;
 
 /// Filename for the SQLite query cache under the effective cache directory.
 pub const SQLITE_INDEX_FILE: &str = "brick.sqlite";
@@ -120,6 +120,8 @@ pub struct SqliteAttachmentRecord {
     pub sha256: String,
     pub size_bytes: u64,
     pub storage_uri: String,
+    pub external_uri: Option<String>,
+    pub availability: String,
     pub repo_context_id: Option<String>,
     pub uploaded_at: String,
 }
@@ -137,7 +139,7 @@ pub fn rebuild_sqlite_index(path: &Path, events: &[TraceEvent], index: &TraceInd
 
     let mut connection = Connection::open(path)
         .with_context(|| format!("failed to open SQLite index at {}", path.display()))?;
-    create_schema(&connection)?;
+    prepare_schema_for_rebuild(&connection)?;
     let transaction = connection
         .transaction()
         .context("failed to start SQLite index rebuild transaction")?;
@@ -315,6 +317,31 @@ pub fn query_sqlite_artifacts(
     Ok(records)
 }
 
+fn prepare_schema_for_rebuild(connection: &Connection) -> Result<()> {
+    if !table_exists(connection, "metadata")? {
+        return reset_schema(connection);
+    }
+    let schema_version = metadata_value(connection, "schema_version")?
+        .map(|value| value.parse::<u16>())
+        .transpose()
+        .context("failed to parse SQLite schema_version metadata")?;
+    if schema_version == Some(SQLITE_INDEX_SCHEMA_VERSION) {
+        create_schema(connection)
+    } else {
+        reset_schema(connection)
+    }
+}
+
+fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table_name],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to inspect SQLite schema")
+}
+
 fn insert_metadata(connection: &Connection, event_count: usize) -> Result<()> {
     let rebuilt_at = Utc::now().to_rfc3339();
     for (key, value) in [
@@ -333,9 +360,9 @@ fn insert_metadata(connection: &Connection, event_count: usize) -> Result<()> {
 fn insert_events(connection: &Connection, events: &[TraceEvent]) -> Result<()> {
     let mut statement = connection.prepare(
         "INSERT INTO events (event_id, event_type, schema_version, payload_schema_version, \
-         occurred_at, recorded_at, actor_id, actor_type, actor_display_name, repo_id, mission_id, \
-         session_id, artifact_id, repo_context_id, confidence, payload_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         occurred_at, recorded_at, actor_id, actor_type, actor_display_name, repo_id, org_id, \
+         project_id, mission_id, session_id, artifact_id, repo_context_id, confidence, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )?;
     for event in events {
         let payload_json = serde_json::to_string(&event.payload)
@@ -351,6 +378,8 @@ fn insert_events(connection: &Connection, events: &[TraceEvent]) -> Result<()> {
             actor_type_name(event.actor.actor_type),
             event.actor.display_name,
             event.repo_id,
+            event.org_id.as_ref().map(ToString::to_string),
+            event.project_id.as_ref().map(ToString::to_string),
             event.mission_id.as_ref().map(ToString::to_string),
             event.session_id.as_ref().map(ToString::to_string),
             event.artifact_id.as_ref().map(ToString::to_string),
@@ -363,6 +392,12 @@ fn insert_events(connection: &Connection, events: &[TraceEvent]) -> Result<()> {
 }
 
 fn insert_index(connection: &Connection, index: &TraceIndex) -> Result<()> {
+    for org in index.orgs.values() {
+        insert_org(connection, org)?;
+    }
+    for project in index.projects.values() {
+        insert_project(connection, project)?;
+    }
     for mission in index.missions.values() {
         insert_mission(connection, mission)?;
     }
@@ -390,14 +425,47 @@ fn insert_index(connection: &Connection, index: &TraceIndex) -> Result<()> {
     Ok(())
 }
 
-fn insert_mission(connection: &Connection, mission: &IndexedMission) -> Result<()> {
+fn insert_org(connection: &Connection, org: &IndexedOrg) -> Result<()> {
     connection.execute(
-        "INSERT INTO missions (mission_id, title, description, created_at, last_event_at) \
+        "INSERT INTO orgs (org_id, name, description, created_at, last_event_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
+            org.org_id,
+            org.name,
+            org.description,
+            org.created_at.to_rfc3339(),
+            org.last_event_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_project(connection: &Connection, project: &IndexedProject) -> Result<()> {
+    connection.execute(
+        "INSERT INTO projects (project_id, org_id, name, description, created_at, last_event_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            project.project_id,
+            project.org_id,
+            project.name,
+            project.description,
+            project.created_at.to_rfc3339(),
+            project.last_event_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_mission(connection: &Connection, mission: &IndexedMission) -> Result<()> {
+    connection.execute(
+        "INSERT INTO missions (mission_id, project_id, title, description, status, created_at, last_event_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
             mission.mission_id,
+            mission.project_id,
             mission.title,
             mission.description,
+            mission_status_name(mission.status),
             mission.created_at.to_rfc3339(),
             mission.last_event_at.to_rfc3339(),
         ],
@@ -498,8 +566,8 @@ fn insert_file(connection: &Connection, file: &IndexedFile) -> Result<()> {
 fn insert_attachment(connection: &Connection, attachment: &IndexedAttachment) -> Result<()> {
     connection.execute(
         "INSERT INTO attachments (attachment_id, name, original_path, content_type, sha256, \
-         size_bytes, storage_uri, repo_context_id, uploaded_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         size_bytes, storage_uri, external_uri, availability, repo_context_id, uploaded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             attachment.attachment_id,
             attachment.name,
@@ -509,6 +577,8 @@ fn insert_attachment(connection: &Connection, attachment: &IndexedAttachment) ->
             i64::try_from(attachment.size_bytes)
                 .context("attachment size cannot fit in SQLite integer")?,
             attachment.storage_uri,
+            attachment.external_uri,
+            evidence_availability_name(attachment.availability),
             attachment.repo_context_id,
             attachment.uploaded_at.to_rfc3339(),
         ],
@@ -569,8 +639,8 @@ fn insert_diff(connection: &Connection, diff: &IndexedDiff) -> Result<()> {
 fn insert_session_log(connection: &Connection, session_log: &IndexedSessionLog) -> Result<()> {
     connection.execute(
         "INSERT INTO session_logs (log_ref_id, session_id, original_path, format, source, sha256, \
-         size_bytes, storage_uri, local_path, repo_context_id, uploaded_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         size_bytes, storage_uri, local_path, external_uri, availability, repo_context_id, uploaded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             session_log.log_ref_id,
             session_log.session_id,
@@ -582,6 +652,8 @@ fn insert_session_log(connection: &Connection, session_log: &IndexedSessionLog) 
                 .context("session log size cannot fit in SQLite integer")?,
             session_log.storage_uri,
             session_log.local_path,
+            session_log.external_uri,
+            evidence_availability_name(session_log.availability),
             session_log.repo_context_id,
             session_log.uploaded_at.to_rfc3339(),
         ],
@@ -640,7 +712,8 @@ fn collect_attachments(
     let mut statement = connection.prepare(
         "SELECT attachments.attachment_id, attachments.name, attachments.original_path, \
          attachments.content_type, attachments.sha256, attachments.size_bytes, \
-         attachments.storage_uri, attachments.repo_context_id, attachments.uploaded_at \
+         attachments.storage_uri, attachments.external_uri, attachments.availability, \
+         attachments.repo_context_id, attachments.uploaded_at \
          FROM attachments \
          JOIN artifact_attachments ON artifact_attachments.attachment_id = attachments.attachment_id \
          WHERE artifact_attachments.artifact_id = ?1 \
@@ -656,8 +729,10 @@ fn collect_attachments(
             sha256: row.get(4)?,
             size_bytes: u64::try_from(size_bytes).unwrap_or_default(),
             storage_uri: row.get(6)?,
-            repo_context_id: row.get(7)?,
-            uploaded_at: row.get(8)?,
+            external_uri: row.get(7)?,
+            availability: row.get(8)?,
+            repo_context_id: row.get(9)?,
+            uploaded_at: row.get(10)?,
         })
     })?;
     let mut records = Vec::new();
@@ -722,6 +797,16 @@ fn actor_type_name(actor_type: ActorType) -> &'static str {
     }
 }
 
+fn mission_status_name(status: MissionStatus) -> &'static str {
+    match status {
+        MissionStatus::Planned => "planned",
+        MissionStatus::Active => "active",
+        MissionStatus::Blocked => "blocked",
+        MissionStatus::Completed => "completed",
+        MissionStatus::Archived => "archived",
+    }
+}
+
 fn artifact_kind_name(kind: ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::Decision => "decision",
@@ -763,8 +848,20 @@ fn session_log_format_name(format: SessionLogFormat) -> &'static str {
     }
 }
 
+fn evidence_availability_name(availability: EvidenceAvailability) -> &'static str {
+    match availability {
+        EvidenceAvailability::LocalPointer => "local_pointer",
+        EvidenceAvailability::LocalBlob => "local_blob",
+        EvidenceAvailability::RemoteBlob => "remote_blob",
+    }
+}
+
 fn event_type_name(event_type: EventType) -> &'static str {
     match event_type {
+        EventType::OrgCreated => "org.created",
+        EventType::OrgUpdated => "org.updated",
+        EventType::ProjectCreated => "project.created",
+        EventType::ProjectUpdated => "project.updated",
         EventType::MissionCreated => "mission.created",
         EventType::MissionUpdated => "mission.updated",
         EventType::SessionStarted => "session.started",

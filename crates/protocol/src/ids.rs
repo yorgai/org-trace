@@ -69,6 +69,8 @@ impl fmt::Display for TraceIdParseError {
 
 impl std::error::Error for TraceIdParseError {}
 
+trace_id_type!(OrgId, "org_");
+trace_id_type!(ProjectId, "project_");
 trace_id_type!(MissionId, "mission_");
 trace_id_type!(SessionId, "session_");
 trace_id_type!(ArtifactId, "artifact_");

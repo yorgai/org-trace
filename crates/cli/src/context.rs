@@ -125,7 +125,7 @@ pub fn handle_session_read(
         }
         SessionCommand::Start { .. }
         | SessionCommand::Link { .. }
-        | SessionCommand::UploadLog { .. } => {
+        | SessionCommand::Show { .. } => {
             let _ = (identity_args, source_profile);
             Ok(false)
         }

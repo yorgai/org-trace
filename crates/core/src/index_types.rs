@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use brick_protocol::{
-    ActorRef, ActorType, ArtifactKind, DiffFileChangeKind, DiffTarget, SessionLogFormat,
-    SessionSource,
+    ActorRef, ActorType, ArtifactKind, DiffFileChangeKind, DiffTarget, EvidenceAvailability,
+    MissionStatus, SessionLogFormat, SessionSource,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub struct TraceIndex {
     pub schema_version: u16,
     pub rebuilt_at: DateTime<Utc>,
     pub event_count: usize,
+    pub orgs: BTreeMap<String, IndexedOrg>,
+    pub projects: BTreeMap<String, IndexedProject>,
     pub missions: BTreeMap<String, IndexedMission>,
     pub sessions: BTreeMap<String, IndexedSession>,
     pub artifacts: BTreeMap<String, IndexedArtifact>,
@@ -34,12 +36,68 @@ pub struct TraceIndex {
     pub repo_contexts: BTreeMap<String, IndexedRepoContext>,
 }
 
+/// Indexed Org view with child Projects and repo contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedOrg {
+    pub org_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub project_ids: BTreeSet<String>,
+    pub repo_context_ids: BTreeSet<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_event_at: DateTime<Utc>,
+}
+
+impl IndexedOrg {
+    pub(crate) fn blank(org_id: String, recorded_at: DateTime<Utc>) -> Self {
+        Self {
+            org_id,
+            name: None,
+            description: None,
+            project_ids: BTreeSet::new(),
+            repo_context_ids: BTreeSet::new(),
+            created_at: recorded_at,
+            last_event_at: recorded_at,
+        }
+    }
+}
+
+/// Indexed Project view with parent Org, child Missions, and repo contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedProject {
+    pub project_id: String,
+    pub org_id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub mission_ids: BTreeSet<String>,
+    pub repo_context_ids: BTreeSet<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_event_at: DateTime<Utc>,
+}
+
+impl IndexedProject {
+    pub(crate) fn blank(project_id: String, recorded_at: DateTime<Utc>) -> Self {
+        Self {
+            project_id,
+            org_id: None,
+            name: None,
+            description: None,
+            mission_ids: BTreeSet::new(),
+            repo_context_ids: BTreeSet::new(),
+            created_at: recorded_at,
+            last_event_at: recorded_at,
+        }
+    }
+}
+
 /// Indexed Mission view with linked sessions, artifacts, and repo contexts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedMission {
     pub mission_id: String,
+    pub project_id: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub status: MissionStatus,
     pub session_ids: BTreeSet<String>,
     pub artifact_ids: BTreeSet<String>,
     pub repo_context_ids: BTreeSet<String>,
@@ -51,8 +109,10 @@ impl IndexedMission {
     pub(crate) fn blank(mission_id: String, recorded_at: DateTime<Utc>) -> Self {
         Self {
             mission_id,
+            project_id: None,
             title: None,
             description: None,
+            status: MissionStatus::default(),
             session_ids: BTreeSet::new(),
             artifact_ids: BTreeSet::new(),
             repo_context_ids: BTreeSet::new(),
@@ -145,6 +205,8 @@ pub struct IndexedAttachment {
     pub sha256: String,
     pub size_bytes: u64,
     pub storage_uri: String,
+    pub external_uri: Option<String>,
+    pub availability: EvidenceAvailability,
     pub repo_context_id: Option<String>,
     pub uploaded_at: DateTime<Utc>,
 }
@@ -192,6 +254,8 @@ pub struct IndexedSessionLog {
     pub size_bytes: u64,
     pub storage_uri: String,
     pub local_path: String,
+    pub external_uri: Option<String>,
+    pub availability: EvidenceAvailability,
     pub repo_context_id: Option<String>,
     pub uploaded_at: DateTime<Utc>,
 }

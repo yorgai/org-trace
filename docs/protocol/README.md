@@ -11,8 +11,8 @@ Each `TraceEvent` has these stable fields:
 - `schema_version` and `payload_schema_version`: currently `1`.
 - `occurred_at` and `recorded_at`: UTC timestamps.
 - `actor`: actor type, actor ID, and optional display name.
-- `repo_id`: optional server-side repository boundary.
-- `mission_id`, `session_id`, `artifact_id`, `repo_context_id`: optional graph anchors.
+- `repo_id`: optional server-side repository boundary retained by the current self-hosted MVP routes.
+- `org_id`, `project_id`, `mission_id`, `session_id`, `artifact_id`, `repo_context_id`: optional graph anchors.
 - `confidence`: `explicit`, `observed`, `imported`, `inferred`, or `unknown`.
 - `payload`: typed JSON payload for the event family.
 
@@ -27,9 +27,11 @@ Local append-only logs are the source of truth. Derived indexes may denormalize 
 
 ### Session events
 
-- `session.started`: records a canonical Brick session, optional mission link, session name, and source fields such as `app_id`, app-native session ID/name, and runtime ID.
+- `session.started`: records a canonical Brick session, optional mission link, session name, and source fields such as `app_id`, app-native session ID/name, and runtime ID. Sessions can represent agent execution, human work, CI execution, or imported external activity.
 - `session.linked_to_mission`: links an existing session to a mission with a relationship label.
-- `session.log_uploaded`: records metadata for content-addressed session log bytes. The payload stores log ref ID, original path, format, source, SHA-256, byte size, storage URI, local path, and optional repo context; it does not inline log content.
+- `session.log_uploaded`: records metadata for content-addressed session log or transcript bytes. The payload stores log ref ID, original path, format, source, SHA-256, byte size, storage URI, local path, and optional repo context; it does not inline log content.
+
+Session metadata is the default sync tier. Full transcripts, replay JSON, recordings, and logs are optional evidence tier content addressed by hashes and storage URIs.
 
 ### Artifact events
 
@@ -39,6 +41,8 @@ Local append-only logs are the source of truth. Derived indexes may denormalize 
 - `artifact.file_ref_recorded`: links an artifact to a repository file path.
 - `artifact.attachment_uploaded`: records metadata for content-addressed artifact attachment bytes without inlining content.
 - `artifact.reviewed` and `artifact.accepted`: reserved event names for later review workflows.
+
+Artifacts are Brick's work products and proof of work. Agent sessions may attach generated files, diffs, plans, or CI results. Human sessions may attach meeting notes, screen recordings, QA videos, screenshots, approval notes, or manual review documents. Large proof files should be uploaded as attachments so events stay small and syncable.
 
 Artifact kinds are `decision`, `file_ref`, `patch`, `review`, `test_result`, `acceptance`, and `note`.
 
@@ -115,10 +119,10 @@ GET /v1/repos/{repo_id}/sessions?limit=20&app_id=cursor
 Local query commands use equivalent rebuildable local projections:
 
 ```bash
-cargo run -p brick -- index rebuild
-cargo run -p brick -- db rebuild
-cargo run -p brick -- db sessions --limit 20
-cargo run -p brick -- db artifacts --limit 20
+cargo run -p brick -- maintenance index rebuild
+cargo run -p brick -- maintenance db rebuild
+cargo run -p brick -- maintenance db sessions --limit 20
+cargo run -p brick -- maintenance db artifacts --limit 20
 ```
 
 ## Importer semantics

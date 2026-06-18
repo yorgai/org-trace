@@ -184,7 +184,9 @@ fn route_error(error: anyhow::Error) -> (StatusCode, String) {
 mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
-    use brick_protocol::{ActorRef, ActorType, MissionCreatedPayload, MissionId, TraceEvent};
+    use brick_protocol::{
+        ActorRef, ActorType, MissionCreatedPayload, MissionId, MissionStatus, ProjectId, TraceEvent,
+    };
     use chrono::Utc;
     use tower::ServiceExt;
 
@@ -206,8 +208,10 @@ mod tests {
             },
             MissionId::new(),
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: "Server route".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )

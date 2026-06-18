@@ -21,6 +21,8 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
              actor_type TEXT NOT NULL,
              actor_display_name TEXT,
              repo_id TEXT,
+             org_id TEXT,
+             project_id TEXT,
              mission_id TEXT,
              session_id TEXT,
              artifact_id TEXT,
@@ -28,10 +30,27 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
              confidence TEXT NOT NULL,
              payload_json TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS orgs (
+             org_id TEXT PRIMARY KEY,
+             name TEXT,
+             description TEXT,
+             created_at TEXT NOT NULL,
+             last_event_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS projects (
+             project_id TEXT PRIMARY KEY,
+             org_id TEXT,
+             name TEXT,
+             description TEXT,
+             created_at TEXT NOT NULL,
+             last_event_at TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS missions (
              mission_id TEXT PRIMARY KEY,
+             project_id TEXT,
              title TEXT,
              description TEXT,
+             status TEXT NOT NULL,
              created_at TEXT NOT NULL,
              last_event_at TEXT NOT NULL
          );
@@ -84,6 +103,8 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
              sha256 TEXT NOT NULL,
              size_bytes INTEGER NOT NULL,
              storage_uri TEXT NOT NULL,
+             external_uri TEXT,
+             availability TEXT NOT NULL,
              repo_context_id TEXT,
              uploaded_at TEXT NOT NULL
          );
@@ -123,6 +144,8 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
              size_bytes INTEGER NOT NULL,
              storage_uri TEXT NOT NULL,
              local_path TEXT NOT NULL,
+             external_uri TEXT,
+             availability TEXT NOT NULL,
              repo_context_id TEXT,
              uploaded_at TEXT NOT NULL
          );
@@ -155,10 +178,39 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn reset_schema(connection: &Connection) -> Result<()> {
+    for table in [
+        "metadata",
+        "events",
+        "orgs",
+        "projects",
+        "missions",
+        "sessions",
+        "session_missions",
+        "artifacts",
+        "artifact_missions",
+        "artifact_sessions",
+        "files",
+        "artifact_files",
+        "attachments",
+        "diffs",
+        "diff_files",
+        "session_logs",
+        "artifact_attachments",
+        "file_refs",
+        "repo_contexts",
+    ] {
+        connection.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+    }
+    create_schema(connection)
+}
+
 pub(crate) fn clear_tables(connection: &Connection) -> Result<()> {
     for table in [
         "metadata",
         "events",
+        "orgs",
+        "projects",
         "missions",
         "sessions",
         "session_missions",

@@ -6,35 +6,39 @@
 
 use anyhow::{anyhow, Context, Result};
 use brick_core::{
-    capture_diff, capture_repo_context, DiffCaptureRequest, LocalStore, SourceProfile,
+    capture_diff, capture_repo_context, BrickConfig, DiffCaptureRequest, LocalStore, SourceProfile,
 };
 use brick_importers::{import_traces, ImportRequest, ImportSource};
 use brick_protocol::{
     ActorRef, ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload,
     ArtifactFileRefRecordedPayload, ArtifactId, ArtifactKind, ArtifactLinkedToMissionPayload,
-    ArtifactUpdatedPayload, AttachmentId, DiffTarget, FileRefId, LogRefId, MissionCreatedPayload,
-    MissionId, RepoContextId, SessionId, SessionLinkedToMissionPayload, SessionLogFormat,
-    SessionLogUploadedPayload, SessionStartedPayload, TraceEvent,
+    ArtifactUpdatedPayload, AttachmentId, DiffTarget, EvidenceAvailability, FileRefId, LogRefId,
+    MissionCreatedPayload, MissionId, MissionStatus, MissionUpdatedPayload, OrgCreatedPayload,
+    OrgId, ProjectCreatedPayload, ProjectId, RepoContextId, SessionId,
+    SessionLinkedToMissionPayload, SessionLogFormat, SessionLogUploadedPayload,
+    SessionStartedPayload, TraceEvent,
 };
 
 use crate::args::{
-    AgentImportArgs, ArtifactCommand, ArtifactKindArg, CiImportArgs, DiffCommand, DiffTargetArg,
-    IdentityArgs, ImportCommand, MissionCommand, SessionCommand, SessionLogFormatArg,
+    AgentImportArgs, ArtifactCommand, ArtifactKindArg, CiImportArgs, DiffTargetArg,
+    EvidenceCommand, IdentityArgs, ImportCommand, MissionCommand, MissionStatusArg, OrgCommand,
+    ProjectCommand, SessionCommand, SessionLogFormatArg,
 };
 use crate::context::{parse_optional_id, resolve_cli_identity};
 use crate::output::print_session_env;
 
-/// Executes diff capture write subcommands against the local event queue.
-pub fn handle_diff(
-    command: DiffCommand,
+/// Executes Evidence write subcommands against the local event queue.
+pub fn handle_evidence(
+    command: EvidenceCommand,
     identity_args: &IdentityArgs,
     store: &LocalStore,
     repo_root: &std::path::Path,
     work_dir: &std::path::Path,
     source_profile: Option<&SourceProfile>,
+    brick_config: &BrickConfig,
 ) -> Result<()> {
     match command {
-        DiffCommand::Capture {
+        EvidenceCommand::Diff {
             artifact,
             session,
             mission,
@@ -95,6 +99,243 @@ pub fn handle_diff(
             println!("patch_id={patch_id}");
             println!("summary_hash={summary_hash}");
         }
+        EvidenceCommand::Attach {
+            artifact,
+            session,
+            path,
+            name,
+            content_type,
+            copy,
+        } => {
+            let artifact_id = artifact
+                .parse::<ArtifactId>()
+                .context("invalid artifact id")?;
+            let session_id = parse_optional_id::<SessionId>(session.as_deref(), "session")?;
+            let identity =
+                resolve_cli_identity(store, identity_args, None, session_id, source_profile)?;
+            let actor = identity.actor.clone();
+            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
+            let should_copy = copy
+                || source_profile
+                    .map(|profile| profile.should_upload_full_evidence(brick_config))
+                    .unwrap_or(brick_config.evidence.default_full_evidence_upload);
+            let pointer = store.attachment_store().inspect_file(&path)?;
+            let (storage_uri, storage_path, availability) = if should_copy {
+                let stored = store.attachment_store().store_file(&path)?;
+                (
+                    stored.storage_uri,
+                    stored.storage_path.display().to_string(),
+                    EvidenceAvailability::LocalBlob,
+                )
+            } else {
+                (
+                    format!("file://{}", pointer.original_path.display()),
+                    String::new(),
+                    EvidenceAvailability::LocalPointer,
+                )
+            };
+            let attachment_name = name.unwrap_or_else(|| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("attachment")
+                    .to_string()
+            });
+            let attachment_id = AttachmentId::new();
+            let event = TraceEvent::artifact_attachment_uploaded(
+                actor,
+                artifact_id.clone(),
+                Some(identity.session_id),
+                ArtifactAttachmentUploadedPayload {
+                    attachment_id: attachment_id.clone(),
+                    name: attachment_name,
+                    original_path: pointer.original_path.display().to_string(),
+                    content_type,
+                    sha256: pointer.sha256.clone(),
+                    size_bytes: pointer.size_bytes,
+                    storage_uri: storage_uri.clone(),
+                    external_uri: Some(format!("file://{}", pointer.original_path.display())),
+                    availability,
+                    repo_context_id: Some(repo_context_id),
+                },
+            )?;
+            store.append_event(&event)?;
+            println!("attachment_id={attachment_id}");
+            println!("sha256={}", pointer.sha256);
+            println!("size_bytes={}", pointer.size_bytes);
+            println!("storage_uri={storage_uri}");
+            println!("storage_path={storage_path}");
+            println!(
+                "availability={}",
+                format_evidence_availability(availability)
+            );
+        }
+        EvidenceCommand::File {
+            artifact,
+            session,
+            path,
+        } => {
+            let artifact_id = artifact
+                .parse::<ArtifactId>()
+                .context("invalid artifact id")?;
+            let session_id = parse_optional_id::<SessionId>(session.as_deref(), "session")?;
+            let identity =
+                resolve_cli_identity(store, identity_args, None, session_id, source_profile)?;
+            let actor = identity.actor.clone();
+            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
+            let event = TraceEvent::artifact_file_ref_recorded(
+                actor,
+                artifact_id,
+                Some(identity.session_id),
+                ArtifactFileRefRecordedPayload {
+                    file_ref_id: FileRefId::new(),
+                    path,
+                    repo_context_id: Some(repo_context_id),
+                },
+            )?;
+            store.append_event(&event)?;
+            println!("file_ref_recorded=true");
+        }
+        EvidenceCommand::Log {
+            session,
+            path,
+            format,
+            source,
+            copy,
+        } => {
+            let session_id = session.parse::<SessionId>().context("invalid session id")?;
+            let identity = resolve_cli_identity(
+                store,
+                identity_args,
+                None,
+                Some(session_id.clone()),
+                source_profile,
+            )?;
+            let actor = identity.actor.clone();
+            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
+            let should_copy = copy
+                || source_profile
+                    .map(|profile| profile.should_upload_full_evidence(brick_config))
+                    .unwrap_or(brick_config.evidence.default_full_evidence_upload);
+            let pointer = store.attachment_store().inspect_file(&path)?;
+            let (storage_uri, local_path, availability) = if should_copy {
+                let stored = store.log_store().store_file(&path)?;
+                (
+                    stored.storage_uri,
+                    stored.storage_path.display().to_string(),
+                    EvidenceAvailability::LocalBlob,
+                )
+            } else {
+                (
+                    format!("file://{}", pointer.original_path.display()),
+                    String::new(),
+                    EvidenceAvailability::LocalPointer,
+                )
+            };
+            let log_ref_id = LogRefId::new();
+            let event = TraceEvent::session_log_uploaded(
+                actor,
+                session_id.clone(),
+                SessionLogUploadedPayload {
+                    log_ref_id: log_ref_id.clone(),
+                    original_path: pointer.original_path.display().to_string(),
+                    format: format
+                        .map(session_log_format_from_arg)
+                        .unwrap_or_else(|| infer_session_log_format(&pointer.original_path)),
+                    source: source
+                        .or_else(|| identity.session_source.app_id.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    sha256: pointer.sha256.clone(),
+                    size_bytes: pointer.size_bytes,
+                    storage_uri: storage_uri.clone(),
+                    local_path: local_path.clone(),
+                    external_uri: Some(format!("file://{}", pointer.original_path.display())),
+                    availability,
+                    repo_context_id: Some(repo_context_id),
+                },
+            )?;
+            store.append_event(&event)?;
+            println!("log_ref_id={log_ref_id}");
+            println!("session_id={session_id}");
+            println!("sha256={}", pointer.sha256);
+            println!("size_bytes={}", pointer.size_bytes);
+            println!("storage_uri={storage_uri}");
+            println!("storage_path={local_path}");
+            println!(
+                "availability={}",
+                format_evidence_availability(availability)
+            );
+        }
+        EvidenceCommand::FileShow { .. } => {}
+    }
+    Ok(())
+}
+
+/// Executes Org write subcommands against the local event queue.
+pub fn handle_org(
+    command: OrgCommand,
+    identity_args: &IdentityArgs,
+    store: &LocalStore,
+    repo_root: &std::path::Path,
+    work_dir: &std::path::Path,
+    source_profile: Option<&SourceProfile>,
+) -> Result<()> {
+    match command {
+        OrgCommand::Create { name, description } => {
+            let identity = resolve_cli_identity(store, identity_args, None, None, source_profile)?;
+            let actor = identity.actor.clone();
+            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
+            let org_id = OrgId::new();
+            let event = TraceEvent::org_created(
+                actor,
+                org_id.clone(),
+                OrgCreatedPayload {
+                    name,
+                    description,
+                    repo_context_id: Some(repo_context_id),
+                },
+            )?;
+            store.append_event(&event)?;
+            println!("org_id={org_id}");
+        }
+        OrgCommand::Show { .. } => {}
+    }
+    Ok(())
+}
+
+/// Executes Project write subcommands against the local event queue.
+pub fn handle_project(
+    command: ProjectCommand,
+    identity_args: &IdentityArgs,
+    store: &LocalStore,
+    repo_root: &std::path::Path,
+    work_dir: &std::path::Path,
+    source_profile: Option<&SourceProfile>,
+) -> Result<()> {
+    match command {
+        ProjectCommand::Create {
+            org,
+            name,
+            description,
+        } => {
+            let org_id = org.parse::<OrgId>().context("invalid org id")?;
+            let identity = resolve_cli_identity(store, identity_args, None, None, source_profile)?;
+            let actor = identity.actor.clone();
+            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
+            let project_id = ProjectId::new();
+            let event = TraceEvent::project_created(
+                actor,
+                project_id.clone(),
+                ProjectCreatedPayload {
+                    org_id,
+                    name,
+                    description,
+                    repo_context_id: Some(repo_context_id),
+                },
+            )?;
+            store.append_event(&event)?;
+            println!("project_id={project_id}");
+        }
+        ProjectCommand::Show { .. } => {}
     }
     Ok(())
 }
@@ -109,7 +350,13 @@ pub fn handle_mission(
     source_profile: Option<&SourceProfile>,
 ) -> Result<()> {
     match command {
-        MissionCommand::Create { title, description } => {
+        MissionCommand::Create {
+            project,
+            title,
+            description,
+            status,
+        } => {
+            let project_id = project.parse::<ProjectId>().context("invalid project id")?;
             let identity = resolve_cli_identity(store, identity_args, None, None, source_profile)?;
             let actor = identity.actor.clone();
             let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
@@ -118,14 +365,55 @@ pub fn handle_mission(
                 actor,
                 mission_id.clone(),
                 MissionCreatedPayload {
+                    project_id,
                     title,
                     description,
+                    status: mission_status_from_arg(status),
                     repo_context_id: Some(repo_context_id),
                 },
             )?;
             store.append_event(&event)?;
             println!("mission_id={mission_id}");
         }
+        MissionCommand::Update {
+            mission,
+            project,
+            title,
+            description,
+            status,
+        } => {
+            if project.is_none() && title.is_none() && description.is_none() && status.is_none() {
+                return Err(anyhow!(
+                    "mission update requires at least one of --project, --title, --description, or --status"
+                ));
+            }
+            let mission_id = mission.parse::<MissionId>().context("invalid mission id")?;
+            let project_id = parse_optional_id::<ProjectId>(project.as_deref(), "project")?;
+            let identity = resolve_cli_identity(
+                store,
+                identity_args,
+                Some(mission_id.clone()),
+                None,
+                source_profile,
+            )?;
+            let actor = identity.actor.clone();
+            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
+            let event = TraceEvent::mission_updated(
+                actor,
+                mission_id.clone(),
+                MissionUpdatedPayload {
+                    project_id,
+                    title,
+                    description,
+                    status: status.map(mission_status_from_arg),
+                    repo_context_id: Some(repo_context_id),
+                },
+            )?;
+            store.append_event(&event)?;
+            println!("mission_updated=true");
+            println!("mission_id={mission_id}");
+        }
+        MissionCommand::Show { .. } => {}
     }
     Ok(())
 }
@@ -204,52 +492,10 @@ pub fn handle_session(
             store.append_event(&event)?;
             println!("linked_session_to_mission=true");
         }
-        SessionCommand::UploadLog {
-            session,
-            path,
-            format,
-            source,
-        } => {
-            let session_id = session.parse::<SessionId>().context("invalid session id")?;
-            let identity = resolve_cli_identity(
-                store,
-                identity_args,
-                None,
-                Some(session_id.clone()),
-                source_profile,
-            )?;
-            let actor = identity.actor.clone();
-            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
-            let stored = store.log_store().store_file(&path)?;
-            let log_ref_id = LogRefId::new();
-            let event = TraceEvent::session_log_uploaded(
-                actor,
-                session_id.clone(),
-                SessionLogUploadedPayload {
-                    log_ref_id: log_ref_id.clone(),
-                    original_path: stored.original_path.display().to_string(),
-                    format: format
-                        .map(session_log_format_from_arg)
-                        .unwrap_or_else(|| infer_session_log_format(&stored.original_path)),
-                    source: source
-                        .or_else(|| identity.session_source.app_id.clone())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    sha256: stored.sha256.clone(),
-                    size_bytes: stored.size_bytes,
-                    storage_uri: stored.storage_uri.clone(),
-                    local_path: stored.storage_path.display().to_string(),
-                    repo_context_id: Some(repo_context_id),
-                },
-            )?;
-            store.append_event(&event)?;
-            println!("log_ref_id={log_ref_id}");
-            println!("session_id={session_id}");
-            println!("sha256={}", stored.sha256);
-            println!("size_bytes={}", stored.size_bytes);
-            println!("storage_uri={}", stored.storage_uri);
-            println!("storage_path={}", stored.storage_path.display());
-        }
-        SessionCommand::Current | SessionCommand::List { .. } | SessionCommand::Find { .. } => {}
+        SessionCommand::Current
+        | SessionCommand::List { .. }
+        | SessionCommand::Find { .. }
+        | SessionCommand::Show { .. } => {}
     }
     Ok(())
 }
@@ -344,9 +590,10 @@ pub fn handle_artifact(
     source_profile: Option<&SourceProfile>,
 ) -> Result<()> {
     match command {
-        ArtifactCommand::Decision {
+        ArtifactCommand::Create {
             mission,
             session,
+            kind,
             title,
             body,
         } => {
@@ -363,7 +610,7 @@ pub fn handle_artifact(
                 identity.mission_id.clone(),
                 Some(identity.session_id.clone()),
                 ArtifactCreatedPayload {
-                    artifact_kind: ArtifactKind::Decision,
+                    artifact_kind: artifact_kind_from_arg(kind),
                     title,
                     body,
                     repo_context_id: Some(repo_context_id),
@@ -371,32 +618,6 @@ pub fn handle_artifact(
             )?;
             store.append_event(&event)?;
             println!("artifact_id={artifact_id}");
-        }
-        ArtifactCommand::File {
-            artifact,
-            session,
-            path,
-        } => {
-            let artifact_id = artifact
-                .parse::<ArtifactId>()
-                .context("invalid artifact id")?;
-            let session_id = parse_optional_id::<SessionId>(session.as_deref(), "session")?;
-            let identity =
-                resolve_cli_identity(store, identity_args, None, session_id, source_profile)?;
-            let actor = identity.actor.clone();
-            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
-            let event = TraceEvent::artifact_file_ref_recorded(
-                actor,
-                artifact_id,
-                Some(identity.session_id),
-                ArtifactFileRefRecordedPayload {
-                    file_ref_id: FileRefId::new(),
-                    path,
-                    repo_context_id: Some(repo_context_id),
-                },
-            )?;
-            store.append_event(&event)?;
-            println!("file_ref_recorded=true");
         }
         ArtifactCommand::Link {
             mission,
@@ -463,51 +684,7 @@ pub fn handle_artifact(
             println!("artifact_updated=true");
             println!("artifact_id={artifact_id}");
         }
-        ArtifactCommand::Upload {
-            artifact,
-            session,
-            path,
-            name,
-            content_type,
-        } => {
-            let artifact_id = artifact
-                .parse::<ArtifactId>()
-                .context("invalid artifact id")?;
-            let session_id = parse_optional_id::<SessionId>(session.as_deref(), "session")?;
-            let identity =
-                resolve_cli_identity(store, identity_args, None, session_id, source_profile)?;
-            let actor = identity.actor.clone();
-            let repo_context_id = append_repo_context(store, repo_root, work_dir, actor.clone())?;
-            let stored = store.attachment_store().store_file(&path)?;
-            let attachment_name = name.unwrap_or_else(|| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("attachment")
-                    .to_string()
-            });
-            let attachment_id = AttachmentId::new();
-            let event = TraceEvent::artifact_attachment_uploaded(
-                actor,
-                artifact_id.clone(),
-                Some(identity.session_id),
-                ArtifactAttachmentUploadedPayload {
-                    attachment_id: attachment_id.clone(),
-                    name: attachment_name,
-                    original_path: stored.original_path.display().to_string(),
-                    content_type,
-                    sha256: stored.sha256.clone(),
-                    size_bytes: stored.size_bytes,
-                    storage_uri: stored.storage_uri.clone(),
-                    repo_context_id: Some(repo_context_id),
-                },
-            )?;
-            store.append_event(&event)?;
-            println!("attachment_id={attachment_id}");
-            println!("sha256={}", stored.sha256);
-            println!("size_bytes={}", stored.size_bytes);
-            println!("storage_uri={}", stored.storage_uri);
-            println!("storage_path={}", stored.storage_path.display());
-        }
+        ArtifactCommand::Show { .. } => {}
     }
     Ok(())
 }
@@ -524,6 +701,14 @@ fn diff_target_from_arg(
             DiffTargetArg::Working => DiffTarget::Working,
             DiffTargetArg::Staged => DiffTarget::Staged,
         }
+    }
+}
+
+fn format_evidence_availability(availability: EvidenceAvailability) -> &'static str {
+    match availability {
+        EvidenceAvailability::LocalPointer => "local_pointer",
+        EvidenceAvailability::LocalBlob => "local_blob",
+        EvidenceAvailability::RemoteBlob => "remote_blob",
     }
 }
 
@@ -547,6 +732,16 @@ fn infer_session_log_format(path: &std::path::Path) -> SessionLogFormat {
         Some("jsonl") => SessionLogFormat::Jsonl,
         Some("md" | "markdown") => SessionLogFormat::Markdown,
         _ => SessionLogFormat::Unknown,
+    }
+}
+
+fn mission_status_from_arg(status: MissionStatusArg) -> MissionStatus {
+    match status {
+        MissionStatusArg::Planned => MissionStatus::Planned,
+        MissionStatusArg::Active => MissionStatus::Active,
+        MissionStatusArg::Blocked => MissionStatus::Blocked,
+        MissionStatusArg::Completed => MissionStatus::Completed,
+        MissionStatusArg::Archived => MissionStatus::Archived,
     }
 }
 

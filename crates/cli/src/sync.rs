@@ -192,7 +192,9 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use brick_protocol::{ActorRef, ActorType, MissionCreatedPayload, MissionId};
+    use brick_protocol::{
+        ActorRef, ActorType, MissionCreatedPayload, MissionId, MissionStatus, ProjectId,
+    };
     use chrono::Utc;
 
     use super::*;
@@ -215,8 +217,10 @@ mod tests {
             },
             MissionId::new(),
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: title.to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )

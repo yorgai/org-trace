@@ -89,11 +89,22 @@ run git commit --quiet -m "initial smoke commit"
 printf 'working change\n' >> tracked.txt
 
 run brick --store-root "${STORE_ONE}" init
-run brick source configure --name cursor --app-id cursor --actor-id smoke-agent --actor-type agent --store-root "${STORE_ONE}" --notes "Smoke source"
+run brick source config --default-full-evidence-upload false --metadata-only-local true
+run brick source configure --name cursor --app-id cursor --actor-id smoke-agent --actor-type agent --store-root "${STORE_ONE}" --evidence-root "${TMP_ROOT}/.orgii" --default-full-evidence-upload false --notes "Smoke source"
 run brick source use --name cursor
 run brick --source cursor source show --name cursor
 
-mission_output="$(capture brick --source cursor mission create "Smoke MVP mission" --description "End-to-end smoke")"
+org_output="$(capture brick --source cursor org create "Smoke Org" --description "End-to-end smoke org")"
+printf '%s\n' "${org_output}"
+org_id="$(extract_value "${org_output}" org_id)"
+[[ -n "${org_id}" ]]
+
+project_output="$(capture brick --source cursor project create --org "${org_id}" "Smoke Project" --description "End-to-end smoke project")"
+printf '%s\n' "${project_output}"
+project_id="$(extract_value "${project_output}" project_id)"
+[[ -n "${project_id}" ]]
+
+mission_output="$(capture brick --source cursor mission create --project "${project_id}" "Smoke MVP mission" --description "End-to-end smoke" --status active)"
 printf '%s\n' "${mission_output}"
 mission_id="$(extract_value "${mission_output}" mission_id)"
 [[ -n "${mission_id}" ]]
@@ -106,34 +117,36 @@ session_id="$(extract_value "${session_output}" session_id)"
 run brick --source cursor session current
 run brick --source cursor context show
 
-artifact_output="$(capture brick --source cursor artifact decision --mission "${mission_id}" --session "${session_id}" "Smoke decision" --body "Choose the MVP smoke path")"
+artifact_output="$(capture brick --source cursor artifact create --mission "${mission_id}" --session "${session_id}" --kind decision "Smoke decision" --body "Choose the MVP smoke path")"
 printf '%s\n' "${artifact_output}"
 artifact_id="$(extract_value "${artifact_output}" artifact_id)"
 [[ -n "${artifact_id}" ]]
-run brick --source cursor artifact update --artifact "${artifact_id}" --session "${session_id}" --title "Updated smoke decision" --body "Updated by smoke harness" --kind review
+run brick --source cursor artifact update "${artifact_id}" --session "${session_id}" --title "Updated smoke decision" --body "Updated by smoke harness" --kind review
 
 ATTACHMENT_FILE="${TMP_ROOT}/attachment.txt"
 SESSION_LOG_FILE="${TMP_ROOT}/session.log"
 printf 'attachment body\n' > "${ATTACHMENT_FILE}"
 printf '{"role":"assistant","message":"smoke"}\n' > "${SESSION_LOG_FILE}"
-run brick --source cursor artifact upload --artifact "${artifact_id}" --session "${session_id}" --path "${ATTACHMENT_FILE}" --name smoke.txt --content-type text/plain
-run brick --source cursor session upload-log --session "${session_id}" --path "${SESSION_LOG_FILE}" --format jsonl --source cursor
+run brick --source cursor evidence attach --artifact "${artifact_id}" --session "${session_id}" --path "${ATTACHMENT_FILE}" --name smoke.txt --content-type text/plain
+run brick --source cursor evidence log --session "${session_id}" --path "${SESSION_LOG_FILE}" --format jsonl --source cursor
 
-run brick --source cursor diff capture --artifact "${artifact_id}" --session "${session_id}" --target working
+run brick --source cursor evidence diff --artifact "${artifact_id}" --session "${session_id}" --target working
 run git add tracked.txt
-run brick --source cursor diff capture --artifact "${artifact_id}" --session "${session_id}" --target staged
-run brick --source cursor artifact file --artifact "${artifact_id}" --session "${session_id}" tracked.txt
+run brick --source cursor evidence diff --artifact "${artifact_id}" --session "${session_id}" --target staged
+run brick --source cursor evidence file --artifact "${artifact_id}" --session "${session_id}" tracked.txt
 
-run brick --source cursor index rebuild
-run brick --source cursor index status
-run brick --source cursor db rebuild
-run brick --source cursor db status
-run brick --source cursor db sessions --limit 10 --app-id cursor --actor-id smoke-agent
-run brick --source cursor db artifacts --limit 10 --session "${session_id}" --mission "${mission_id}"
-run brick --source cursor inspect mission "${mission_id}"
-run brick --source cursor inspect session "${session_id}"
-run brick --source cursor inspect artifact "${artifact_id}"
-run brick --source cursor inspect file tracked.txt
+run brick --source cursor maintenance index rebuild
+run brick --source cursor maintenance index status
+run brick --source cursor maintenance db rebuild
+run brick --source cursor maintenance db status
+run brick --source cursor maintenance db sessions --limit 10 --app-id cursor --actor-id smoke-agent
+run brick --source cursor maintenance db artifacts --limit 10 --session "${session_id}" --mission "${mission_id}"
+run brick --source cursor org show "${org_id}"
+run brick --source cursor project show "${project_id}"
+run brick --source cursor mission show "${mission_id}"
+run brick --source cursor session show "${session_id}"
+run brick --source cursor artifact show "${artifact_id}"
+run brick --source cursor evidence file-show tracked.txt
 
 CURSOR_FIXTURE="${TMP_ROOT}/cursor.jsonl"
 CI_FIXTURE="${TMP_ROOT}/ci.json"
@@ -148,8 +161,8 @@ cat > "${CI_FIXTURE}" <<'JSON'
 JSON
 run brick --source cursor import cursor --path "${CURSOR_FIXTURE}" --session "${session_id}" --mission "${mission_id}" --app-session-id cursor-smoke --app-session-name "Cursor Smoke"
 run brick --source cursor import ci --path "${CI_FIXTURE}" --mission "${mission_id}" --session "${session_id}"
-run brick --source cursor index rebuild
-run brick --source cursor db rebuild
+run brick --source cursor maintenance index rebuild
+run brick --source cursor maintenance db rebuild
 
 cd "${ROOT_DIR}"
 brick_server serve --bind "127.0.0.1:${PORT}" --data-dir "${SERVER_DATA}" >"${SERVER_LOG}" 2>&1 &
@@ -158,7 +171,7 @@ wait_for_server
 run curl -fsS "${REMOTE}/health"
 
 cd "${REPO_ONE}"
-run brick --source cursor push --remote "${REMOTE}" --repo-id "${REPO_ID}"
+run brick --source cursor sync push --remote "${REMOTE}" --repo-id "${REPO_ID}" --org-id "${org_id}"
 run curl -fsS "${REMOTE}/v1/repos/${REPO_ID}/index/status"
 run curl -fsS "${REMOTE}/v1/repos/${REPO_ID}/sessions?limit=20"
 
@@ -173,11 +186,11 @@ printf 'second repo\n' > README.md
 run git add README.md
 run git commit --quiet -m "initial second repo"
 run brick --store-root "${STORE_TWO}" init
-run brick --store-root "${STORE_TWO}" pull --remote "${REMOTE}" --repo-id "${REPO_ID}"
-run brick --store-root "${STORE_TWO}" index rebuild
-run brick --store-root "${STORE_TWO}" db rebuild
-run brick --store-root "${STORE_TWO}" db sessions --limit 20
-run brick --store-root "${STORE_TWO}" db artifacts --limit 20 --mission "${mission_id}"
+run brick --store-root "${STORE_TWO}" sync pull --remote "${REMOTE}" --repo-id "${REPO_ID}" --org-id "${org_id}"
+run brick --store-root "${STORE_TWO}" maintenance index rebuild
+run brick --store-root "${STORE_TWO}" maintenance db rebuild
+run brick --store-root "${STORE_TWO}" maintenance db sessions --limit 20
+run brick --store-root "${STORE_TWO}" maintenance db artifacts --limit 20 --mission "${mission_id}"
 
 cd "${ROOT_DIR}"
 run brick_server rebuild-index --data-dir "${SERVER_DATA}" --repo-id "${REPO_ID}"

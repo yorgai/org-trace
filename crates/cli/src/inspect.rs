@@ -4,10 +4,13 @@
 //! rebuilding from JSONL, so users can query local provenance without a server.
 
 use anyhow::{anyhow, Result};
-use brick_core::{IndexedArtifact, IndexedFile, IndexedMission, IndexedSession, LocalStore};
-use brick_protocol::ActorType;
+use brick_core::{
+    IndexedArtifact, IndexedFile, IndexedMission, IndexedOrg, IndexedProject, IndexedSession,
+    LocalStore,
+};
+use brick_protocol::{ActorType, MissionStatus};
 
-use crate::args::{IndexCommand, InspectCommand};
+use crate::args::IndexCommand;
 
 /// Executes index cache maintenance subcommands.
 pub fn handle_index(command: IndexCommand, store: &LocalStore) -> Result<()> {
@@ -39,46 +42,99 @@ pub fn handle_index(command: IndexCommand, store: &LocalStore) -> Result<()> {
     Ok(())
 }
 
-/// Executes local graph inspection subcommands.
-pub fn handle_inspect(command: InspectCommand, store: &LocalStore) -> Result<()> {
+/// Prints a local Org projection by ID.
+pub fn show_org(org: String, store: &LocalStore) -> Result<()> {
     let index = store.load_or_rebuild_index()?;
-    match command {
-        InspectCommand::Mission { mission } => {
-            let item = index
-                .missions
-                .get(&mission)
-                .ok_or_else(|| anyhow!("mission not found: {mission}"))?;
-            print_mission(item);
-        }
-        InspectCommand::Session { session } => {
-            let item = index
-                .sessions
-                .get(&session)
-                .ok_or_else(|| anyhow!("session not found: {session}"))?;
-            print_session(item);
-        }
-        InspectCommand::Artifact { artifact } => {
-            let item = index
-                .artifacts
-                .get(&artifact)
-                .ok_or_else(|| anyhow!("artifact not found: {artifact}"))?;
-            print_artifact(item);
-        }
-        InspectCommand::File { path } => {
-            let item = index
-                .files
-                .get(&path)
-                .ok_or_else(|| anyhow!("file not found in trace index: {path}"))?;
-            print_file(item);
-        }
-    }
+    let item = index
+        .orgs
+        .get(&org)
+        .ok_or_else(|| anyhow!("org not found: {org}"))?;
+    print_org(item);
     Ok(())
+}
+
+/// Prints a local Project projection by ID.
+pub fn show_project(project: String, store: &LocalStore) -> Result<()> {
+    let index = store.load_or_rebuild_index()?;
+    let item = index
+        .projects
+        .get(&project)
+        .ok_or_else(|| anyhow!("project not found: {project}"))?;
+    print_project(item);
+    Ok(())
+}
+
+/// Prints a local Mission projection by ID.
+pub fn show_mission(mission: String, store: &LocalStore) -> Result<()> {
+    let index = store.load_or_rebuild_index()?;
+    let item = index
+        .missions
+        .get(&mission)
+        .ok_or_else(|| anyhow!("mission not found: {mission}"))?;
+    print_mission(item);
+    Ok(())
+}
+
+/// Prints a local Session projection by ID.
+pub fn show_session(session: String, store: &LocalStore) -> Result<()> {
+    let index = store.load_or_rebuild_index()?;
+    let item = index
+        .sessions
+        .get(&session)
+        .ok_or_else(|| anyhow!("session not found: {session}"))?;
+    print_session(item);
+    Ok(())
+}
+
+/// Prints a local Artifact projection by ID.
+pub fn show_artifact(artifact: String, store: &LocalStore) -> Result<()> {
+    let index = store.load_or_rebuild_index()?;
+    let item = index
+        .artifacts
+        .get(&artifact)
+        .ok_or_else(|| anyhow!("artifact not found: {artifact}"))?;
+    print_artifact(item);
+    Ok(())
+}
+
+/// Prints local file evidence by path.
+pub fn show_file(path: String, store: &LocalStore) -> Result<()> {
+    let index = store.load_or_rebuild_index()?;
+    let item = index
+        .files
+        .get(&path)
+        .ok_or_else(|| anyhow!("file not found in trace index: {path}"))?;
+    print_file(item);
+    Ok(())
+}
+
+fn print_org(item: &IndexedOrg) {
+    println!("org_id={}", item.org_id);
+    println!("name={}", item.name.as_deref().unwrap_or(""));
+    println!("description={}", item.description.as_deref().unwrap_or(""));
+    println!("created_at={}", item.created_at);
+    println!("last_event_at={}", item.last_event_at);
+    print_set("projects", item.project_ids.iter());
+    print_set("repo_contexts", item.repo_context_ids.iter());
+}
+
+fn print_project(item: &IndexedProject) {
+    println!("project_id={}", item.project_id);
+    println!("org_id={}", item.org_id.as_deref().unwrap_or(""));
+    println!("name={}", item.name.as_deref().unwrap_or(""));
+    println!("description={}", item.description.as_deref().unwrap_or(""));
+    println!("created_at={}", item.created_at);
+    println!("last_event_at={}", item.last_event_at);
+    print_set("missions", item.mission_ids.iter());
+    print_set("repo_contexts", item.repo_context_ids.iter());
 }
 
 fn print_mission(item: &IndexedMission) {
     println!("mission_id={}", item.mission_id);
+    println!("project_id={}", item.project_id.as_deref().unwrap_or(""));
     println!("title={}", item.title.as_deref().unwrap_or(""));
     println!("description={}", item.description.as_deref().unwrap_or(""));
+    println!("status={}", format_mission_status(item.status));
     println!("created_at={}", item.created_at);
     println!("last_event_at={}", item.last_event_at);
     print_set("sessions", item.session_ids.iter());
@@ -158,6 +214,16 @@ fn print_file(item: &IndexedFile) {
 fn print_set<'a>(label: &str, values: impl Iterator<Item = &'a String>) {
     let joined = values.cloned().collect::<Vec<_>>().join(",");
     println!("{label}={joined}");
+}
+
+fn format_mission_status(status: MissionStatus) -> &'static str {
+    match status {
+        MissionStatus::Planned => "planned",
+        MissionStatus::Active => "active",
+        MissionStatus::Blocked => "blocked",
+        MissionStatus::Completed => "completed",
+        MissionStatus::Archived => "archived",
+    }
 }
 
 fn format_actor_type(actor_type: ActorType) -> &'static str {

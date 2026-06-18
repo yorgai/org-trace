@@ -16,20 +16,52 @@ Phase 14 completes the MVP documentation and end-to-end smoke harness around the
 
 Still out of scope: authentication, per-repo authorization, queue draining, conflict resolution, background server indexes, full review workflow events, and private application database scraping.
 
+## Product model
+
+Brick's human-facing model is Mission-centered:
+
+```text
+Org or sync scope
+  └── Project grouping
+        └── Mission
+              ├── Sessions
+              └── Artifacts
+```
+
+A Mission is the object people manage. It replaces a task or work item and owns status, planning metadata, linked sessions, artifacts, and the proof-of-work timeline.
+
+A Session is execution evidence. Sessions can come from agents, humans, CI systems, or importers. A human session is valid when a person manually performs work and records evidence such as a review note, meeting transcript, video recording, screenshot, QA pass, or operational log.
+
+Artifacts replace work products. They are reviewable evidence attached to Missions and Sessions: diffs, decisions, reviews, CI results, documents, screenshots, recordings, external references, and uploaded files.
+
+## Two-tier session availability
+
+Brick intentionally keeps Session metadata separate from full Session content:
+
+1. **Metadata tier** — synced and indexed by default. It includes session ID, actor, source app, timestamps, linked missions, linked artifacts, repo contexts, transcript availability, and last update time. Mission pages can show useful session cards from this tier alone.
+2. **Full evidence tier** — optional content-addressed files, such as transcript JSON/JSONL, video recordings, screenshots, or raw logs. Events store hashes, sizes, and storage URIs; large bytes live in blob storage and can be fetched or uploaded explicitly.
+
+There is no separate third tier in the MVP. Structured replay is a rendering capability over full evidence when the uploaded transcript format supports it.
+
 ## Components
 
 ### `brick` CLI
 
 The CLI is the main capture and inspection surface. It discovers the Git repository root, resolves the effective store root, loads source profile defaults, captures repo context for write commands, and appends typed protocol events to the local store.
 
-Primary command groups:
+The next Brick-native CLI should be Mission-first and should not keep legacy command aliases. The current MVP command shape proved the storage and sync substrate; the product CLI should expose only the new model:
 
-- `init`, `status`, and `log` for local store setup and quick inspection.
-- `source` for repo-local source profile configuration and selection.
-- `mission`, `session`, `artifact`, and `diff` for event-producing capture.
-- `index`, `db`, and `inspect` for rebuildable local projections.
+- `org` for the sync/share boundary.
+- `project` for project lists and grouping.
+- `mission` for the human-managed work object, including status and assignment.
+- `session` for metadata-tier execution evidence.
+- `artifact` for work products and reviewable outputs.
+- `evidence` for transcripts, recordings, screenshots, raw logs, attachments, and diff capture.
 - `import` for explicit external trace files.
-- `push`, `pull`, and `sync` for server event transfer.
+- `sync` for org-scoped push, pull, and status.
+- `maintenance` for index rebuilds, SQLite rebuilds, and diagnostics.
+
+Old recorder-shaped commands such as top-level `diff capture`, `artifact upload`, `session upload-log`, `db`, `index`, and standalone `push`/`pull` should be replaced rather than preserved as public aliases. Documentation should show only the Brick-native command set.
 
 ### `brick-core`
 

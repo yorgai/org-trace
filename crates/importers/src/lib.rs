@@ -12,8 +12,8 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context, Result};
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactId, ArtifactKind, ConfidenceLevel,
-    ExternalRefId, ExternalRefLinkedPayload, LogRefId, MissionId, SessionId, SessionLogFormat,
-    SessionLogUploadedPayload, SessionSource, SessionStartedPayload, TraceEvent,
+    EvidenceAvailability, ExternalRefId, ExternalRefLinkedPayload, LogRefId, MissionId, SessionId,
+    SessionLogFormat, SessionLogUploadedPayload, SessionSource, SessionStartedPayload, TraceEvent,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -219,7 +219,9 @@ fn import_transcript(
             sha256: metadata.sha256,
             size_bytes: metadata.size_bytes,
             storage_uri: format!("file://{}", path.display()),
-            local_path: path.display().to_string(),
+            local_path: String::new(),
+            external_uri: Some(format!("file://{}", path.display())),
+            availability: EvidenceAvailability::LocalPointer,
             repo_context_id: None,
         },
     )

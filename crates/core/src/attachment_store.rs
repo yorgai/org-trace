@@ -13,6 +13,14 @@ use sha2::{Digest, Sha256};
 
 use crate::BLOBS_DIR;
 
+/// Metadata returned after reading a local evidence file without copying bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidencePointer {
+    pub original_path: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 /// Metadata returned after copying a local file into the blob store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAttachment {
@@ -35,6 +43,11 @@ impl AttachmentStore {
         Self {
             storage_root: storage_root.into(),
         }
+    }
+
+    /// Reads digest and size for `source_path` without copying bytes into Brick.
+    pub fn inspect_file(&self, source_path: impl AsRef<Path>) -> Result<EvidencePointer> {
+        inspect_evidence_file(source_path.as_ref())
     }
 
     /// Copies `source_path` to `blobs/sha256/<digest>` and returns its metadata.
@@ -86,6 +99,24 @@ impl AttachmentStore {
             .join("sha256")
             .join(sha256)
     }
+}
+
+fn inspect_evidence_file(path: &Path) -> Result<EvidencePointer> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("failed to read evidence metadata at {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "evidence path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let (sha256, size_bytes) = digest_file(path)?;
+    Ok(EvidencePointer {
+        original_path: path.to_path_buf(),
+        sha256,
+        size_bytes,
+    })
 }
 
 fn digest_file(path: &Path) -> Result<(String, u64)> {

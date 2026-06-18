@@ -14,8 +14,9 @@ use crate::{
     ArtifactFileRefRecordedPayload, ArtifactId, ArtifactLinkedToMissionPayload,
     ArtifactUpdatedPayload, ConfidenceLevel, DiffCapturedPayload, EventType,
     ExternalRefLinkedPayload, MissionCreatedPayload, MissionId, MissionUpdatedPayload,
-    RepoContextCapturedPayload, RepoContextId, SessionId, SessionLinkedToMissionPayload,
-    SessionLogUploadedPayload, SessionStartedPayload,
+    OrgCreatedPayload, OrgId, OrgUpdatedPayload, ProjectCreatedPayload, ProjectId,
+    ProjectUpdatedPayload, RepoContextCapturedPayload, RepoContextId, SessionId,
+    SessionLinkedToMissionPayload, SessionLogUploadedPayload, SessionStartedPayload,
 };
 
 /// Current protocol schema version for event envelopes and typed payloads.
@@ -32,6 +33,8 @@ pub struct TraceEvent {
     pub recorded_at: DateTime<Utc>,
     pub actor: ActorRef,
     pub repo_id: Option<String>,
+    pub org_id: Option<OrgId>,
+    pub project_id: Option<ProjectId>,
     pub mission_id: Option<MissionId>,
     pub session_id: Option<SessionId>,
     pub artifact_id: Option<ArtifactId>,
@@ -41,14 +44,72 @@ pub struct TraceEvent {
 }
 
 impl TraceEvent {
+    /// Builds an `org.created` event for a new Brick Org sync boundary.
+    pub fn org_created(
+        actor: ActorRef,
+        org_id: OrgId,
+        payload: OrgCreatedPayload,
+    ) -> serde_json::Result<Self> {
+        let repo_context_id = payload.repo_context_id.clone();
+        let mut event = Self::from_payload(EventType::OrgCreated, actor, payload)?;
+        event.org_id = Some(org_id);
+        event.repo_context_id = repo_context_id;
+        Ok(event)
+    }
+
+    /// Builds an `org.updated` event with partial Org metadata.
+    pub fn org_updated(
+        actor: ActorRef,
+        org_id: OrgId,
+        payload: OrgUpdatedPayload,
+    ) -> serde_json::Result<Self> {
+        let repo_context_id = payload.repo_context_id.clone();
+        let mut event = Self::from_payload(EventType::OrgUpdated, actor, payload)?;
+        event.org_id = Some(org_id);
+        event.repo_context_id = repo_context_id;
+        Ok(event)
+    }
+
+    /// Builds a `project.created` event for a new Brick Project.
+    pub fn project_created(
+        actor: ActorRef,
+        project_id: ProjectId,
+        payload: ProjectCreatedPayload,
+    ) -> serde_json::Result<Self> {
+        let org_id = payload.org_id.clone();
+        let repo_context_id = payload.repo_context_id.clone();
+        let mut event = Self::from_payload(EventType::ProjectCreated, actor, payload)?;
+        event.org_id = Some(org_id);
+        event.project_id = Some(project_id);
+        event.repo_context_id = repo_context_id;
+        Ok(event)
+    }
+
+    /// Builds a `project.updated` event with partial Project metadata.
+    pub fn project_updated(
+        actor: ActorRef,
+        project_id: ProjectId,
+        payload: ProjectUpdatedPayload,
+    ) -> serde_json::Result<Self> {
+        let org_id = payload.org_id.clone();
+        let repo_context_id = payload.repo_context_id.clone();
+        let mut event = Self::from_payload(EventType::ProjectUpdated, actor, payload)?;
+        event.org_id = org_id;
+        event.project_id = Some(project_id);
+        event.repo_context_id = repo_context_id;
+        Ok(event)
+    }
+
     /// Builds a `mission.created` event for a new Mission.
     pub fn mission_created(
         actor: ActorRef,
         mission_id: MissionId,
         payload: MissionCreatedPayload,
     ) -> serde_json::Result<Self> {
+        let project_id = payload.project_id.clone();
         let repo_context_id = payload.repo_context_id.clone();
         let mut event = Self::from_payload(EventType::MissionCreated, actor, payload)?;
+        event.project_id = Some(project_id);
         event.mission_id = Some(mission_id);
         event.repo_context_id = repo_context_id;
         Ok(event)
@@ -60,8 +121,10 @@ impl TraceEvent {
         mission_id: MissionId,
         payload: MissionUpdatedPayload,
     ) -> serde_json::Result<Self> {
+        let project_id = payload.project_id.clone();
         let repo_context_id = payload.repo_context_id.clone();
         let mut event = Self::from_payload(EventType::MissionUpdated, actor, payload)?;
+        event.project_id = project_id;
         event.mission_id = Some(mission_id);
         event.repo_context_id = repo_context_id;
         Ok(event)
@@ -250,6 +313,8 @@ impl TraceEvent {
             recorded_at: now,
             actor,
             repo_id: None,
+            org_id: None,
+            project_id: None,
             mission_id: None,
             session_id: None,
             artifact_id: None,
@@ -265,8 +330,8 @@ mod tests {
     use crate::{
         ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactId, ArtifactKind,
         ArtifactUpdatedPayload, AttachmentId, DiffCapturedPayload, DiffFileChange,
-        DiffFileChangeKind, DiffTarget, EventType, LogRefId, SessionId, SessionLogFormat,
-        SessionLogUploadedPayload, SessionSource, SessionStartedPayload,
+        DiffFileChangeKind, DiffTarget, EventType, EvidenceAvailability, LogRefId, SessionId,
+        SessionLogFormat, SessionLogUploadedPayload, SessionSource, SessionStartedPayload,
     };
 
     use super::*;
@@ -319,6 +384,8 @@ mod tests {
                 sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
                 size_bytes: 5,
                 storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                external_uri: Some("file:///tmp/report.txt".to_string()),
+                availability: EvidenceAvailability::LocalBlob,
                 repo_context_id: None,
             },
         )
@@ -409,6 +476,8 @@ mod tests {
                 size_bytes: 5,
                 storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
                 local_path: "/repo/.brick/provenance/blobs/sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                external_uri: Some("file:///tmp/session.jsonl".to_string()),
+                availability: EvidenceAvailability::LocalBlob,
                 repo_context_id: None,
             },
         )

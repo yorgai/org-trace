@@ -77,7 +77,7 @@ impl ListEventsResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ActorRef, ActorType, MissionCreatedPayload, MissionId};
+    use crate::{ActorRef, ActorType, MissionCreatedPayload, MissionId, MissionStatus, ProjectId};
 
     use super::*;
 
@@ -90,8 +90,10 @@ mod tests {
             },
             MissionId::new(),
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: "Sync payload".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )

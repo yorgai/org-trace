@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactKind, AttachmentId, ContextMode, DiffFileChangeKind, DiffTarget, ExternalRefId,
-    FileRefId, LogRefId, RepoContextId,
+    FileRefId, LogRefId, MissionStatus, OrgId, ProjectId, RepoContextId,
 };
 
 /// Source-application identity for a canonical Brick session.
@@ -20,19 +20,57 @@ pub struct SessionSource {
     pub runtime_id: Option<String>,
 }
 
+/// Payload recorded when a Brick Org sync boundary is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgCreatedPayload {
+    pub name: String,
+    pub description: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Partial update payload for Org metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgUpdatedPayload {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Payload recorded when a Brick Project is created inside an Org.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCreatedPayload {
+    pub org_id: OrgId,
+    pub name: String,
+    pub description: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Partial update payload for Project metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpdatedPayload {
+    pub org_id: Option<OrgId>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub repo_context_id: Option<RepoContextId>,
+}
+
 /// Payload recorded when a new Mission accountability container is created.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionCreatedPayload {
+    pub project_id: ProjectId,
     pub title: String,
     pub description: Option<String>,
+    pub status: MissionStatus,
     pub repo_context_id: Option<RepoContextId>,
 }
 
 /// Partial update payload for Mission metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionUpdatedPayload {
+    pub project_id: Option<ProjectId>,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub status: Option<MissionStatus>,
     pub repo_context_id: Option<RepoContextId>,
 }
 
@@ -61,6 +99,15 @@ pub enum SessionLogFormat {
     Unknown,
 }
 
+/// Availability of full evidence bytes for a local pointer or copied blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAvailability {
+    LocalPointer,
+    LocalBlob,
+    RemoteBlob,
+}
+
 /// Payload for content-addressed session log bytes captured outside artifact attachments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLogUploadedPayload {
@@ -72,6 +119,8 @@ pub struct SessionLogUploadedPayload {
     pub size_bytes: u64,
     pub storage_uri: String,
     pub local_path: String,
+    pub external_uri: Option<String>,
+    pub availability: EvidenceAvailability,
     pub repo_context_id: Option<RepoContextId>,
 }
 
@@ -118,6 +167,8 @@ pub struct ArtifactAttachmentUploadedPayload {
     pub sha256: String,
     pub size_bytes: u64,
     pub storage_uri: String,
+    pub external_uri: Option<String>,
+    pub availability: EvidenceAvailability,
     pub repo_context_id: Option<RepoContextId>,
 }
 

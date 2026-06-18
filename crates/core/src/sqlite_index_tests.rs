@@ -5,8 +5,9 @@ use std::fs;
 use brick_protocol::{
     ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload,
     ArtifactFileRefRecordedPayload, ArtifactId, ArtifactKind, ArtifactUpdatedPayload, AttachmentId,
-    FileRefId, LogRefId, MissionCreatedPayload, MissionId, SessionId, SessionLogFormat,
-    SessionLogUploadedPayload, SessionSource, SessionStartedPayload, TraceEvent,
+    EvidenceAvailability, FileRefId, LogRefId, MissionCreatedPayload, MissionId, MissionStatus,
+    ProjectId, SessionId, SessionLogFormat, SessionLogUploadedPayload, SessionSource,
+    SessionStartedPayload, TraceEvent,
 };
 use chrono::Utc;
 
@@ -36,6 +37,7 @@ fn temp_sqlite_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn rebuilds_and_queries_sqlite_cache() {
     let path = temp_sqlite_path("query");
+    let project_id = ProjectId::new();
     let mission_id = MissionId::new();
     let session_id = SessionId::new();
     let artifact_id = ArtifactId::new();
@@ -46,8 +48,10 @@ fn rebuilds_and_queries_sqlite_cache() {
             actor(),
             mission_id.clone(),
             MissionCreatedPayload {
+                project_id: project_id.clone(),
                 title: "Phase 6".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )
@@ -116,6 +120,8 @@ fn rebuilds_and_queries_sqlite_cache() {
                 sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
                 size_bytes: 5,
                 storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                external_uri: Some("file:///tmp/report.txt".to_string()),
+                availability: EvidenceAvailability::LocalBlob,
                 repo_context_id: None,
             },
         )
@@ -132,6 +138,8 @@ fn rebuilds_and_queries_sqlite_cache() {
                 size_bytes: 5,
                 storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
                 local_path: "/tmp/blob".to_string(),
+                external_uri: Some("file:///tmp/session.jsonl".to_string()),
+                availability: EvidenceAvailability::LocalBlob,
                 repo_context_id: None,
             },
         )

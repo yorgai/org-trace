@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 /// Stable event names used in the append-only provenance log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
+    #[serde(rename = "org.created")]
+    OrgCreated,
+    #[serde(rename = "org.updated")]
+    OrgUpdated,
+    #[serde(rename = "project.created")]
+    ProjectCreated,
+    #[serde(rename = "project.updated")]
+    ProjectUpdated,
     #[serde(rename = "mission.created")]
     MissionCreated,
     #[serde(rename = "mission.updated")]
@@ -60,6 +68,23 @@ pub enum ContextMode {
     CreatedWorktree,
     DetachedHead,
     Unknown,
+}
+
+/// Lifecycle state for a Mission accountability container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionStatus {
+    Planned,
+    Active,
+    Blocked,
+    Completed,
+    Archived,
+}
+
+impl Default for MissionStatus {
+    fn default() -> Self {
+        Self::Planned
+    }
 }
 
 /// Reviewable output category produced by a session.

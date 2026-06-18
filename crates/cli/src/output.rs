@@ -87,6 +87,10 @@ pub fn print_session_env(identity: &brick_core::ResolvedIdentity) {
 
 fn format_event_type(event_type: EventType) -> &'static str {
     match event_type {
+        EventType::OrgCreated => "org.created",
+        EventType::OrgUpdated => "org.updated",
+        EventType::ProjectCreated => "project.created",
+        EventType::ProjectUpdated => "project.updated",
         EventType::MissionCreated => "mission.created",
         EventType::MissionUpdated => "mission.updated",
         EventType::SessionStarted => "session.started",

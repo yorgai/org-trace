@@ -9,16 +9,17 @@ use anyhow::{Context, Result};
 use brick_protocol::{
     ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload,
     ArtifactId, ArtifactLinkedToMissionPayload, ArtifactUpdatedPayload, DiffCapturedPayload,
-    EventType, MissionCreatedPayload, MissionId, MissionUpdatedPayload, RepoContextCapturedPayload,
-    SessionId, SessionLinkedToMissionPayload, SessionLogUploadedPayload, SessionStartedPayload,
-    TraceEvent,
+    EventType, MissionCreatedPayload, MissionId, MissionUpdatedPayload, OrgCreatedPayload, OrgId,
+    OrgUpdatedPayload, ProjectCreatedPayload, ProjectId, ProjectUpdatedPayload,
+    RepoContextCapturedPayload, SessionId, SessionLinkedToMissionPayload,
+    SessionLogUploadedPayload, SessionStartedPayload, TraceEvent,
 };
 use chrono::Utc;
 
 use crate::{
     IndexedArtifact, IndexedAttachment, IndexedDiff, IndexedDiffFileChange, IndexedFile,
-    IndexedFileRef, IndexedMission, IndexedRepoContext, IndexedSession, IndexedSessionLog,
-    TraceIndex, INDEX_SCHEMA_VERSION,
+    IndexedFileRef, IndexedMission, IndexedOrg, IndexedProject, IndexedRepoContext, IndexedSession,
+    IndexedSessionLog, TraceIndex, INDEX_SCHEMA_VERSION,
 };
 
 impl TraceIndex {
@@ -36,6 +37,8 @@ impl TraceIndex {
             schema_version: INDEX_SCHEMA_VERSION,
             rebuilt_at: Utc::now(),
             event_count,
+            orgs: BTreeMap::new(),
+            projects: BTreeMap::new(),
             missions: BTreeMap::new(),
             sessions: BTreeMap::new(),
             artifacts: BTreeMap::new(),
@@ -49,6 +52,10 @@ impl TraceIndex {
 
     fn apply_event(&mut self, event: &TraceEvent) -> Result<()> {
         match event.event_type {
+            EventType::OrgCreated => self.apply_org_created(event),
+            EventType::OrgUpdated => self.apply_org_updated(event),
+            EventType::ProjectCreated => self.apply_project_created(event),
+            EventType::ProjectUpdated => self.apply_project_updated(event),
             EventType::MissionCreated => self.apply_mission_created(event),
             EventType::MissionUpdated => self.apply_mission_updated(event),
             EventType::SessionStarted => self.apply_session_started(event),
@@ -67,17 +74,111 @@ impl TraceIndex {
         }
     }
 
+    fn apply_org_created(&mut self, event: &TraceEvent) -> Result<()> {
+        let Some(org_id) = event.org_id.as_ref() else {
+            return Ok(());
+        };
+        let payload = payload::<OrgCreatedPayload>(event)?;
+        let org = self
+            .orgs
+            .entry(org_id.to_string())
+            .or_insert_with(|| new_org(org_id, event));
+        org.name = Some(payload.name);
+        org.description = payload.description;
+        org.repo_context_ids
+            .insert_optional(payload.repo_context_id);
+        org.last_event_at = event.recorded_at;
+        Ok(())
+    }
+
+    fn apply_org_updated(&mut self, event: &TraceEvent) -> Result<()> {
+        let Some(org_id) = event.org_id.as_ref() else {
+            return Ok(());
+        };
+        let payload = payload::<OrgUpdatedPayload>(event)?;
+        let org = self
+            .orgs
+            .entry(org_id.to_string())
+            .or_insert_with(|| new_org(org_id, event));
+        if let Some(name) = payload.name {
+            org.name = Some(name);
+        }
+        if payload.description.is_some() {
+            org.description = payload.description;
+        }
+        org.repo_context_ids
+            .insert_optional(payload.repo_context_id);
+        org.last_event_at = event.recorded_at;
+        Ok(())
+    }
+
+    fn apply_project_created(&mut self, event: &TraceEvent) -> Result<()> {
+        let Some(project_id) = event.project_id.as_ref() else {
+            return Ok(());
+        };
+        let payload = payload::<ProjectCreatedPayload>(event)?;
+        let org_id = payload.org_id.clone();
+        let project = self
+            .projects
+            .entry(project_id.to_string())
+            .or_insert_with(|| new_project(project_id, event));
+        project.org_id = Some(org_id.to_string());
+        project.name = Some(payload.name);
+        project.description = payload.description;
+        project
+            .repo_context_ids
+            .insert_optional(payload.repo_context_id.clone());
+        project.last_event_at = event.recorded_at;
+        self.link_project_to_org(project_id, &org_id, event);
+        if let Some(org) = self.orgs.get_mut(org_id.as_str()) {
+            org.repo_context_ids
+                .insert_optional(payload.repo_context_id);
+        }
+        Ok(())
+    }
+
+    fn apply_project_updated(&mut self, event: &TraceEvent) -> Result<()> {
+        let Some(project_id) = event.project_id.as_ref() else {
+            return Ok(());
+        };
+        let payload = payload::<ProjectUpdatedPayload>(event)?;
+        if let Some(org_id) = payload.org_id.as_ref() {
+            self.link_project_to_org(project_id, org_id, event);
+        }
+        let project = self
+            .projects
+            .entry(project_id.to_string())
+            .or_insert_with(|| new_project(project_id, event));
+        if let Some(org_id) = payload.org_id {
+            project.org_id = Some(org_id.to_string());
+        }
+        if let Some(name) = payload.name {
+            project.name = Some(name);
+        }
+        if payload.description.is_some() {
+            project.description = payload.description;
+        }
+        project
+            .repo_context_ids
+            .insert_optional(payload.repo_context_id);
+        project.last_event_at = event.recorded_at;
+        Ok(())
+    }
+
     fn apply_mission_created(&mut self, event: &TraceEvent) -> Result<()> {
         let Some(mission_id) = event.mission_id.as_ref() else {
             return Ok(());
         };
         let payload = payload::<MissionCreatedPayload>(event)?;
+        self.link_mission_to_project(mission_id, &payload.project_id, event);
         let mission = self
             .missions
             .entry(mission_id.to_string())
             .or_insert_with(|| new_mission(mission_id, event));
+        mission.project_id = Some(payload.project_id.to_string());
         mission.title = Some(payload.title);
         mission.description = payload.description;
+        mission.status = payload.status;
         mission
             .repo_context_ids
             .insert_optional(payload.repo_context_id);
@@ -90,15 +191,24 @@ impl TraceIndex {
             return Ok(());
         };
         let payload = payload::<MissionUpdatedPayload>(event)?;
+        if let Some(project_id) = payload.project_id.as_ref() {
+            self.link_mission_to_project(mission_id, project_id, event);
+        }
         let mission = self
             .missions
             .entry(mission_id.to_string())
             .or_insert_with(|| new_mission(mission_id, event));
+        if let Some(project_id) = payload.project_id {
+            mission.project_id = Some(project_id.to_string());
+        }
         if let Some(title) = payload.title {
             mission.title = Some(title);
         }
         if payload.description.is_some() {
             mission.description = payload.description;
+        }
+        if let Some(status) = payload.status {
+            mission.status = status;
         }
         mission
             .repo_context_ids
@@ -169,6 +279,8 @@ impl TraceIndex {
                 size_bytes: payload.size_bytes,
                 storage_uri: payload.storage_uri,
                 local_path: payload.local_path,
+                external_uri: payload.external_uri,
+                availability: payload.availability,
                 repo_context_id: payload.repo_context_id.as_ref().map(ToString::to_string),
                 uploaded_at: event.recorded_at,
             },
@@ -306,6 +418,8 @@ impl TraceIndex {
                 sha256: payload.sha256,
                 size_bytes: payload.size_bytes,
                 storage_uri: payload.storage_uri,
+                external_uri: payload.external_uri,
+                availability: payload.availability,
                 repo_context_id: payload.repo_context_id.as_ref().map(ToString::to_string),
                 uploaded_at: event.recorded_at,
             },
@@ -432,6 +546,43 @@ impl TraceIndex {
         Ok(())
     }
 
+    fn link_project_to_org(&mut self, project_id: &ProjectId, org_id: &OrgId, event: &TraceEvent) {
+        let org = self
+            .orgs
+            .entry(org_id.to_string())
+            .or_insert_with(|| new_org(org_id, event));
+        org.project_ids.insert(project_id.to_string());
+        org.last_event_at = event.recorded_at;
+
+        let project = self
+            .projects
+            .entry(project_id.to_string())
+            .or_insert_with(|| new_project(project_id, event));
+        project.org_id = Some(org_id.to_string());
+        project.last_event_at = event.recorded_at;
+    }
+
+    fn link_mission_to_project(
+        &mut self,
+        mission_id: &MissionId,
+        project_id: &ProjectId,
+        event: &TraceEvent,
+    ) {
+        let project = self
+            .projects
+            .entry(project_id.to_string())
+            .or_insert_with(|| new_project(project_id, event));
+        project.mission_ids.insert(mission_id.to_string());
+        project.last_event_at = event.recorded_at;
+
+        let mission = self
+            .missions
+            .entry(mission_id.to_string())
+            .or_insert_with(|| new_mission(mission_id, event));
+        mission.project_id = Some(project_id.to_string());
+        mission.last_event_at = event.recorded_at;
+    }
+
     fn link_session_to_mission(
         &mut self,
         session_id: &SessionId,
@@ -513,6 +664,14 @@ impl InsertOptionalId for BTreeSet<String> {
     }
 }
 
+fn new_org(org_id: &OrgId, event: &TraceEvent) -> IndexedOrg {
+    IndexedOrg::blank(org_id.to_string(), event.recorded_at)
+}
+
+fn new_project(project_id: &ProjectId, event: &TraceEvent) -> IndexedProject {
+    IndexedProject::blank(project_id.to_string(), event.recorded_at)
+}
+
 fn new_mission(mission_id: &MissionId, event: &TraceEvent) -> IndexedMission {
     IndexedMission::blank(mission_id.to_string(), event.recorded_at)
 }
@@ -540,6 +699,10 @@ where
 
 fn event_type_name(event_type: EventType) -> &'static str {
     match event_type {
+        EventType::OrgCreated => "org.created",
+        EventType::OrgUpdated => "org.updated",
+        EventType::ProjectCreated => "project.created",
+        EventType::ProjectUpdated => "project.updated",
         EventType::MissionCreated => "mission.created",
         EventType::MissionUpdated => "mission.updated",
         EventType::SessionStarted => "session.started",
@@ -562,8 +725,8 @@ fn event_type_name(event_type: EventType) -> &'static str {
 mod tests {
     use brick_protocol::{
         ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactId, ArtifactKind,
-        AttachmentId, FileRefId, LogRefId, SessionLogFormat, SessionLogUploadedPayload,
-        SessionSource,
+        AttachmentId, EvidenceAvailability, FileRefId, LogRefId, MissionStatus, ProjectId,
+        SessionLogFormat, SessionLogUploadedPayload, SessionSource,
     };
 
     use super::*;
@@ -578,6 +741,7 @@ mod tests {
 
     #[test]
     fn builds_mission_session_artifact_file_index() {
+        let project_id = ProjectId::new();
         let mission_id = MissionId::new();
         let session_id = SessionId::new();
         let artifact_id = ArtifactId::new();
@@ -585,8 +749,10 @@ mod tests {
             actor(),
             mission_id.clone(),
             MissionCreatedPayload {
+                project_id: project_id.clone(),
                 title: "Build index".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )
@@ -639,6 +805,8 @@ mod tests {
                 sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
                 size_bytes: 5,
                 storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+                external_uri: Some("file:///tmp/report.txt".to_string()),
+                availability: EvidenceAvailability::LocalBlob,
                 repo_context_id: None,
             },
         )
@@ -656,6 +824,8 @@ mod tests {
                 size_bytes: 5,
                 storage_uri: "brick-blob://sha256/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
                 local_path: "/tmp/blob".to_string(),
+                external_uri: Some("file:///tmp/session.md".to_string()),
+                availability: EvidenceAvailability::LocalBlob,
                 repo_context_id: None,
             },
         )

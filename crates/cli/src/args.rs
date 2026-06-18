@@ -1,7 +1,8 @@
-//! CLI argument model for the agent-facing trace recorder.
+//! CLI argument model for the Brick-native provenance surface.
 //!
-//! These structures define the public command contract for humans and agents.
-//! Prefer adding explicit subcommands here over hidden behavior in handlers.
+//! These structures define the public command contract around Orgs, Projects,
+//! Missions, Sessions, Artifacts, and Evidence. Old recorder-shaped commands
+//! are intentionally not kept as aliases.
 
 use std::path::PathBuf;
 
@@ -11,7 +12,7 @@ pub const DEFAULT_RELATIONSHIP: &str = "contributes_to";
 
 #[derive(Debug, Parser)]
 #[command(name = "brick")]
-#[command(about = "Record and sync signed work-unit provenance events")]
+#[command(about = "Record and sync Brick work provenance")]
 pub struct Cli {
     #[arg(long, global = true)]
     pub store_root: Option<PathBuf>,
@@ -56,9 +57,13 @@ pub struct IdentityArgs {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Init,
-    Diff {
+    Org {
         #[command(subcommand)]
-        command: DiffCommand,
+        command: OrgCommand,
+    },
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
     },
     Mission {
         #[command(subcommand)]
@@ -72,26 +77,13 @@ pub enum Command {
         #[command(subcommand)]
         command: ArtifactCommand,
     },
-    Status,
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
     Context {
         #[command(subcommand)]
         command: ContextCommand,
-    },
-    Log {
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    Index {
-        #[command(subcommand)]
-        command: IndexCommand,
-    },
-    Db {
-        #[command(subcommand)]
-        command: DbCommand,
-    },
-    Inspect {
-        #[command(subcommand)]
-        command: InspectCommand,
     },
     Source {
         #[command(subcommand)]
@@ -102,62 +94,75 @@ pub enum Command {
         command: ImportCommand,
     },
     Sync {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        remote: Option<String>,
-        #[arg(long)]
-        repo_id: Option<String>,
+        #[command(subcommand)]
+        command: SyncCommand,
     },
-    Push {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        remote: Option<String>,
-        #[arg(long)]
-        repo_id: Option<String>,
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
     },
-    Pull {
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrgCommand {
+    Create {
+        name: String,
         #[arg(long)]
-        dry_run: bool,
+        description: Option<String>,
+    },
+    Show {
+        org: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    Create {
         #[arg(long)]
-        remote: Option<String>,
+        org: String,
+        name: String,
         #[arg(long)]
-        repo_id: Option<String>,
+        description: Option<String>,
+    },
+    Show {
+        project: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "snake_case")]
-pub enum DiffTargetArg {
-    Working,
-    Staged,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DiffCommand {
-    Capture {
-        #[arg(long)]
-        artifact: String,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long)]
-        mission: Option<String>,
-        #[arg(long, value_enum)]
-        target: DiffTargetArg,
-        #[arg(long)]
-        base: Option<String>,
-        #[arg(long)]
-        head: Option<String>,
-    },
+pub enum MissionStatusArg {
+    Planned,
+    Active,
+    Blocked,
+    Completed,
+    Archived,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum MissionCommand {
     Create {
+        #[arg(long)]
+        project: String,
         title: String,
         #[arg(long)]
         description: Option<String>,
+        #[arg(long, value_enum, default_value_t = MissionStatusArg::Planned)]
+        status: MissionStatusArg,
+    },
+    Update {
+        mission: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, value_enum)]
+        status: Option<MissionStatusArg>,
+    },
+    Show {
+        mission: String,
     },
 }
 
@@ -213,15 +218,8 @@ pub enum SessionCommand {
         #[arg(long, default_value = DEFAULT_RELATIONSHIP)]
         relationship: String,
     },
-    UploadLog {
-        #[arg(long)]
+    Show {
         session: String,
-        #[arg(long)]
-        path: PathBuf,
-        #[arg(long, value_enum)]
-        format: Option<SessionLogFormatArg>,
-        #[arg(long)]
-        source: Option<String>,
     },
 }
 
@@ -239,21 +237,16 @@ pub enum ArtifactKindArg {
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
-    Decision {
+    Create {
         #[arg(long)]
         mission: Option<String>,
         #[arg(long)]
         session: Option<String>,
+        #[arg(long, value_enum, default_value_t = ArtifactKindArg::Decision)]
+        kind: ArtifactKindArg,
         title: String,
         #[arg(long)]
         body: Option<String>,
-    },
-    File {
-        #[arg(long)]
-        artifact: String,
-        #[arg(long)]
-        session: Option<String>,
-        path: String,
     },
     Link {
         #[arg(long)]
@@ -264,7 +257,6 @@ pub enum ArtifactCommand {
         relationship: String,
     },
     Update {
-        #[arg(long)]
         artifact: String,
         #[arg(long)]
         session: Option<String>,
@@ -275,7 +267,21 @@ pub enum ArtifactCommand {
         #[arg(long, value_enum)]
         kind: Option<ArtifactKindArg>,
     },
-    Upload {
+    Show {
+        artifact: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum DiffTargetArg {
+    Working,
+    Staged,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvidenceCommand {
+    Attach {
         #[arg(long)]
         artifact: String,
         #[arg(long)]
@@ -286,13 +292,86 @@ pub enum ArtifactCommand {
         name: Option<String>,
         #[arg(long)]
         content_type: Option<String>,
+        #[arg(long)]
+        copy: bool,
+    },
+    File {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        session: Option<String>,
+        path: String,
+    },
+    Log {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, value_enum)]
+        format: Option<SessionLogFormatArg>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        copy: bool,
+    },
+    Diff {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        mission: Option<String>,
+        #[arg(long, value_enum)]
+        target: DiffTargetArg,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        head: Option<String>,
+    },
+    FileShow {
+        path: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ContextCommand {
-    /// Shows the resolved identity that write commands would use.
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SyncCommand {
+    Run(SyncArgs),
+    Push(SyncArgs),
+    Pull(SyncArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub remote: Option<String>,
+    #[arg(long)]
+    pub org_id: Option<String>,
+    #[arg(long)]
+    pub repo_id: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MaintenanceCommand {
+    Status,
+    Log {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -326,16 +405,10 @@ pub enum DbCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum InspectCommand {
-    Mission { mission: String },
-    Session { session: String },
-    Artifact { artifact: String },
-    File { path: String },
-}
-
-#[derive(Debug, Subcommand)]
 pub enum SourceCommand {
     Configure(SourceConfigureArgs),
+    Config(SourceConfigArgs),
+    Scan(SourceScanArgs),
     List,
     Show {
         #[arg(long)]
@@ -386,6 +459,21 @@ pub struct CiImportArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct SourceScanArgs {
+    #[arg(long)]
+    pub write_defaults: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SourceConfigArgs {
+    #[arg(long)]
+    pub default_full_evidence_upload: Option<bool>,
+
+    #[arg(long)]
+    pub metadata_only_local: Option<bool>,
+}
+
+#[derive(Debug, Args)]
 pub struct SourceConfigureArgs {
     #[arg(long)]
     pub name: String,
@@ -407,6 +495,15 @@ pub struct SourceConfigureArgs {
 
     #[arg(long)]
     pub session_log_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub evidence_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub cursor_state_db_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub default_full_evidence_upload: Option<bool>,
 
     #[arg(long)]
     pub notes: Option<String>,

@@ -13,11 +13,13 @@ The server stores an append-only `events.jsonl` log under `--data-dir`. That log
 
 ## Push and pull
 
+The default sync payload is metadata-first: mission events, session metadata events, artifact metadata, diff summaries, references, hashes, and storage URIs. Large transcript files, recordings, screenshots, and uploaded attachments are represented by content-addressed references in events. Full blob transfer is explicit future work; do not assume `push` uploads every referenced byte.
+
 Use a repo ID when synchronizing a specific repository boundary:
 
 ```bash
-cargo run -p brick -- push --remote http://127.0.0.1:7821 --repo-id repo-a
-cargo run -p brick -- pull --remote http://127.0.0.1:7821 --repo-id repo-a
+cargo run -p brick -- sync push --remote http://127.0.0.1:7821 --repo-id repo-a --org-id org_local
+cargo run -p brick -- sync pull --remote http://127.0.0.1:7821 --repo-id repo-a --org-id org_local
 cargo run -p brick -- sync --remote http://127.0.0.1:7821 --repo-id repo-a --dry-run
 ```
 
@@ -26,8 +28,8 @@ cargo run -p brick -- sync --remote http://127.0.0.1:7821 --repo-id repo-a --dry
 Omit `--repo-id` only for the global compatibility endpoint:
 
 ```bash
-cargo run -p brick -- push --remote http://127.0.0.1:7821
-cargo run -p brick -- pull --remote http://127.0.0.1:7821
+cargo run -p brick -- sync push --remote http://127.0.0.1:7821 --org-id org_local
+cargo run -p brick -- sync pull --remote http://127.0.0.1:7821 --org-id org_local
 ```
 
 ## Repo ID behavior

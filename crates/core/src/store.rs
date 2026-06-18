@@ -18,7 +18,7 @@ use crate::{
     rebuild_sqlite_index, resolve_storage_root, sqlite_index_status, AttachmentStore,
     CurrentContext, IndexStatus, ResolvedStorageRoot, SqliteIndexStatus, StorageOptions,
     TraceIndex, CACHE_DIR, CURRENT_CONTEXT_FILE, EVENTS_DIR, INDEX_CACHE_FILE, PROVENANCE_DIR,
-    QUEUE_DIR, REPO_CONFIG_FILE, SQLITE_INDEX_FILE,
+    QUEUE_DIR, REPO_CONFIG_FILE, SQLITE_INDEX_FILE, VIEWS_DIR,
 };
 
 /// Repository-local provenance configuration written during initialization.
@@ -26,6 +26,34 @@ use crate::{
 pub struct RepoConfig {
     pub repo_root: String,
     pub created_at: String,
+}
+
+fn ensure_brick_gitignore(repo_root: &Path) -> Result<()> {
+    let gitignore_path = repo_root.join(".gitignore");
+    let existing = match fs::read_to_string(&gitignore_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read .gitignore at {}", gitignore_path.display())
+            });
+        }
+    };
+
+    if existing.lines().any(|line| line.trim() == ".brick/") {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gitignore_path)
+        .with_context(|| format!("failed to open .gitignore at {}", gitignore_path.display()))?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file).context("failed to terminate existing .gitignore line")?;
+    }
+    writeln!(file, ".brick/").context("failed to append .brick/ to .gitignore")?;
+    Ok(())
 }
 
 /// Queue health summary for status output and tests.
@@ -110,6 +138,11 @@ impl LocalStore {
         self.cache_dir().join(INDEX_CACHE_FILE)
     }
 
+    /// Returns the directory containing rebuildable agent-readable views.
+    pub fn views_dir(&self) -> PathBuf {
+        self.provenance_dir().join(VIEWS_DIR)
+    }
+
     /// Returns the path to the rebuildable SQLite query cache.
     pub fn sqlite_index_path(&self) -> PathBuf {
         self.cache_dir().join(SQLITE_INDEX_FILE)
@@ -149,6 +182,8 @@ impl LocalStore {
                 )
             })?;
         }
+
+        ensure_brick_gitignore(&self.repo_root)?;
 
         Ok(())
     }
@@ -288,7 +323,129 @@ impl LocalStore {
         let path = self.index_path();
         fs::write(&path, serialized)
             .with_context(|| format!("failed to write trace index at {}", path.display()))?;
+        self.write_agent_views(&index)?;
         Ok(index)
+    }
+
+    /// Rebuilds Markdown views intended for direct human and agent inspection.
+    pub fn write_agent_views(&self, index: &TraceIndex) -> Result<()> {
+        let views_dir = self.views_dir();
+        if views_dir.exists() {
+            fs::remove_dir_all(&views_dir).with_context(|| {
+                format!("failed to reset views directory {}", views_dir.display())
+            })?;
+        }
+        fs::create_dir_all(&views_dir)
+            .with_context(|| format!("failed to create views directory {}", views_dir.display()))?;
+        fs::create_dir_all(views_dir.join("orgs"))?;
+        fs::create_dir_all(views_dir.join("projects"))?;
+        fs::create_dir_all(views_dir.join("missions"))?;
+        fs::create_dir_all(views_dir.join("sessions"))?;
+        fs::create_dir_all(views_dir.join("artifacts"))?;
+
+        fs::write(
+            views_dir.join("README.md"),
+            format!(
+                "# Brick Views\n\nSchema version: {}\nEvents: {}\nRebuilt at: {}\n\nThese files are derived from the JSONL event queue. Delete and rebuild them at any time.\n",
+                index.schema_version,
+                index.event_count,
+                index.rebuilt_at.to_rfc3339()
+            ),
+        )?;
+
+        for org in index.orgs.values() {
+            fs::write(
+                views_dir.join("orgs").join(format!("{}.md", org.org_id)),
+                format!(
+                    "# {}\n\nOrg ID: {}\nDescription: {}\nProjects: {}\nRepo contexts: {}\nUpdated: {}\n",
+                    org.name.as_deref().unwrap_or("Untitled org"),
+                    org.org_id,
+                    org.description.as_deref().unwrap_or(""),
+                    join_set(&org.project_ids),
+                    join_set(&org.repo_context_ids),
+                    org.last_event_at.to_rfc3339()
+                ),
+            )?;
+        }
+        for project in index.projects.values() {
+            fs::write(
+                views_dir
+                    .join("projects")
+                    .join(format!("{}.md", project.project_id)),
+                format!(
+                    "# {}\n\nProject ID: {}\nOrg ID: {}\nDescription: {}\nMissions: {}\nRepo contexts: {}\nUpdated: {}\n",
+                    project.name.as_deref().unwrap_or("Untitled project"),
+                    project.project_id,
+                    project.org_id.as_deref().unwrap_or(""),
+                    project.description.as_deref().unwrap_or(""),
+                    join_set(&project.mission_ids),
+                    join_set(&project.repo_context_ids),
+                    project.last_event_at.to_rfc3339()
+                ),
+            )?;
+        }
+        for mission in index.missions.values() {
+            fs::write(
+                views_dir
+                    .join("missions")
+                    .join(format!("{}.md", mission.mission_id)),
+                format!(
+                    "# {}\n\nMission ID: {}\nProject ID: {}\nStatus: {:?}\nDescription: {}\nSessions: {}\nArtifacts: {}\nRepo contexts: {}\nUpdated: {}\n",
+                    mission.title.as_deref().unwrap_or("Untitled mission"),
+                    mission.mission_id,
+                    mission.project_id.as_deref().unwrap_or(""),
+                    mission.status,
+                    mission.description.as_deref().unwrap_or(""),
+                    join_set(&mission.session_ids),
+                    join_set(&mission.artifact_ids),
+                    join_set(&mission.repo_context_ids),
+                    mission.last_event_at.to_rfc3339()
+                ),
+            )?;
+        }
+        for session in index.sessions.values() {
+            fs::write(
+                views_dir
+                    .join("sessions")
+                    .join(format!("{}.md", session.session_id)),
+                format!(
+                    "# {}\n\nSession ID: {}\nActor: {} ({:?})\nApp: {}\nApp session ID: {}\nMissions: {}\nArtifacts: {}\nLogs: {}\nRepo contexts: {}\nUpdated: {}\n",
+                    session.session_name.as_deref().unwrap_or("Untitled session"),
+                    session.session_id,
+                    session.actor_id.as_deref().unwrap_or(""),
+                    session.actor_type,
+                    session.source.app_id.as_deref().unwrap_or(""),
+                    session.source.app_session_id.as_deref().unwrap_or(""),
+                    join_set(&session.mission_ids),
+                    join_set(&session.artifact_ids),
+                    join_set(&session.log_ref_ids),
+                    join_set(&session.repo_context_ids),
+                    session.last_event_at.to_rfc3339()
+                ),
+            )?;
+        }
+        for artifact in index.artifacts.values() {
+            fs::write(
+                views_dir
+                    .join("artifacts")
+                    .join(format!("{}.md", artifact.artifact_id)),
+                format!(
+                    "# {}\n\nArtifact ID: {}\nKind: {:?}\nMissions: {}\nSessions: {}\nFiles: {}\nAttachments: {}\nDiffs: {}\nRepo contexts: {}\nUpdated: {}\n\n{}\n",
+                    artifact.title.as_deref().unwrap_or("Untitled artifact"),
+                    artifact.artifact_id,
+                    artifact.artifact_kind,
+                    join_set(&artifact.mission_ids),
+                    join_set(&artifact.session_ids),
+                    join_set(&artifact.file_paths),
+                    join_set(&artifact.attachment_ids),
+                    join_set(&artifact.diff_ids),
+                    join_set(&artifact.repo_context_ids),
+                    artifact.last_event_at.to_rfc3339(),
+                    artifact.body.as_deref().unwrap_or("")
+                ),
+            )?;
+        }
+        Ok(())
     }
 
     /// Reads the cached inspection index if it has already been built.
@@ -395,6 +552,10 @@ fn jsonl_paths(root: &Path, label: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn join_set(values: &BTreeSet<String>) -> String {
+    values.iter().cloned().collect::<Vec<_>>().join(", ")
+}
+
 fn event_id_set(events: &[TraceEvent]) -> BTreeSet<Uuid> {
     events.iter().map(|event| event.event_id).collect()
 }
@@ -403,7 +564,8 @@ fn event_id_set(events: &[TraceEvent]) -> BTreeSet<Uuid> {
 mod tests {
     use brick_protocol::{
         ActorRef, ActorType, ArtifactCreatedPayload, ArtifactId, ArtifactKind, EventType,
-        MissionCreatedPayload, MissionId, SessionId, SessionSource, SessionStartedPayload,
+        MissionCreatedPayload, MissionId, MissionStatus, ProjectId, SessionId, SessionSource,
+        SessionStartedPayload,
     };
 
     use super::*;
@@ -417,6 +579,34 @@ mod tests {
         path
     }
 
+    #[test]
+    fn init_adds_brick_to_gitignore_once() {
+        let repo_root = temp_repo_root("gitignore-init");
+        fs::write(repo_root.join(".gitignore"), "target\n").expect("write gitignore");
+        let store = LocalStore::new(&repo_root);
+
+        store.init().expect("init store");
+        store.init().expect("init store again");
+
+        let gitignore = fs::read_to_string(repo_root.join(".gitignore")).expect("read gitignore");
+        assert!(gitignore.lines().any(|line| line == ".brick/"));
+        assert_eq!(
+            gitignore.lines().filter(|line| *line == ".brick/").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn init_creates_gitignore_when_missing() {
+        let repo_root = temp_repo_root("gitignore-missing");
+        let store = LocalStore::new(&repo_root);
+
+        store.init().expect("init store");
+
+        let gitignore = fs::read_to_string(repo_root.join(".gitignore")).expect("read gitignore");
+        assert!(gitignore.lines().any(|line| line == ".brick/"));
+    }
+
     fn mission_event(title: &str) -> TraceEvent {
         TraceEvent::mission_created(
             ActorRef {
@@ -426,8 +616,10 @@ mod tests {
             },
             MissionId::new(),
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: title.to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )
@@ -447,8 +639,10 @@ mod tests {
             },
             mission_id,
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: "Test mission".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )
@@ -543,8 +737,10 @@ mod tests {
             },
             mission_id.clone(),
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: "Index mission".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )
@@ -573,8 +769,10 @@ mod tests {
             actor.clone(),
             mission_id.clone(),
             MissionCreatedPayload {
+                project_id: ProjectId::new(),
                 title: "SQLite mission".to_string(),
                 description: None,
+                status: MissionStatus::Planned,
                 repo_context_id: None,
             },
         )

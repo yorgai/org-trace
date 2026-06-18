@@ -154,6 +154,9 @@ mod tests {
             store_root: Some(PathBuf::from("profile-store")),
             session_db_path: None,
             session_log_path: None,
+            evidence_root: None,
+            cursor_state_db_path: None,
+            default_full_evidence_upload: None,
             notes: None,
         };
 
