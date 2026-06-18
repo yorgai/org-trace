@@ -27,9 +27,9 @@ impl DiscoveredSourceKind {
     pub fn profile_name(self) -> &'static str {
         match self {
             DiscoveredSourceKind::Orgii => "orgii",
-            DiscoveredSourceKind::Cursor => "cursor",
+            DiscoveredSourceKind::Cursor => "cursor_ide",
             DiscoveredSourceKind::ClaudeCode => "claude_code",
-            DiscoveredSourceKind::Codex => "codex",
+            DiscoveredSourceKind::Codex => "codex_app",
             DiscoveredSourceKind::Windsurf => "windsurf",
             DiscoveredSourceKind::OpenCode => "opencode",
         }

@@ -13,9 +13,10 @@ use std::time::UNIX_EPOCH;
 use anyhow::{anyhow, Result};
 use brick_core::{
     format_source_session_chunks, list_source_plans, list_source_sessions, metadata_db_path,
-    ActivityChunk, MetadataDb, NativeSourceSession, SourcePlanListQuery, SourcePlanRecord,
+    query_sqlite_file_session_blame, ActivityChunk, FileSessionBlameRow, LocalStore, MetadataDb,
+    NativeSourceSession, SourceFileSessionBlameQuery, SourcePlanListQuery, SourcePlanRecord,
     SourcePlanSessionEdgeRecord, SourceProfile, SourceProfileStore, SourceSessionListQuery,
-    SourceSessionRecord, SourceSessionUpsert,
+    SourceSessionRecord, SourceSessionUpsert, SqliteFileSessionBlameQuery,
 };
 use brick_protocol::ActorType;
 use chrono::{DateTime, Utc};
@@ -29,7 +30,8 @@ use crate::args::{
 const HISTORY_EXPORT_SCHEMA_AUDIT_V1: &str = "audit-v1";
 const HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1: &str = "source-metadata-v1";
 const EXPORT_AVAILABILITY_METADATA_ONLY: &str = "metadata_only";
-const EXPORT_REFRESH_LIMIT: usize = 10_000;
+const SOURCE_INDEX_REFRESH_LIMIT: usize = 100_000;
+const EXPORT_REFRESH_LIMIT: usize = SOURCE_INDEX_REFRESH_LIMIT;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HistorySourcesResponse {
@@ -250,6 +252,17 @@ pub struct SourceMetadataSessionRow {
     pub metadata_json: Option<Value>,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HistoryFileSessionBlameResponse {
+    pub schema: String,
+    pub file_path: String,
+    pub source: String,
+    pub limit: usize,
+    pub status: String,
+    pub errors: Vec<String>,
+    pub rows: Vec<FileSessionBlameRow>,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HistoryDoctorResponse {
     pub source: String,
@@ -309,7 +322,11 @@ pub struct DoctorIndexedCounts {
 }
 
 /// Executes read-only history subcommands and emits machine-readable JSON.
-pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) -> Result<()> {
+pub fn handle_history(
+    command: HistoryCommand,
+    profiles: &SourceProfileStore,
+    store: &LocalStore,
+) -> Result<()> {
     match command {
         HistoryCommand::Sources { format } => {
             ensure_json(format);
@@ -327,7 +344,7 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
             refresh_profiles_to_metadata(
                 &mut metadata_db,
                 std::slice::from_ref(&profile),
-                offset.saturating_add(limit).saturating_add(1),
+                SOURCE_INDEX_REFRESH_LIMIT,
             )?;
             print_json(&build_sessions_response(
                 &metadata_db,
@@ -366,7 +383,11 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
                 vec![read_profile(profiles, &source)?]
             };
             let mut metadata_db = MetadataDb::open_global()?;
-            refresh_profiles_to_metadata(&mut metadata_db, &selected_profiles, limit)?;
+            refresh_profiles_to_metadata(
+                &mut metadata_db,
+                &selected_profiles,
+                SOURCE_INDEX_REFRESH_LIMIT,
+            )?;
             print_json(&build_recent_paths_response(
                 &metadata_db,
                 source_label,
@@ -424,7 +445,108 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
             let chunks = format_chunks_for_record(&record)?;
             print_export(schema, format, record, chunks)
         }
+        HistoryCommand::FileSessionBlame {
+            path,
+            source,
+            limit,
+            format,
+        } => {
+            ensure_json(format);
+            print_json(&build_file_session_blame_response(
+                store, profiles, &path, &source, limit,
+            )?)
+        }
     }
+}
+
+fn build_file_session_blame_response(
+    store: &LocalStore,
+    profiles: &SourceProfileStore,
+    file_path: &str,
+    source: &str,
+    limit: usize,
+) -> Result<HistoryFileSessionBlameResponse> {
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+
+    match store.rebuild_sqlite_index() {
+        Ok(_) => match query_sqlite_file_session_blame(
+            &store.sqlite_index_path(),
+            &SqliteFileSessionBlameQuery {
+                file_path: file_path.to_string(),
+                limit,
+            },
+        ) {
+            Ok(runtime_rows) => rows.extend(runtime_rows),
+            Err(error) => errors.push(format!("runtime_index_query: {error}")),
+        },
+        Err(error) => errors.push(format!("runtime_index_rebuild: {error}")),
+    }
+
+    let selected_profiles = if source == "all" {
+        profiles.list_profiles()?
+    } else {
+        vec![read_profile(profiles, source)?]
+    };
+    let mut metadata_db = match MetadataDb::open_global() {
+        Ok(metadata_db) => Some(metadata_db),
+        Err(error) => {
+            errors.push(format!("source_metadata_open: {error}"));
+            None
+        }
+    };
+    if let Some(metadata_db) = metadata_db.as_mut() {
+        match refresh_profiles_to_metadata(metadata_db, &selected_profiles, EXPORT_REFRESH_LIMIT) {
+            Ok(()) => {
+                let query_source = (source != "all").then(|| source.to_string());
+                match metadata_db.query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                    file_path: file_path.to_string(),
+                    source_id: query_source,
+                    repo_path: Some(store.repo_root().to_path_buf()),
+                    limit,
+                }) {
+                    Ok(source_rows) => rows.extend(source_rows),
+                    Err(error) => errors.push(format!("source_metadata_query: {error}")),
+                }
+            }
+            Err(error) => errors.push(format!("source_metadata_refresh: {error}")),
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.external_session_id.cmp(&right.external_session_id))
+            .then_with(|| {
+                left.evidence_kind
+                    .as_str()
+                    .cmp(right.evidence_kind.as_str())
+            })
+    });
+    rows.truncate(limit.max(1));
+    let status = if errors.is_empty() {
+        if rows.is_empty() {
+            "empty"
+        } else {
+            "ok"
+        }
+    } else {
+        "error"
+    }
+    .to_string();
+
+    Ok(HistoryFileSessionBlameResponse {
+        schema: "file-session-blame-v1".to_string(),
+        file_path: file_path.to_string(),
+        source: source.to_string(),
+        limit,
+        status,
+        errors,
+        rows,
+    })
 }
 
 fn build_sources_response(profiles: &SourceProfileStore) -> Result<HistorySourcesResponse> {
@@ -1099,7 +1221,7 @@ fn refresh_profiles_to_metadata(
 ) -> Result<()> {
     for profile in profiles {
         for session in list_source_sessions(profile, Some(limit))? {
-            let upsert = source_session_upsert(&profile.name, session);
+            let upsert = source_session_upsert(profile, session);
             metadata_db.upsert_source_session(&upsert)?;
         }
         for plan in list_source_plans(profile)? {
@@ -1109,11 +1231,16 @@ fn refresh_profiles_to_metadata(
     Ok(())
 }
 
-fn source_session_upsert(source_id: &str, session: NativeSourceSession) -> SourceSessionUpsert {
+fn source_session_upsert(
+    profile: &SourceProfile,
+    session: NativeSourceSession,
+) -> SourceSessionUpsert {
     let now = Utc::now();
     let source_mtime = session.modified_at.map(system_time_to_utc);
+    let listable = session.listable;
+    let metadata_json = source_session_metadata(profile, &session);
     SourceSessionUpsert {
-        source_id: source_id.to_string(),
+        source_id: profile.name.clone(),
         external_session_id: session.external_session_id,
         title: session.title.clone(),
         name: session.title,
@@ -1134,15 +1261,38 @@ fn source_session_upsert(source_id: &str, session: NativeSourceSession) -> Sourc
         lines_added: session.lines_added,
         lines_removed: session.lines_removed,
         touched_files_json: Some(json!(session.touched_files)),
-        listable: true,
+        listable,
         discovered_at: now,
         last_seen_at: session
             .session_updated_at
             .map(system_time_to_utc)
             .or(source_mtime)
             .unwrap_or(now),
-        metadata_json: Some(json!({ "app_id": session.source_app_id })),
+        metadata_json,
     }
+}
+
+fn source_session_metadata(
+    profile: &SourceProfile,
+    session: &NativeSourceSession,
+) -> Option<Value> {
+    let mut metadata = json!({
+        "app_id": session.source_app_id,
+        "actor_id": profile.actor_id,
+        "actor_type": profile.actor_type.map(format_actor_type),
+    });
+    if let Some(provider_metadata) = session.metadata_json.as_ref() {
+        if let (Some(metadata_object), Some(provider_object)) =
+            (metadata.as_object_mut(), provider_metadata.as_object())
+        {
+            for (key, value) in provider_object {
+                metadata_object.insert(key.clone(), value.clone());
+            }
+        } else {
+            metadata["sourceMetadata"] = provider_metadata.clone();
+        }
+    }
+    Some(metadata)
 }
 
 fn session_row(record: SourceSessionRecord) -> HistorySessionRow {

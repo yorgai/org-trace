@@ -24,6 +24,12 @@ pub enum Command {
         bind: String,
         #[arg(long, default_value = ".brick-server")]
         data_dir: PathBuf,
+        #[arg(long)]
+        enable_local_history: bool,
+        #[arg(long, default_value = "brick")]
+        brick_bin: PathBuf,
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
     },
     RebuildIndex {
         #[arg(long, default_value = ".brick-server")]

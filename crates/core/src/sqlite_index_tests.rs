@@ -5,16 +5,16 @@ use std::fs;
 use brick_protocol::{
     ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload,
     ArtifactFileRefRecordedPayload, ArtifactId, ArtifactKind, ArtifactUpdatedPayload, AttachmentId,
-    EvidenceAvailability, FileRefId, LogRefId, MissionCreatedPayload, MissionId, MissionStatus,
-    ProjectId, SessionId, SessionLogFormat, SessionLogUploadedPayload, SessionSource,
-    SessionStartedPayload, TraceEvent,
+    DiffCapturedPayload, DiffFileChange, DiffFileChangeKind, DiffTarget, EvidenceAvailability,
+    FileRefId, LogRefId, MissionCreatedPayload, MissionId, MissionStatus, ProjectId, SessionId,
+    SessionLogFormat, SessionLogUploadedPayload, SessionSource, SessionStartedPayload, TraceEvent,
 };
 use chrono::Utc;
 
 use crate::{
-    query_sqlite_artifacts, query_sqlite_sessions, rebuild_sqlite_index, sqlite_index_status,
-    SqliteArtifactQuery, SqliteSessionQuery, TraceIndex, SQLITE_INDEX_FILE,
-    SQLITE_INDEX_SCHEMA_VERSION,
+    query_sqlite_artifacts, query_sqlite_file_session_blame, query_sqlite_sessions,
+    rebuild_sqlite_index, sqlite_index_status, SqliteArtifactQuery, SqliteFileSessionBlameQuery,
+    SqliteSessionQuery, TraceIndex, SQLITE_INDEX_FILE, SQLITE_INDEX_SCHEMA_VERSION,
 };
 
 fn actor() -> ActorRef {
@@ -43,6 +43,7 @@ fn rebuilds_and_queries_sqlite_cache() {
     let artifact_id = ArtifactId::new();
     let attachment_id = AttachmentId::new();
     let log_ref_id = LogRefId::new();
+    let diff_artifact_id = ArtifactId::new();
     let events = vec![
         TraceEvent::mission_created(
             actor(),
@@ -144,6 +145,41 @@ fn rebuilds_and_queries_sqlite_cache() {
             },
         )
         .expect("session log event"),
+        TraceEvent::artifact_created(
+            actor(),
+            diff_artifact_id.clone(),
+            Some(mission_id.clone()),
+            Some(session_id.clone()),
+            ArtifactCreatedPayload {
+                artifact_kind: ArtifactKind::Patch,
+                title: "Captured diff".to_string(),
+                body: None,
+                repo_context_id: None,
+            },
+        )
+        .expect("diff artifact event"),
+        TraceEvent::diff_captured(
+            actor(),
+            diff_artifact_id.clone(),
+            Some(session_id.clone()),
+            Some(mission_id.clone()),
+            DiffCapturedPayload {
+                diff_target: DiffTarget::Working,
+                base_commit: None,
+                head_commit: None,
+                patch_id: Some("patch-1".to_string()),
+                summary_hash: "summary-1".to_string(),
+                file_changes: vec![DiffFileChange {
+                    path: "crates/core/src/file_session_blame.rs".to_string(),
+                    old_path: None,
+                    change_kind: DiffFileChangeKind::Modified,
+                    additions: Some(12),
+                    deletions: Some(3),
+                }],
+                repo_context_id: None,
+            },
+        )
+        .expect("diff captured event"),
     ];
     let index = TraceIndex::build(&events).expect("build trace index");
 
@@ -151,7 +187,7 @@ fn rebuilds_and_queries_sqlite_cache() {
     let status = sqlite_index_status(&path).expect("sqlite status");
     assert!(status.exists);
     assert_eq!(status.schema_version, Some(SQLITE_INDEX_SCHEMA_VERSION));
-    assert_eq!(status.event_count, 7);
+    assert_eq!(status.event_count, 9);
     assert_eq!(status.session_log_count, 1);
 
     let sessions = query_sqlite_sessions(
@@ -178,26 +214,48 @@ fn rebuilds_and_queries_sqlite_cache() {
         },
     )
     .expect("query artifacts");
-    assert_eq!(artifacts.len(), 1);
-    assert_eq!(artifacts[0].artifact_id, artifact_id.to_string());
-    assert_eq!(artifacts[0].artifact_kind.as_deref(), Some("review"));
+    assert_eq!(artifacts.len(), 2);
+    let artifact = artifacts
+        .iter()
+        .find(|record| record.artifact_id == artifact_id.to_string())
+        .expect("original artifact row");
+    assert_eq!(artifact.artifact_kind.as_deref(), Some("review"));
+    assert_eq!(artifact.title.as_deref(), Some("Use updated SQLite cache"));
+    assert_eq!(artifact.body.as_deref(), Some("Updated body"));
     assert_eq!(
-        artifacts[0].title.as_deref(),
-        Some("Use updated SQLite cache")
-    );
-    assert_eq!(artifacts[0].body.as_deref(), Some("Updated body"));
-    assert_eq!(
-        artifacts[0].file_paths,
+        artifact.file_paths,
         vec!["crates/core/src/sqlite_index.rs".to_string()]
     );
-    assert_eq!(artifacts[0].attachments.len(), 1);
+    assert_eq!(artifact.attachments.len(), 1);
     assert_eq!(
-        artifacts[0].attachments[0].attachment_id,
+        artifact.attachments[0].attachment_id,
         attachment_id.to_string()
     );
-    assert_eq!(artifacts[0].attachments[0].size_bytes, 5);
+    assert_eq!(artifact.attachments[0].size_bytes, 5);
     assert_eq!(
-        artifacts[0].attachments[0].content_type.as_deref(),
+        artifact.attachments[0].content_type.as_deref(),
         Some("text/plain")
     );
+
+    let blame = query_sqlite_file_session_blame(
+        &path,
+        &SqliteFileSessionBlameQuery {
+            file_path: "crates/core/src/file_session_blame.rs".to_string(),
+            limit: 20,
+        },
+    )
+    .expect("query file blame");
+    assert_eq!(blame.len(), 1);
+    assert_eq!(blame[0].session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(blame[0].app_id.as_deref(), Some("cursor"));
+    assert_eq!(blame[0].actor_id.as_deref(), Some("agent-1"));
+    assert!(blame.iter().any(|row| row.lines_added == Some(12)
+        && row.lines_removed == Some(3)
+        && row.files_changed == Some(1)
+        && row.evidence_kind.as_str() == "runtime_event"
+        && row.confidence.as_deref() == Some("explicit")));
+    assert!(blame.iter().any(|row| row
+        .source_pointer
+        .as_ref()
+        .is_some_and(|pointer| pointer.get("diff_id").is_some())));
 }

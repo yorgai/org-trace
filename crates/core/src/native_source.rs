@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use crate::SourceProfile;
 
@@ -36,9 +37,11 @@ pub struct NativeSourceSession {
     pub lines_added: Option<u64>,
     pub lines_removed: Option<u64>,
     pub touched_files: Vec<String>,
+    pub listable: bool,
+    pub metadata_json: Option<Value>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct NativeSessionMetadata {
     pub title: Option<String>,
     pub parser_version: Option<String>,
@@ -53,6 +56,30 @@ pub(crate) struct NativeSessionMetadata {
     pub lines_added: Option<u64>,
     pub lines_removed: Option<u64>,
     pub touched_files: Vec<String>,
+    pub listable: bool,
+    pub metadata_json: Option<Value>,
+}
+
+impl Default for NativeSessionMetadata {
+    fn default() -> Self {
+        Self {
+            title: None,
+            parser_version: None,
+            session_created_at: None,
+            session_updated_at: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            repo_path: None,
+            branch: None,
+            files_changed: None,
+            lines_added: None,
+            lines_removed: None,
+            touched_files: Vec::new(),
+            listable: true,
+            metadata_json: None,
+        }
+    }
 }
 
 /// Returns recent generic native source sessions discovered from a source profile.
@@ -67,6 +94,15 @@ pub(crate) fn list_file_source_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
     extract: impl Fn(&Path) -> Result<NativeSessionMetadata>,
+) -> Result<Vec<NativeSourceSession>> {
+    list_file_source_sessions_with_filter(profile, limit, extract, is_supported_session_file)
+}
+
+pub(crate) fn list_file_source_sessions_with_filter(
+    profile: &SourceProfile,
+    limit: Option<usize>,
+    extract: impl Fn(&Path) -> Result<NativeSessionMetadata>,
+    include: impl Fn(&Path) -> bool,
 ) -> Result<Vec<NativeSourceSession>> {
     let scan_limit = limit.unwrap_or(DEFAULT_NATIVE_SESSION_LIMIT);
     let mut roots = Vec::new();
@@ -83,7 +119,7 @@ pub(crate) fn list_file_source_sessions(
         .unwrap_or_else(|| profile.name.clone());
     let mut sessions = Vec::new();
     for root in roots {
-        collect_session_files(&root, &app_id, &extract, &mut sessions)?;
+        collect_session_files(&root, &app_id, &extract, &include, &mut sessions)?;
         if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
             break;
         }
@@ -99,13 +135,14 @@ fn collect_session_files(
     root: &Path,
     app_id: &str,
     extract: &impl Fn(&Path) -> Result<NativeSessionMetadata>,
+    include: &impl Fn(&Path) -> bool,
     sessions: &mut Vec<NativeSourceSession>,
 ) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
     if root.is_file() {
-        if is_supported_session_file(root) {
+        if include(root) {
             sessions.push(session_from_path(root, app_id, extract)?);
         }
         return Ok(());
@@ -131,7 +168,7 @@ fn collect_session_files(
                 stack.push(path);
                 continue;
             }
-            if !is_supported_session_file(&path) {
+            if !include(&path) {
                 continue;
             }
             sessions.push(session_from_path(&path, app_id, extract)?);
@@ -194,6 +231,8 @@ fn session_from_path(
         lines_added: extracted.lines_added,
         lines_removed: extracted.lines_removed,
         touched_files: extracted.touched_files,
+        listable: extracted.listable,
+        metadata_json: extracted.metadata_json,
     })
 }
 

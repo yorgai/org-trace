@@ -36,7 +36,7 @@ pub(in crate::sources) fn read_kv_value(
         .query([key])
         .context("failed to query Cursor-family KV value")?;
     if let Some(row) = rows.next()? {
-        Ok(Some(row.get(0)?))
+        Ok(row.get(0)?)
     } else {
         Ok(None)
     }
@@ -47,14 +47,17 @@ pub(in crate::sources) fn read_kv_entries_with_prefix(
     prefix: &str,
 ) -> Result<Vec<(String, String)>> {
     let sql = format!(
-        "SELECT key, value FROM {} WHERE key LIKE ?1",
+        "SELECT key, value FROM {} WHERE key >= ?1 AND key < ?2 AND value IS NOT NULL ORDER BY key ASC",
         quote_identifier(CURSOR_DISK_KV_TABLE)
     );
+    let upper_bound = prefix_upper_bound(prefix);
     let mut statement = connection
         .prepare(&sql)
         .context("failed to prepare Cursor-family KV prefix lookup")?;
     let rows = statement
-        .query_map([format!("{prefix}%")], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([prefix, upper_bound.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .context("failed to query Cursor-family KV prefix values")?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to read Cursor-family KV prefix rows")
@@ -204,6 +207,16 @@ fn is_embedded_cursor_content_identifier(value: &str) -> bool {
 
 fn is_probable_content_hash(value: &str) -> bool {
     (16..=128).contains(&value.len()) && value.chars().all(|char| char.is_ascii_hexdigit())
+}
+
+fn prefix_upper_bound(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    if let Some(last_byte) = bytes.last_mut() {
+        *last_byte = last_byte.saturating_add(1);
+        String::from_utf8(bytes).unwrap_or_else(|_| format!("{prefix}\u{10ffff}"))
+    } else {
+        "\u{10ffff}".to_string()
+    }
 }
 
 fn quote_identifier(identifier: &str) -> String {

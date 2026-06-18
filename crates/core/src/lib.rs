@@ -7,6 +7,7 @@
 mod activity;
 mod attachment_store;
 mod diff_capture;
+mod file_session_blame;
 mod global_home;
 mod identity;
 mod index;
@@ -31,6 +32,7 @@ mod store_options;
 pub use activity::*;
 pub use attachment_store::*;
 pub use diff_capture::*;
+pub use file_session_blame::*;
 pub use global_home::*;
 pub use identity::*;
 pub use index_types::*;

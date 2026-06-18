@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -63,6 +64,7 @@ pub(in crate::sources) fn list_sessions_from_composer_data(
             .transpose()
         })
         .collect::<Result<Vec<_>>>()?;
+    attach_subagent_ids_to_parents(&mut sessions);
     sessions.sort_by(|left, right| {
         right
             .session_updated_at
@@ -131,6 +133,8 @@ pub(in crate::sources) fn composer_header_session(
         lines_added: first_u64(composer, &["totalLinesAdded", "linesAdded"]),
         lines_removed: first_u64(composer, &["totalLinesRemoved", "linesRemoved"]),
         touched_files: touched_files_from_composer(composer),
+        listable: true,
+        metadata_json: None,
     }))
 }
 
@@ -241,6 +245,57 @@ pub(in crate::sources) fn cursor_family_state_db_path(
         })
 }
 
+fn attach_subagent_ids_to_parents(sessions: &mut [NativeSourceSession]) {
+    let mut parent_by_subagent_id = HashMap::<String, String>::new();
+    let mut subagent_ids_by_parent = HashMap::<String, Vec<String>>::new();
+
+    for session in sessions.iter() {
+        let Some(metadata) = session.metadata_json.as_ref() else {
+            continue;
+        };
+        if let Some(parent_session_id) = metadata.get("parentSessionId").and_then(Value::as_str) {
+            parent_by_subagent_id.insert(
+                session.external_session_id.clone(),
+                parent_session_id.to_string(),
+            );
+        }
+        if let Some(subagent_ids) = metadata.get("subagentSessionIds").and_then(Value::as_array) {
+            for subagent_id in subagent_ids.iter().filter_map(Value::as_str) {
+                parent_by_subagent_id
+                    .entry(subagent_id.to_string())
+                    .or_insert_with(|| session.external_session_id.clone());
+            }
+        }
+    }
+
+    for (subagent_id, parent_session_id) in &parent_by_subagent_id {
+        subagent_ids_by_parent
+            .entry(parent_session_id.clone())
+            .or_default()
+            .push(subagent_id.clone());
+    }
+
+    for session in sessions.iter_mut() {
+        if let Some(parent_session_id) = parent_by_subagent_id.get(&session.external_session_id) {
+            session.listable = false;
+            let mut metadata = session.metadata_json.take().unwrap_or_else(|| json!({}));
+            if metadata.get("kind").and_then(Value::as_str).is_none() {
+                metadata["kind"] = json!("subagent");
+            }
+            metadata["subagentSessionId"] = json!(session.external_session_id);
+            metadata["parentSessionId"] = json!(parent_session_id);
+            session.metadata_json = Some(metadata);
+        }
+
+        let Some(subagent_ids) = subagent_ids_by_parent.remove(&session.external_session_id) else {
+            continue;
+        };
+        let mut metadata = session.metadata_json.take().unwrap_or_else(|| json!({}));
+        metadata["subagentSessionIds"] = json!(subagent_ids);
+        session.metadata_json = Some(metadata);
+    }
+}
+
 fn composer_data_session(
     key: &str,
     composer_json: &str,
@@ -270,14 +325,119 @@ fn composer_data_session(
                 options.source_label
             )
         })?;
-    composer_header_session(
+    let Some(mut session) = composer_header_session(
         &composer_id,
         &composer,
         state_db_path,
         source_app_id,
         db_metadata,
         options,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(parent_link_metadata) = parent_link_metadata(&composer) {
+        session.metadata_json = Some(parent_link_metadata);
+    }
+    if let Some(subagent_metadata) = subagent_metadata(&composer_id, &composer) {
+        session.listable = false;
+        session.metadata_json = Some(merge_metadata(
+            session.metadata_json.take(),
+            subagent_metadata,
+        ));
+    } else if let Some(non_listable_metadata) =
+        non_listable_composer_metadata(&composer_id, &composer)
+    {
+        session.listable = false;
+        session.metadata_json = Some(merge_metadata(
+            session.metadata_json.take(),
+            non_listable_metadata,
+        ));
+    }
+    Ok(Some(session))
+}
+
+fn parent_link_metadata(composer: &Value) -> Option<Value> {
+    let subagent_ids: Vec<&str> = composer
+        .get("subagentComposerIds")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|subagent_id| !subagent_id.is_empty())
+        .collect();
+    if subagent_ids.is_empty() {
+        return None;
+    }
+    Some(json!({ "subagentSessionIds": subagent_ids }))
+}
+
+fn merge_metadata(base: Option<Value>, extra: Value) -> Value {
+    let mut metadata = base.unwrap_or_else(|| json!({}));
+    if let (Some(metadata_object), Some(extra_object)) =
+        (metadata.as_object_mut(), extra.as_object())
+    {
+        for (key, value) in extra_object {
+            metadata_object.insert(key.clone(), value.clone());
+        }
+        metadata
+    } else {
+        extra
+    }
+}
+
+fn subagent_metadata(composer_id: &str, composer: &Value) -> Option<Value> {
+    let subagent_info = composer.get("subagentInfo")?.as_object()?;
+    let parent_session_id = subagent_info
+        .get("parentComposerId")
+        .or_else(|| subagent_info.get("parentSessionId"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent_session_id.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "kind": "subagent",
+        "subagentSessionId": composer_id,
+        "parentSessionId": parent_session_id,
+        "cursorToolCallId": subagent_info.get("toolCallId").and_then(Value::as_str),
+        "subagentType": subagent_info.get("subagentTypeName").and_then(Value::as_str),
+    }))
+}
+
+fn non_listable_composer_metadata(composer_id: &str, composer: &Value) -> Option<Value> {
+    if composer.get("isDraft").and_then(Value::as_bool) == Some(true) {
+        return Some(json!({
+            "kind": "draft",
+            "composerId": composer_id,
+            "reason": "cursor_draft_composer",
+        }));
+    }
+    let has_no_bubbles = bubble_ids(composer).is_empty();
+    let has_empty_conversation_map = composer
+        .get("conversationMap")
+        .and_then(Value::as_object)
+        .is_none_or(serde_json::Map::is_empty);
+    if composer.get("status").and_then(Value::as_str) == Some("none")
+        && has_no_bubbles
+        && has_empty_conversation_map
+    {
+        return Some(json!({
+            "kind": "empty_composer",
+            "composerId": composer_id,
+            "reason": "cursor_empty_composer",
+        }));
+    }
+    if composer.get("status").and_then(Value::as_str) == Some("aborted")
+        && has_no_bubbles
+        && has_empty_conversation_map
+    {
+        return Some(json!({
+            "kind": "empty_composer",
+            "composerId": composer_id,
+            "reason": "cursor_aborted_empty_composer",
+        }));
+    }
+    None
 }
 
 fn bubble_ids(composer: &Value) -> Vec<String> {
@@ -456,11 +616,30 @@ fn first_u64(composer: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn touched_files_from_composer(composer: &Value) -> Vec<String> {
-    ["touchedFiles", "filesChanged", "changedFiles"]
+    let mut touched_files = ["touchedFiles", "filesChanged", "changedFiles"]
         .iter()
         .filter_map(|key| composer.get(key))
         .find_map(string_array)
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if let Some(original_file_states) = composer
+        .get("originalFileStates")
+        .and_then(Value::as_object)
+    {
+        touched_files.extend(
+            original_file_states
+                .keys()
+                .map(|path| cursor_file_path(path)),
+        );
+    }
+
+    if let Some(newly_created_files) = composer.get("newlyCreatedFiles").and_then(string_array) {
+        touched_files.extend(newly_created_files);
+    }
+
+    touched_files.sort();
+    touched_files.dedup();
+    touched_files
 }
 
 fn string_array(value: &Value) -> Option<Vec<String>> {
@@ -469,20 +648,30 @@ fn string_array(value: &Value) -> Option<Vec<String>> {
             .iter()
             .filter_map(|item| {
                 item.as_str()
-                    .map(ToOwned::to_owned)
+                    .map(cursor_file_path)
                     .or_else(|| {
                         item.get("path")
                             .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
+                            .map(cursor_file_path)
                     })
                     .or_else(|| {
                         item.get("filePath")
+                            .and_then(Value::as_str)
+                            .map(cursor_file_path)
+                    })
+                    .or_else(|| {
+                        item.get("uri")
+                            .and_then(|uri| uri.get("fsPath"))
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned)
                     })
             })
             .collect()
     })
+}
+
+fn cursor_file_path(value: &str) -> String {
+    value.strip_prefix("file://").unwrap_or(value).to_string()
 }
 
 fn truncate_title(value: &str) -> String {

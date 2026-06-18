@@ -10,15 +10,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
-    metadata_db_path, metadata_db_path_in_home, SourcePlanListQuery, SourcePlanRecord,
+    metadata_db_path, metadata_db_path_in_home, FileSessionBlameEvidenceKind, FileSessionBlameRow,
+    SourceFileSessionBlameQuery, SourcePlanListQuery, SourcePlanRecord,
     SourcePlanSessionEdgeRecord, SourcePlanWithEdgesUpsert,
 };
 
 /// Current schema version for the unified metadata database.
-pub const METADATA_DB_SCHEMA_VERSION: u16 = 2;
+pub const METADATA_DB_SCHEMA_VERSION: u16 = 5;
 
 const METADATA_KEY_SCHEMA_VERSION: &str = "schema_version";
 const METADATA_KEY_RESET_AT: &str = "reset_at";
@@ -249,6 +250,7 @@ impl MetadataDb {
                     discovered_at, last_seen_at, created_at, updated_at, metadata_json
              FROM source_sessions
              WHERE (?1 IS NULL OR source_id = ?1)
+               AND listable = 1
              ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC
              LIMIT ?2 OFFSET ?3",
         )?;
@@ -263,10 +265,53 @@ impl MetadataDb {
         Ok(records)
     }
 
+    /// Queries source metadata rows that touched a file path.
+    pub fn query_source_file_session_blame(
+        &self,
+        query: &SourceFileSessionBlameQuery,
+    ) -> Result<Vec<FileSessionBlameRow>> {
+        let limit = normalized_limit(query.limit);
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, external_session_id, title, name, source_path, source_uri,
+                    source_mtime, source_size, source_fingerprint, parser_version,
+                    session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                    files_changed, lines_added, lines_removed, touched_files_json, listable,
+                    discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             FROM source_sessions
+             WHERE (?1 IS NULL OR source_id = ?1)
+               AND (?2 IS NULL OR repo_path = ?2)
+               AND touched_files_json IS NOT NULL
+             ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                query.source_id,
+                query
+                    .repo_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                limit,
+            ],
+            source_session_from_row,
+        )?;
+        let mut records = Vec::new();
+        for row in rows {
+            let record = row.context("failed to read metadata source-session blame row")?;
+            if touched_files_from_value(record.touched_files_json.as_ref())
+                .iter()
+                .any(|path| path == &query.file_path)
+            {
+                records.push(source_session_blame_row(&query.file_path, record));
+            }
+        }
+        Ok(records)
+    }
+
     /// Counts source-session rows matching an optional source filter.
     pub fn count_source_sessions(&self, source_id: Option<&str>) -> Result<usize> {
         let count = self.connection.query_row(
-            "SELECT COUNT(*) FROM source_sessions WHERE (?1 IS NULL OR source_id = ?1)",
+            "SELECT COUNT(*) FROM source_sessions WHERE (?1 IS NULL OR source_id = ?1) AND listable = 1",
             params![source_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -618,6 +663,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
 }
 
 fn reset_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
     for table in existing_user_tables(connection)? {
         connection.execute(
             &format!("DROP TABLE IF EXISTS {}", quote_identifier(&table)),
@@ -625,6 +671,7 @@ fn reset_schema(connection: &Connection) -> Result<()> {
         )?;
     }
     create_schema(connection)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     upsert_metadata(connection, METADATA_KEY_RESET_AT, &Utc::now().to_rfc3339())?;
     Ok(())
 }
@@ -783,6 +830,75 @@ fn read_source_session(
         )
         .optional()
         .context("failed to read metadata source-session row")
+}
+
+fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> FileSessionBlameRow {
+    let app_id = record
+        .metadata_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("app_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| Some(record.source_id.clone()));
+    let actor_id = record
+        .metadata_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("actor_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let actor_type = record
+        .metadata_json
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("actor_type"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    FileSessionBlameRow {
+        file_path: file_path.to_string(),
+        session_id: None,
+        external_session_id: Some(record.external_session_id.clone()),
+        source_id: Some(record.source_id.clone()),
+        app_id,
+        actor_id,
+        actor_type,
+        evidence_kind: FileSessionBlameEvidenceKind::SourceMetadata,
+        last_seen_at: record.last_seen_at.to_rfc3339(),
+        lines_added: record.lines_added,
+        lines_removed: record.lines_removed,
+        files_changed: record.files_changed,
+        confidence: Some("metadata_only".to_string()),
+        source_pointer: Some(json!({
+            "source_id": record.source_id,
+            "external_session_id": record.external_session_id,
+            "source_path": record.source_path.map(|path| path.display().to_string()),
+            "source_uri": record.source_uri,
+            "source_record_key": record
+                .metadata_json
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("source_record_key"))
+                .and_then(Value::as_str),
+            "parser_version": record.parser_version,
+            "repo_path": record.repo_path.map(|path| path.display().to_string()),
+            "branch": record.branch,
+            "source_fingerprint": record.source_fingerprint,
+        })),
+    }
+}
+
+fn touched_files_from_value(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn source_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSessionRecord> {
@@ -959,7 +1075,12 @@ mod tests {
             listable: true,
             discovered_at,
             last_seen_at,
-            metadata_json: Some(json!({ "phase": "first-slice" })),
+            metadata_json: Some(json!({
+                "phase": "first-slice",
+                "app_id": "test-app",
+                "actor_id": "agent-1",
+                "actor_type": "agent",
+            })),
         }
     }
 
@@ -1002,7 +1123,12 @@ mod tests {
         assert!(inserted.listable);
         assert_eq!(
             inserted.metadata_json,
-            Some(json!({ "phase": "first-slice" }))
+            Some(json!({
+                "phase": "first-slice",
+                "app_id": "test-app",
+                "actor_id": "agent-1",
+                "actor_type": "agent",
+            }))
         );
 
         let mut updated_input = sample_upsert("Updated title", 1);
@@ -1033,6 +1159,49 @@ mod tests {
                 .expect("count source sessions"),
             1
         );
+    }
+
+    #[test]
+    fn queries_source_metadata_file_session_blame() {
+        let path = temp_home("source-blame").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Blame session", 0))
+            .expect("insert source session");
+
+        let rows = db
+            .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                file_path: "src/lib.rs".to_string(),
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                repo_path: Some(PathBuf::from("/tmp/repo")),
+                limit: 20,
+            })
+            .expect("query source file blame");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/lib.rs");
+        assert_eq!(
+            rows[0].external_session_id.as_deref(),
+            Some(TEST_EXTERNAL_SESSION_ID)
+        );
+        assert_eq!(rows[0].source_id.as_deref(), Some(TEST_SOURCE_ID));
+        assert_eq!(rows[0].app_id.as_deref(), Some("test-app"));
+        assert_eq!(rows[0].actor_id.as_deref(), Some("agent-1"));
+        assert_eq!(rows[0].actor_type.as_deref(), Some("agent"));
+        assert_eq!(rows[0].evidence_kind.as_str(), "source_metadata");
+        assert_eq!(rows[0].lines_added, Some(3));
+        assert_eq!(rows[0].lines_removed, Some(4));
+        assert_eq!(rows[0].files_changed, Some(2));
+        assert_eq!(rows[0].confidence.as_deref(), Some("metadata_only"));
+
+        let missing_rows = db
+            .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                file_path: "src/missing.rs".to_string(),
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                repo_path: Some(PathBuf::from("/tmp/repo")),
+                limit: 20,
+            })
+            .expect("query missing source file blame");
+        assert!(missing_rows.is_empty());
     }
 
     #[test]
@@ -1200,5 +1369,32 @@ mod tests {
             )
             .expect("inspect obsolete table");
         assert!(!obsolete_exists);
+    }
+
+    #[test]
+    fn resets_incomplete_foreign_key_schema() {
+        let path = temp_home("reset-incomplete-fk").join(crate::METADATA_DB_FILE);
+        let connection = Connection::open(&path).expect("open raw metadata DB");
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata (key, value) VALUES ('schema_version', '1');
+                 CREATE TABLE source_sessions (source_session_id INTEGER PRIMARY KEY AUTOINCREMENT);
+                 CREATE TABLE source_session_workspace_roots (
+                     source_session_id INTEGER NOT NULL,
+                     workspace_root_id INTEGER NOT NULL,
+                     FOREIGN KEY(source_session_id) REFERENCES source_sessions(source_session_id) ON DELETE CASCADE,
+                     FOREIGN KEY(workspace_root_id) REFERENCES workspace_roots(workspace_root_id) ON DELETE CASCADE
+                 );",
+            )
+            .expect("seed incomplete metadata DB");
+        drop(connection);
+
+        let db = MetadataDb::open_path(&path).expect("open reset metadata DB");
+        assert_eq!(
+            db.schema_version().expect("schema version"),
+            METADATA_DB_SCHEMA_VERSION
+        );
+        assert!(table_exists(&db.connection, "workspace_roots").expect("inspect workspace table"));
     }
 }

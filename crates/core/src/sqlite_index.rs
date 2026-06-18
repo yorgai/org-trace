@@ -13,11 +13,13 @@ use brick_protocol::{
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::json;
 
 use crate::{
     sqlite_schema::{clear_tables, create_schema, reset_schema},
-    IndexedArtifact, IndexedAttachment, IndexedDiff, IndexedFile, IndexedMission, IndexedOrg,
-    IndexedProject, IndexedRepoContext, IndexedSession, IndexedSessionLog, TraceIndex,
+    FileSessionBlameEvidenceKind, FileSessionBlameRow, IndexedArtifact, IndexedAttachment,
+    IndexedDiff, IndexedFile, IndexedMission, IndexedOrg, IndexedProject, IndexedRepoContext,
+    IndexedSession, IndexedSessionLog, SqliteFileSessionBlameQuery, TraceIndex,
 };
 
 /// Current schema version for the rebuildable SQLite cache.
@@ -258,6 +260,34 @@ pub fn query_sqlite_sessions(
     Ok(records)
 }
 
+/// Runs a typed, read-only file/session attribution query against runtime provenance.
+pub fn query_sqlite_file_session_blame(
+    path: &Path,
+    query: &SqliteFileSessionBlameQuery,
+) -> Result<Vec<FileSessionBlameRow>> {
+    let connection = readonly_connection(path)?;
+    let limit = normalized_limit(query.limit);
+    let mut records = runtime_diff_blame_rows(&connection, &query.file_path, limit)?;
+    records.extend(runtime_file_ref_blame_rows(
+        &connection,
+        &query.file_path,
+        limit,
+    )?);
+    records.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| {
+                left.evidence_kind
+                    .as_str()
+                    .cmp(right.evidence_kind.as_str())
+            })
+    });
+    records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(records)
+}
+
 /// Runs a typed, read-only artifact query against the SQLite cache.
 pub fn query_sqlite_artifacts(
     path: &Path,
@@ -313,6 +343,123 @@ pub fn query_sqlite_artifacts(
         record.attachments = collect_attachments(&connection, &record.artifact_id)?;
         record.diffs = collect_diffs(&connection, &record.artifact_id)?;
         records.push(record);
+    }
+    Ok(records)
+}
+
+fn runtime_diff_blame_rows(
+    connection: &Connection,
+    file_path: &str,
+    limit: i64,
+) -> Result<Vec<FileSessionBlameRow>> {
+    let mut statement = connection.prepare(
+        "SELECT diff_files.path, diffs.session_id, sessions.app_id, sessions.actor_id, sessions.actor_type,
+                diffs.captured_at, diff_files.additions, diff_files.deletions, diffs.file_count,
+                diffs.diff_id, diffs.artifact_id, diffs.mission_id, diffs.diff_target, diffs.base_commit,
+                diffs.head_commit, diffs.patch_id, diffs.summary_hash, diff_files.change_kind,
+                diff_files.old_path, events.confidence
+         FROM diff_files
+         JOIN diffs ON diffs.diff_id = diff_files.diff_id
+         LEFT JOIN sessions ON sessions.session_id = diffs.session_id
+         LEFT JOIN events ON events.event_id = diffs.diff_id
+         WHERE diff_files.path = ?1 OR diff_files.old_path = ?1
+         ORDER BY diffs.captured_at DESC, diffs.diff_id ASC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![file_path, limit], |row| {
+        let additions: Option<i64> = row.get(6)?;
+        let deletions: Option<i64> = row.get(7)?;
+        let file_count: i64 = row.get(8)?;
+        let path_value: String = row.get(0)?;
+        let old_path: Option<String> = row.get(18)?;
+        Ok(FileSessionBlameRow {
+            file_path: if path_value == file_path {
+                path_value
+            } else {
+                old_path.unwrap_or(path_value)
+            },
+            session_id: row.get(1)?,
+            external_session_id: None,
+            source_id: None,
+            app_id: row.get(2)?,
+            actor_id: row.get(3)?,
+            actor_type: row.get(4)?,
+            evidence_kind: FileSessionBlameEvidenceKind::RuntimeEvent,
+            last_seen_at: row.get(5)?,
+            lines_added: additions.and_then(|value| u64::try_from(value).ok()),
+            lines_removed: deletions.and_then(|value| u64::try_from(value).ok()),
+            files_changed: u64::try_from(file_count).ok(),
+            confidence: row.get(19)?,
+            source_pointer: Some(json!({
+                "diff_id": row.get::<_, String>(9)?,
+                "artifact_id": row.get::<_, String>(10)?,
+                "mission_id": row.get::<_, Option<String>>(11)?,
+                "diff_target": row.get::<_, String>(12)?,
+                "base_commit": row.get::<_, Option<String>>(13)?,
+                "head_commit": row.get::<_, Option<String>>(14)?,
+                "patch_id": row.get::<_, Option<String>>(15)?,
+                "summary_hash": row.get::<_, String>(16)?,
+                "change_kind": row.get::<_, String>(17)?,
+                "old_path": row.get::<_, Option<String>>(18)?,
+            })),
+        })
+    })?;
+    collect_blame_rows(rows, "failed to read SQLite runtime diff blame row")
+}
+
+fn runtime_file_ref_blame_rows(
+    connection: &Connection,
+    file_path: &str,
+    limit: i64,
+) -> Result<Vec<FileSessionBlameRow>> {
+    let mut statement = connection.prepare(
+        "SELECT file_refs.path, file_refs.session_id, sessions.app_id, sessions.actor_id, sessions.actor_type,
+                file_refs.recorded_at, file_refs.file_ref_id, file_refs.artifact_id, file_refs.repo_context_id,
+                events.confidence
+         FROM file_refs
+         LEFT JOIN sessions ON sessions.session_id = file_refs.session_id
+         LEFT JOIN events ON events.event_id = file_refs.file_ref_id
+         LEFT JOIN diffs generated_diff ON generated_diff.diff_id = file_refs.file_ref_id
+         WHERE file_refs.path = ?1
+           AND generated_diff.diff_id IS NULL
+         ORDER BY file_refs.recorded_at DESC, file_refs.file_ref_id ASC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![file_path, limit], |row| {
+        Ok(FileSessionBlameRow {
+            file_path: row.get(0)?,
+            session_id: row.get(1)?,
+            external_session_id: None,
+            source_id: None,
+            app_id: row.get(2)?,
+            actor_id: row.get(3)?,
+            actor_type: row.get(4)?,
+            evidence_kind: FileSessionBlameEvidenceKind::RuntimeEvent,
+            last_seen_at: row.get(5)?,
+            lines_added: None,
+            lines_removed: None,
+            files_changed: Some(1),
+            confidence: row.get(9)?,
+            source_pointer: Some(json!({
+                "file_ref_id": row.get::<_, String>(6)?,
+                "artifact_id": row.get::<_, String>(7)?,
+                "repo_context_id": row.get::<_, Option<String>>(8)?,
+            })),
+        })
+    })?;
+    collect_blame_rows(rows, "failed to read SQLite runtime file-ref blame row")
+}
+
+fn collect_blame_rows(
+    rows: rusqlite::MappedRows<
+        '_,
+        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<FileSessionBlameRow>,
+    >,
+    context: &str,
+) -> Result<Vec<FileSessionBlameRow>> {
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.context(context.to_string())?);
     }
     Ok(records)
 }

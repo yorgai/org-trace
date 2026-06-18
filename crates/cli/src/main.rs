@@ -169,7 +169,7 @@ fn main() -> Result<()> {
             &store,
             selected_source_profile.as_ref(),
         )?,
-        Command::History { command } => handle_history(command, &source_profiles)?,
+        Command::History { command } => handle_history(command, &source_profiles, &store)?,
         Command::Sync { command } => match command {
             SyncCommand::Run(args) => handle_sync(&store, args.dry_run, args.remote, args.repo_id)?,
             SyncCommand::Push(args) => {

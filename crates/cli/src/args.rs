@@ -482,6 +482,16 @@ pub enum HistoryCommand {
         #[arg(long, value_enum, default_value_t = HistoryExportFormatArg::Json)]
         format: HistoryExportFormatArg,
     },
+    FileSessionBlame {
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -574,6 +584,19 @@ pub struct CiImportArgs {
 pub struct SourceScanArgs {
     #[arg(long)]
     pub write_defaults: bool,
+
+    #[arg(long)]
+    pub include: Vec<String>,
+
+    #[arg(long, value_enum, default_value_t = SourceScanFormatArg::Text)]
+    pub format: SourceScanFormatArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum SourceScanFormatArg {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Args)]

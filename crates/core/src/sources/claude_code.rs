@@ -5,8 +5,8 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::{
-    assistant_message_chunk, list_file_source_sessions, thinking_chunk, tool_call_chunk,
-    user_message_chunk, ActivityChunk, ImportedToolCall, NativeSessionMetadata,
+    assistant_message_chunk, list_file_source_sessions_with_filter, thinking_chunk,
+    tool_call_chunk, user_message_chunk, ActivityChunk, ImportedToolCall, NativeSessionMetadata,
     NativeSourceSession, SourceProfile, FUNCTION_EDIT_FILE, FUNCTION_RUN_COMMAND_LINE,
 };
 
@@ -23,7 +23,14 @@ pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
-    list_file_source_sessions(profile, limit, extract_jsonl_metadata)
+    let mut sessions = list_file_source_sessions_with_filter(
+        profile,
+        limit,
+        extract_jsonl_metadata,
+        is_claude_transcript_file,
+    )?;
+    attach_subagent_ids_to_parents(&mut sessions);
+    Ok(sessions)
 }
 
 pub(super) fn format_chunks(
@@ -174,6 +181,56 @@ pub(super) fn format_chunks(
     Ok(chunks)
 }
 
+fn is_claude_transcript_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+}
+
+fn attach_subagent_ids_to_parents(sessions: &mut [NativeSourceSession]) {
+    let mut subagent_ids_by_parent = HashMap::<String, Vec<String>>::new();
+    for session in sessions.iter() {
+        let Some(metadata) = session.metadata_json.as_ref() else {
+            continue;
+        };
+        if metadata.get("kind").and_then(Value::as_str) != Some("subagent") {
+            continue;
+        }
+        let Some(parent_session_id) = metadata.get("parentSessionId").and_then(Value::as_str)
+        else {
+            continue;
+        };
+        subagent_ids_by_parent
+            .entry(parent_session_id.to_string())
+            .or_default()
+            .push(session.external_session_id.clone());
+    }
+    for session in sessions.iter_mut() {
+        let Some(subagent_ids) = subagent_ids_by_parent.remove(&session.external_session_id) else {
+            continue;
+        };
+        let mut metadata = session.metadata_json.take().unwrap_or_else(|| json!({}));
+        metadata["subagentSessionIds"] = json!(subagent_ids);
+        session.metadata_json = Some(metadata);
+    }
+}
+
+fn parent_session_id_from_subagent_path(path: &Path) -> Option<String> {
+    let subagents_directory = path.parent()?;
+    if subagents_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("subagents")
+    {
+        return None;
+    }
+    subagents_directory
+        .parent()
+        .and_then(|parent_session_directory| parent_session_directory.file_name())
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+}
+
 fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
     if path
         .extension()
@@ -192,11 +249,27 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
     let mut output_tokens = 0_u64;
     let mut saw_input_tokens = false;
     let mut saw_output_tokens = false;
+    let mut saw_sidechain = parent_session_id_from_subagent_path(path).is_some();
+    let mut parent_session_id = parent_session_id_from_subagent_path(path);
+    let mut agent_id: Option<String> = None;
+    let mut attribution_agent: Option<String> = None;
 
     for value in lines {
         update_session_times(&mut metadata, value.get("timestamp"));
         set_first_path(&mut metadata.repo_path, value.get("cwd"));
         set_first_string(&mut metadata.branch, value.get("gitBranch"));
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            saw_sidechain = true;
+        }
+        set_first_string_value(
+            &mut parent_session_id,
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        set_first_string(&mut agent_id, value.get("agentId"));
+        set_first_string(&mut attribution_agent, value.get("attributionAgent"));
 
         let message = value.get("message");
         if metadata.title.is_none() && is_user_message(&value, message) {
@@ -231,6 +304,22 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
 
     metadata.input_tokens = saw_input_tokens.then_some(input_tokens);
     metadata.output_tokens = saw_output_tokens.then_some(output_tokens);
+    if saw_sidechain {
+        if let Some(parent_session_id) = parent_session_id.filter(|value| !value.is_empty()) {
+            let subagent_session_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("session");
+            metadata.listable = false;
+            metadata.metadata_json = Some(json!({
+                "kind": "subagent",
+                "subagentSessionId": subagent_session_id,
+                "parentSessionId": parent_session_id,
+                "claudeAgentId": agent_id,
+                "subagentType": attribution_agent,
+            }));
+        }
+    }
     Ok(metadata)
 }
 
@@ -391,6 +480,81 @@ mod tests {
         assert_eq!(chunks[0].source_line_number, Some(1));
         assert_eq!(chunks[2].source_line_number, Some(2));
         assert_eq!(chunks[2].source_message_id.as_deref(), Some("tool-1"));
+    }
+
+    #[test]
+    fn ignores_non_transcript_files() {
+        let root = temp_source_root("non-transcripts");
+        fs::write(root.join("settings.json"), "{}").expect("write settings");
+        fs::write(root.join("help.md"), "# Help").expect("write help");
+        fs::write(root.join("session.meta.json"), "{}").expect("write meta");
+        fs::write(
+            root.join("claude-session.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Real session\"}}\n",
+        )
+        .expect("write transcript");
+
+        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].external_session_id, "claude-session");
+    }
+
+    #[test]
+    fn links_claude_subagents_to_parent_sessions() {
+        let root = temp_source_root("subagents");
+        fs::write(
+            root.join("parent-session.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Use an agent\"}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-06-18T01:01:00Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Agent\"}]}}\n"
+            ),
+        )
+        .expect("write parent transcript");
+        let subagent_dir = root.join("parent-session").join("subagents");
+        fs::create_dir_all(&subagent_dir).expect("create subagent dir");
+        fs::write(
+            subagent_dir.join("agent-worker.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"worker\",\"sessionId\":\"parent-session\",\"message\":{\"role\":\"user\",\"content\":\"Investigate\"}}\n",
+                "{\"type\":\"assistant\",\"isSidechain\":true,\"agentId\":\"worker\",\"sessionId\":\"parent-session\",\"attributionAgent\":\"Explore\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Done\"}]}}\n"
+            ),
+        )
+        .expect("write subagent transcript");
+
+        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let parent = sessions
+            .iter()
+            .find(|session| session.external_session_id == "parent-session")
+            .expect("parent session");
+        let subagent = sessions
+            .iter()
+            .find(|session| session.external_session_id == "agent-worker")
+            .expect("subagent session");
+
+        assert!(parent.listable);
+        assert!(!subagent.listable);
+        assert_eq!(
+            parent
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("subagentSessionIds")),
+            Some(&json!(["agent-worker"]))
+        );
+        assert_eq!(
+            subagent
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("parentSessionId")),
+            Some(&json!("parent-session"))
+        );
+        assert_eq!(
+            subagent
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("subagentType")),
+            Some(&json!("Explore"))
+        );
     }
 
     #[test]

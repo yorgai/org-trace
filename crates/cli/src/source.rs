@@ -14,8 +14,11 @@ use brick_core::{
 #[cfg(test)]
 use brick_core::{DiscoveredSourceKind, DiscoveredSourcePath};
 use brick_protocol::ActorType;
+use serde::Serialize;
 
-use crate::args::{SourceCommand, SourceConfigArgs, SourceConfigureArgs, SourceScanArgs};
+use crate::args::{
+    SourceCommand, SourceConfigArgs, SourceConfigureArgs, SourceScanArgs, SourceScanFormatArg,
+};
 
 /// Executes source profile subcommands.
 pub fn handle_source(command: SourceCommand, profiles: &SourceProfileStore) -> Result<()> {
@@ -30,23 +33,92 @@ pub fn handle_source(command: SourceCommand, profiles: &SourceProfileStore) -> R
 }
 
 fn scan_sources(args: SourceScanArgs, profiles: &SourceProfileStore) -> Result<()> {
-    let discovered = discover_sources();
-    if discovered.is_empty() {
-        println!("source_scan_found=0");
-        return Ok(());
-    }
+    let discovered = discover_sources()
+        .into_iter()
+        .filter(|source| {
+            args.include.is_empty()
+                || args
+                    .include
+                    .iter()
+                    .any(|name| name == source.source.profile_name())
+        })
+        .collect::<Vec<_>>();
+    let mut written = Vec::new();
 
-    println!("source_scan_found={}", discovered.len());
-    for source in &discovered {
-        print_discovered_source(source);
-        if args.write_defaults {
+    if args.write_defaults {
+        for source in &discovered {
             profiles.write_profile(&profile_from_discovered_source(source))?;
+            written.push(source.source.profile_name().to_string());
         }
     }
-    if args.write_defaults {
-        println!("source_defaults_written={}", discovered.len());
+
+    match args.format {
+        SourceScanFormatArg::Text => print_source_scan_text(&discovered, &written),
+        SourceScanFormatArg::Json => print_source_scan_json(&discovered, &written)?,
     }
+
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SourceScanResponse {
+    sources: Vec<DiscoveredSourceDto>,
+    written: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveredSourceDto {
+    source_id: String,
+    app_id: String,
+    label: String,
+    paths: Vec<DiscoveredSourcePathDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveredSourcePathDto {
+    kind: String,
+    path: String,
+    exists: bool,
+}
+
+fn print_source_scan_text(discovered: &[DiscoveredSource], written: &[String]) {
+    println!("source_scan_found={}", discovered.len());
+    for source in discovered {
+        print_discovered_source(source);
+    }
+    if !written.is_empty() {
+        println!("source_defaults_written={}", written.len());
+    }
+}
+
+fn print_source_scan_json(discovered: &[DiscoveredSource], written: &[String]) -> Result<()> {
+    let sources = discovered
+        .iter()
+        .map(discovered_source_dto)
+        .collect::<Vec<_>>();
+    let response = SourceScanResponse {
+        sources,
+        written: written.to_vec(),
+    };
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn discovered_source_dto(source: &DiscoveredSource) -> DiscoveredSourceDto {
+    DiscoveredSourceDto {
+        source_id: source.source.profile_name().to_string(),
+        app_id: source.source.app_id().to_string(),
+        label: source.source.label().to_string(),
+        paths: source
+            .paths
+            .iter()
+            .map(|path| DiscoveredSourcePathDto {
+                kind: path.kind.label().to_string(),
+                path: path.path.display().to_string(),
+                exists: path.path.exists(),
+            })
+            .collect(),
+    }
 }
 
 fn configure_repo(args: SourceConfigArgs, profiles: &SourceProfileStore) -> Result<()> {

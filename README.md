@@ -152,13 +152,13 @@ cargo doc --workspace --no-deps
 `apps/lab-ui` is a small Vite/React dashboard for exercising the localhost server routes while developing Brick features.
 
 ```bash
-cargo run -p brick-server -- serve --bind 127.0.0.1:7821 --data-dir .brick-server
+cargo run -p brick-server -- serve --bind 127.0.0.1:5353 --data-dir .brick-server --enable-local-history --brick-bin /Users/laptop-h/.cargo/shared-target/debug/brick --repo-root "$PWD"
 cd apps/lab-ui
 npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5454>. The UI proxies `/api/*` to `http://127.0.0.1:7821` by default.
+Open <http://127.0.0.1:5454>. The UI proxies `/api/*` to `http://127.0.0.1:5353` by default.
 
 ## License
 

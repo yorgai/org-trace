@@ -289,6 +289,8 @@ fn session_from_row(
         lines_added: None,
         lines_removed: None,
         touched_files: Vec::new(),
+        listable: true,
+        metadata_json: None,
     })
 }
 

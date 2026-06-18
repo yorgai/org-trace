@@ -12,19 +12,37 @@ use crate::{
 
 use super::cursor_family::{
     composer_header_session, cursor_family_state_db_path,
-    format_chunks as format_cursor_family_chunks, open_state_db, read_kv_entries_with_prefix,
+    format_chunks as format_cursor_family_chunks, list_sessions_from_composer_data, open_state_db,
     read_kv_value, ComposerSessionOptions,
 };
 
 const CURSOR_IDE_SOURCE_ID: &str = "cursor_ide";
 const CURSOR_COMPOSER_HEADERS_KEY: &str = "composer.composerHeaders";
 const CURSOR_PLAN_REGISTRY_KEY: &str = "composer.planRegistry";
-const CURSOR_PLAN_REGISTRY_PREFIX: &str = "composer.planRegistry.";
+const CURSOR_IDE_COMPOSER_DATA_PARSER_VERSION: &str = "cursor-ide-composer-data-v1";
 const CURSOR_IDE_HEADERS_PARSER_VERSION: &str = "cursor-ide-composer-headers-v1";
 const CURSOR_IDE_PLAN_REGISTRY_PARSER_VERSION: &str = "cursor-ide-plan-registry-v1";
 const CURSOR_IDE_PROVIDER_SLUG: &str = CURSOR_IDE_SOURCE_ID;
 
 pub(super) fn list_sessions(
+    profile: &SourceProfile,
+    limit: Option<usize>,
+) -> Result<Vec<NativeSourceSession>> {
+    let options = ComposerSessionOptions {
+        source_id: CURSOR_IDE_SOURCE_ID,
+        parser_version: CURSOR_IDE_COMPOSER_DATA_PARSER_VERSION,
+        source_label: "Cursor",
+        include_context_tokens: true,
+        skip_best_of_n: true,
+    };
+    let sessions = list_sessions_from_composer_data(profile, limit, options)?;
+    if !sessions.is_empty() {
+        return Ok(sessions);
+    }
+    list_sessions_from_composer_headers(profile, limit)
+}
+
+fn list_sessions_from_composer_headers(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
@@ -161,21 +179,7 @@ fn read_plan_registry_entries(connection: &rusqlite::Connection) -> Result<Vec<(
                 .collect());
         }
     }
-    let mut entries = Vec::new();
-    for (key, value) in read_kv_entries_with_prefix(connection, CURSOR_PLAN_REGISTRY_PREFIX)? {
-        let Some(plan_id) = key.strip_prefix(CURSOR_PLAN_REGISTRY_PREFIX) else {
-            continue;
-        };
-        if plan_id.is_empty() || plan_id.contains('.') {
-            continue;
-        }
-        let plan: Value = serde_json::from_str(&value)
-            .with_context(|| format!("failed to parse Cursor plan registry JSON for key {key}"))?;
-        if let Some((external_plan_id, plan)) = plan_object(plan_id, &plan) {
-            entries.push((external_plan_id, plan));
-        }
-    }
-    Ok(entries)
+    Ok(Vec::new())
 }
 
 fn plan_object(plan_id: &str, plan: &Value) -> Option<(String, Value)> {
@@ -412,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_plans_from_per_plan_registry_keys() {
+    fn ignores_per_plan_registry_keys_to_avoid_broad_scan() {
         let path = temp_state_db("plan-registry-keys");
         let connection = create_cursor_kv_db(&path);
         let plan = serde_json::json!({
@@ -429,10 +433,230 @@ mod tests {
 
         let plans = list_plans(&profile(path)).expect("list cursor plans");
 
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].plan.external_plan_id, "plan-keyed");
-        assert_eq!(plans[0].plan.title.as_deref(), Some("Per key plan"));
-        assert_eq!(plans[0].edges.len(), 2);
+        assert_eq!(plans.len(), 0);
+    }
+
+    #[test]
+    fn extracts_sessions_from_cursor_composer_data() {
+        let path = temp_state_db("composer-data-sessions");
+        let connection = create_cursor_kv_db(&path);
+        let composer = serde_json::json!({
+            "composerId": "composer-data-1",
+            "name": "Implement from composer data",
+            "createdAt": 1_766_000_000_000_u64,
+            "lastUpdatedAt": 1_766_000_060_000_u64,
+            "workspaceIdentifier": {
+                "uri": { "fsPath": "/workspace/from-composer-data" }
+            },
+            "trackedGitRepos": [
+                {
+                    "repoPath": "/workspace/repo",
+                    "branches": [{ "branchName": "main" }]
+                }
+            ],
+            "modelConfig": { "modelName": "cursor-model" },
+            "contextTokensUsed": 42,
+            "filesChangedCount": 2,
+            "totalLinesAdded": 10,
+            "totalLinesRemoved": 3,
+            "originalFileStates": {
+                "file:///workspace/repo/src/lib.rs": {
+                    "firstEditBubbleId": "bubble-1"
+                }
+            },
+            "newlyCreatedFiles": [
+                {
+                    "uri": {
+                        "fsPath": "/workspace/repo/README.md"
+                    }
+                }
+            ]
+        });
+        let subagent = serde_json::json!({
+            "composerId": "composer-subagent-1",
+            "name": "Subagent worker",
+            "createdAt": 1_766_000_010_000_u64,
+            "lastUpdatedAt": 1_766_000_020_000_u64,
+            "subagentInfo": {
+                "subagentTypeName": "general",
+                "parentComposerId": "composer-data-1",
+                "toolCallId": "tool-call-1"
+            }
+        });
+        insert_cursor_kv(&connection, "composerData:composer-data-1", composer);
+        insert_cursor_kv(&connection, "composerData:composer-subagent-1", subagent);
+        drop(connection);
+
+        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+
+        assert_eq!(sessions.len(), 2);
+        let parent = sessions
+            .iter()
+            .find(|session| session.external_session_id == "composer-data-1")
+            .expect("parent composer session");
+        let subagent = sessions
+            .iter()
+            .find(|session| session.external_session_id == "composer-subagent-1")
+            .expect("subagent composer session");
+        assert_eq!(
+            parent.title.as_deref(),
+            Some("Implement from composer data")
+        );
+        assert_eq!(parent.input_tokens, Some(42));
+        assert_eq!(
+            parent.touched_files,
+            vec![
+                "/workspace/repo/README.md".to_string(),
+                "/workspace/repo/src/lib.rs".to_string()
+            ]
+        );
+        assert!(parent.listable);
+        assert_eq!(
+            parent
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("subagentSessionIds")),
+            Some(&json!(["composer-subagent-1"]))
+        );
+        assert!(!subagent.listable);
+        assert_eq!(
+            subagent
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("parentSessionId"))
+                .and_then(Value::as_str),
+            Some("composer-data-1")
+        );
+        assert_eq!(
+            parent.parser_version,
+            CURSOR_IDE_COMPOSER_DATA_PARSER_VERSION
+        );
+    }
+
+    #[test]
+    fn links_cursor_subagents_from_parent_side_ids() {
+        let path = temp_state_db("parent-side-subagents");
+        let connection = create_cursor_kv_db(&path);
+        let parent = serde_json::json!({
+            "composerId": "parent-composer-1",
+            "name": "Parent composer",
+            "createdAt": 1_766_000_000_000_u64,
+            "lastUpdatedAt": 1_766_000_060_000_u64,
+            "subagentComposerIds": ["child-composer-1"],
+            "modelConfig": { "modelName": "cursor-model" }
+        });
+        let child = serde_json::json!({
+            "composerId": "child-composer-1",
+            "name": "Child composer",
+            "createdAt": 1_766_000_010_000_u64,
+            "lastUpdatedAt": 1_766_000_020_000_u64,
+            "modelConfig": { "modelName": "cursor-model" }
+        });
+        insert_cursor_kv(&connection, "composerData:parent-composer-1", parent);
+        insert_cursor_kv(&connection, "composerData:child-composer-1", child);
+        drop(connection);
+
+        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let parent = sessions
+            .iter()
+            .find(|session| session.external_session_id == "parent-composer-1")
+            .expect("parent composer");
+        let child = sessions
+            .iter()
+            .find(|session| session.external_session_id == "child-composer-1")
+            .expect("child composer");
+
+        assert!(parent.listable);
+        assert!(!child.listable);
+        assert_eq!(
+            parent
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("subagentSessionIds")),
+            Some(&json!(["child-composer-1"]))
+        );
+        assert_eq!(
+            child
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("kind"))
+                .and_then(Value::as_str),
+            Some("subagent")
+        );
+        assert_eq!(
+            child
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("parentSessionId"))
+                .and_then(Value::as_str),
+            Some("parent-composer-1")
+        );
+    }
+
+    #[test]
+    fn marks_cursor_aborted_empty_composers_non_listable() {
+        let path = temp_state_db("aborted-empty-composer");
+        let connection = create_cursor_kv_db(&path);
+        let aborted_composer = serde_json::json!({
+            "composerId": "aborted-empty-composer-1",
+            "name": "Aborted empty composer",
+            "status": "aborted",
+            "isDraft": false,
+            "fullConversationHeadersOnly": [],
+            "conversationMap": {},
+            "modelConfig": { "modelName": "cursor-model" }
+        });
+        insert_cursor_kv(
+            &connection,
+            "composerData:aborted-empty-composer-1",
+            aborted_composer,
+        );
+        drop(connection);
+
+        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].listable);
+        assert_eq!(
+            sessions[0]
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("reason"))
+                .and_then(Value::as_str),
+            Some("cursor_aborted_empty_composer")
+        );
+    }
+
+    #[test]
+    fn marks_cursor_draft_composers_non_listable() {
+        let path = temp_state_db("draft-composer");
+        let connection = create_cursor_kv_db(&path);
+        let draft_composer = serde_json::json!({
+            "composerId": "draft-composer-1",
+            "text": "draft prompt",
+            "createdAt": 1_766_000_000_000_u64,
+            "lastUpdatedAt": 1_766_000_060_000_u64,
+            "fullConversationHeadersOnly": [],
+            "conversationMap": {},
+            "status": "none",
+            "isDraft": true,
+            "modelConfig": { "modelName": "cursor-model" }
+        });
+        insert_cursor_kv(&connection, "composerData:draft-composer-1", draft_composer);
+        drop(connection);
+
+        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].listable);
+        assert_eq!(
+            sessions[0]
+                .metadata_json
+                .as_ref()
+                .and_then(|metadata| metadata.get("kind"))
+                .and_then(Value::as_str),
+            Some("draft")
+        );
     }
 
     #[test]

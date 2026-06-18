@@ -73,6 +73,19 @@ Terminology:
 
 `brick history doctor --source <source|all> --format json` returns raw diagnostic rows for configured source providers. It is intentionally JSON-only and does not apply app rendering semantics. Each row reports profile presence/selection, provider and parser kind, configured path fields with existence/readability checks, provider metadata listing status or structured error string, indexed source-session/source-plan counts from `metadata.sqlite` when available, provider notes, and accumulated errors.
 
+### File-level session attribution
+
+`brick history file-session-blame --path <repo-relative-path> --format json` returns raw file/session attribution rows. The command name intentionally avoids `git blame`: rows are file-level, session-level evidence, not exact line authorship.
+
+The first projection merges two auditable sources:
+
+- Runtime provenance from the rebuildable SQLite cache: `diff.captured` events provide per-file additions/removals plus diff pointers, and `artifact.file_ref_recorded` events provide explicit file/session references.
+- Backfilled source metadata from `metadata.sqlite`: `source_sessions.touched_files_json` identifies files touched by external/native sessions, with `files_changed`, `lines_added`, `lines_removed`, source/app metadata, actor metadata where present, and pointers back to source storage.
+
+The JSON response includes `status` (`ok`, `empty`, or `error`), `errors`, and raw rows with `file_path`, `session_id` or `external_session_id`, `source_id` / `app_id`, actor fields, `evidence_kind`, `last_seen_at`, impact counts, `confidence`, and `source_pointer`. Empty results are explicit (`status = "empty"`), while runtime index rebuild/query failures or source metadata refresh/query failures are surfaced in `errors` rather than silently returning empty data.
+
+True line-level blame remains a separate future projection requiring commit/range mapping, patch hunk parsing, and correlation from session-level evidence to final file lines.
+
 ### Session export formatting
 
 `brick history export` is the specific-session export surface. JSON is canonical and loss-minimized. CSV is a convenience formatting for audit tables and spreadsheets.

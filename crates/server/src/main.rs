@@ -13,7 +13,7 @@ mod store;
 
 use args::{Cli, Command};
 use index::{rebuild_server_index, server_index_status};
-use routes::serve;
+use routes::{serve, LocalHistoryBridge};
 use store::ServerStore;
 
 #[tokio::main]
@@ -21,7 +21,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { bind, data_dir } => serve(bind, ServerStore::new(data_dir)).await?,
+        Command::Serve {
+            bind,
+            data_dir,
+            enable_local_history,
+            brick_bin,
+            repo_root,
+        } => {
+            let history_bridge =
+                enable_local_history.then(|| LocalHistoryBridge::new(brick_bin, repo_root));
+            serve(bind, ServerStore::new(data_dir), history_bridge).await?
+        }
         Command::RebuildIndex { data_dir, repo_id } => {
             let store = ServerStore::new(data_dir);
             let events = store.read_events_for_repo(repo_id.as_deref())?;
