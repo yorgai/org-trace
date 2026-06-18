@@ -4,7 +4,7 @@ status: active
 
 # Session Metadata Structure
 
-This document tracks Brick's source-session metadata structure and how each native source populates it. It is the working contract for `<BRICK_HOME>/metadata.sqlite` and `brick history sessions --format json`.
+This document tracks Brick's source-session metadata structure and how each native source populates it. It is the working contract for `<BRICK_HOME>/metadata.sqlite`, `brick history sessions --format json`, and `brick history export --schema audit-v1|source-metadata-v1`.
 
 ## Boundary
 
@@ -125,6 +125,17 @@ Token fields are optional because not every source exposes them.
 | Core metadata | `session.id`, `session.title`, `session.directory`, `session.model`, `time_created`, `time_updated`, archive flags. |
 | Token metadata | `tokens_input + tokens_cache_read + tokens_cache_write` as input; `tokens_output + tokens_reasoning` as output. |
 | Full chunks | Lazy DB replay from `part` joined to `message`. |
+
+## Shared session export formats
+
+Brick keeps the public export surface intentionally small. Source-specific providers may expose rich internal details, but user-facing auditing should converge on one of these schemas.
+
+| Schema | Command | Purpose | Content boundary |
+| --- | --- | --- | --- |
+| `audit-v1` | `brick history export --source <source> --session-id <id> --schema audit-v1 --format json` | Stable cross-provider audit packet for humans, reviewers, and ORGII ingestion. | Normalized source, session, token, impact, evidence, and chunk sections. |
+| `source-metadata-v1` | `brick history export --source <source> --session-id <id> --schema source-metadata-v1 --format json` | Loss-minimized export of the current metadata index row for debugging and provider parity checks. | Mirrors first-class `source_sessions` metadata plus provider extras. |
+
+Both schemas include a `chunks` array. It is empty for metadata-only providers until lazy chunk replay lands for the source. This preserves the final audit shape while keeping full transcript content out of `metadata.sqlite`.
 
 ## Current implementation status
 

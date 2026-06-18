@@ -19,7 +19,12 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::args::{HistoryCommand, HistoryFormatArg};
+use crate::args::{HistoryCommand, HistoryExportSchemaArg, HistoryFormatArg};
+
+const HISTORY_EXPORT_SCHEMA_AUDIT_V1: &str = "audit-v1";
+const HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1: &str = "source-metadata-v1";
+const EXPORT_AVAILABILITY_METADATA_ONLY: &str = "metadata_only";
+const EXPORT_REFRESH_LIMIT: usize = 10_000;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HistorySourcesResponse {
@@ -100,7 +105,7 @@ pub struct HistoryChunksResponse {
     pub chunks: Vec<ActivityChunkDto>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Eq, Clone)]
 pub struct ActivityChunkDto {
     pub chunk_id: String,
     pub source_id: String,
@@ -110,6 +115,101 @@ pub struct ActivityChunkDto {
     pub ended_at: Option<String>,
     pub path: Option<String>,
     pub text: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AuditSessionExportV1 {
+    pub schema: String,
+    pub exported_at: String,
+    pub source: AuditSourceRef,
+    pub session: AuditSessionMetadata,
+    pub token_usage: AuditTokenUsage,
+    pub impact: AuditImpact,
+    pub evidence: AuditEvidenceRef,
+    pub chunks: Vec<ActivityChunkDto>,
+    pub source_metadata: Option<Value>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AuditSourceRef {
+    pub source_id: String,
+    pub app_id: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AuditSessionMetadata {
+    pub session_id: String,
+    pub external_session_id: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AuditTokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AuditImpact {
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AuditEvidenceRef {
+    pub availability: String,
+    pub source_path: String,
+    pub source_uri: Option<String>,
+    pub source_size_bytes: Option<u64>,
+    pub source_modified_at: Option<String>,
+    pub parser_version: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SourceMetadataSessionExportV1 {
+    pub schema: String,
+    pub exported_at: String,
+    pub source_session: SourceMetadataSessionRow,
+    pub chunks: Vec<ActivityChunkDto>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SourceMetadataSessionRow {
+    pub source_id: String,
+    pub app_id: String,
+    pub external_session_id: String,
+    pub title: Option<String>,
+    pub name: Option<String>,
+    pub source_path: Option<String>,
+    pub source_uri: Option<String>,
+    pub source_mtime: Option<String>,
+    pub source_size: Option<u64>,
+    pub source_fingerprint: Option<String>,
+    pub parser_version: Option<String>,
+    pub session_created_at: Option<String>,
+    pub session_updated_at: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub touched_files: Vec<String>,
+    pub listable: bool,
+    pub discovered_at: String,
+    pub last_seen_at: String,
+    pub metadata_json: Option<Value>,
 }
 
 /// Executes read-only history subcommands and emits machine-readable JSON.
@@ -173,6 +273,32 @@ pub fn handle_history(command: HistoryCommand, profiles: &SourceProfileStore) ->
                 session_id,
                 chunks: Vec::new(),
             })
+        }
+        HistoryCommand::Export {
+            source,
+            session_id,
+            schema,
+            format,
+        } => {
+            ensure_json(format);
+            let profile = read_profile(profiles, &source)?;
+            let mut metadata_db = MetadataDb::open_global()?;
+            refresh_profiles_to_metadata(
+                &mut metadata_db,
+                std::slice::from_ref(&profile),
+                EXPORT_REFRESH_LIMIT,
+            )?;
+            let record = metadata_db
+                .get_source_session(&profile.name, &session_id)?
+                .ok_or_else(|| {
+                    anyhow!("source session not found: {}/{}", profile.name, session_id)
+                })?;
+            match schema {
+                HistoryExportSchemaArg::AuditV1 => print_json(&build_audit_export(record)),
+                HistoryExportSchemaArg::SourceMetadataV1 => {
+                    print_json(&build_source_metadata_export(record))
+                }
+            }
         }
     }
 }
@@ -241,6 +367,106 @@ fn build_recent_paths_response(
         limit,
         paths,
     })
+}
+
+fn build_audit_export(record: SourceSessionRecord) -> AuditSessionExportV1 {
+    let exported_at = Utc::now().to_rfc3339();
+    let app_id = app_id_from_metadata(&record);
+    let touched_files = touched_files_from_record(&record);
+    let source_path = source_path_display(&record);
+    let repo_path = record
+        .repo_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let total_tokens = total_tokens(record.input_tokens, record.output_tokens);
+    AuditSessionExportV1 {
+        schema: HISTORY_EXPORT_SCHEMA_AUDIT_V1.to_string(),
+        exported_at,
+        source: AuditSourceRef {
+            source_id: record.source_id.clone(),
+            app_id,
+        },
+        session: AuditSessionMetadata {
+            session_id: record.external_session_id.clone(),
+            external_session_id: record.external_session_id,
+            title: record.title,
+            model: record.model,
+            created_at: record.session_created_at.map(|time| time.to_rfc3339()),
+            updated_at: record.session_updated_at.map(|time| time.to_rfc3339()),
+            repo_path,
+            branch: record.branch,
+        },
+        token_usage: AuditTokenUsage {
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            total_tokens,
+        },
+        impact: AuditImpact {
+            files_changed: record.files_changed,
+            lines_added: record.lines_added,
+            lines_removed: record.lines_removed,
+            touched_files,
+        },
+        evidence: AuditEvidenceRef {
+            availability: EXPORT_AVAILABILITY_METADATA_ONLY.to_string(),
+            source_path,
+            source_uri: record.source_uri,
+            source_size_bytes: record.source_size,
+            source_modified_at: record.source_mtime.map(|time| time.to_rfc3339()),
+            parser_version: record.parser_version,
+        },
+        chunks: Vec::new(),
+        source_metadata: record.metadata_json,
+    }
+}
+
+fn build_source_metadata_export(record: SourceSessionRecord) -> SourceMetadataSessionExportV1 {
+    let exported_at = Utc::now().to_rfc3339();
+    let app_id = app_id_from_metadata(&record);
+    let touched_files = touched_files_from_record(&record);
+    let source_path = record
+        .source_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let repo_path = record
+        .repo_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let total_tokens = total_tokens(record.input_tokens, record.output_tokens);
+    SourceMetadataSessionExportV1 {
+        schema: HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1.to_string(),
+        exported_at,
+        source_session: SourceMetadataSessionRow {
+            source_id: record.source_id,
+            app_id,
+            external_session_id: record.external_session_id,
+            title: record.title,
+            name: record.name,
+            source_path,
+            source_uri: record.source_uri,
+            source_mtime: record.source_mtime.map(|time| time.to_rfc3339()),
+            source_size: record.source_size,
+            source_fingerprint: record.source_fingerprint,
+            parser_version: record.parser_version,
+            session_created_at: record.session_created_at.map(|time| time.to_rfc3339()),
+            session_updated_at: record.session_updated_at.map(|time| time.to_rfc3339()),
+            model: record.model,
+            input_tokens: record.input_tokens,
+            output_tokens: record.output_tokens,
+            total_tokens,
+            repo_path,
+            branch: record.branch,
+            files_changed: record.files_changed,
+            lines_added: record.lines_added,
+            lines_removed: record.lines_removed,
+            touched_files,
+            listable: record.listable,
+            discovered_at: record.discovered_at.to_rfc3339(),
+            last_seen_at: record.last_seen_at.to_rfc3339(),
+            metadata_json: record.metadata_json,
+        },
+        chunks: Vec::new(),
+    }
 }
 
 fn source_row(profile: SourceProfile, selected: Option<&str>) -> HistorySourceRow {
@@ -449,6 +675,8 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    use chrono::TimeZone;
+
     use super::*;
 
     fn temp_repo_root(name: &str) -> PathBuf {
@@ -571,6 +799,94 @@ mod tests {
             format_system_time(UNIX_EPOCH + Duration::from_secs(1)).expect("format timestamp");
 
         assert_eq!(formatted, "1970-01-01T00:00:01+00:00");
+    }
+
+    fn source_session_record_for_export() -> SourceSessionRecord {
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 6, 18, 1, 2, 3)
+            .single()
+            .expect("valid timestamp");
+        let updated_at = Utc
+            .with_ymd_and_hms(2026, 6, 18, 1, 3, 4)
+            .single()
+            .expect("valid timestamp");
+        SourceSessionRecord {
+            source_id: "claude_code".to_string(),
+            external_session_id: "session-1".to_string(),
+            title: Some("Investigate bug".to_string()),
+            name: Some("Investigate bug".to_string()),
+            source_path: Some(PathBuf::from("/tmp/session-1.jsonl")),
+            source_uri: Some("file:///tmp/session-1.jsonl".to_string()),
+            source_mtime: Some(updated_at),
+            source_size: Some(123),
+            source_fingerprint: Some("sha256:abc".to_string()),
+            parser_version: Some("claude-code-jsonl-v1".to_string()),
+            session_created_at: Some(created_at),
+            session_updated_at: Some(updated_at),
+            model: Some("claude-sonnet".to_string()),
+            input_tokens: Some(100),
+            output_tokens: Some(25),
+            repo_path: Some(PathBuf::from("/tmp/repo")),
+            branch: Some("main".to_string()),
+            files_changed: Some(2),
+            lines_added: Some(10),
+            lines_removed: Some(3),
+            touched_files_json: Some(json!(["src/lib.rs", "README.md"])),
+            listable: true,
+            discovered_at: created_at,
+            last_seen_at: updated_at,
+            created_at,
+            updated_at,
+            metadata_json: Some(json!({ "app_id": "claude_code" })),
+        }
+    }
+
+    #[test]
+    fn audit_export_serializes_universal_session_shape() {
+        let response = build_audit_export(source_session_record_for_export());
+
+        assert_eq!(response.schema, HISTORY_EXPORT_SCHEMA_AUDIT_V1);
+        assert_eq!(response.source.source_id, "claude_code");
+        assert_eq!(response.session.session_id, "session-1");
+        assert_eq!(response.token_usage.total_tokens, Some(125));
+        assert_eq!(
+            response.impact.touched_files,
+            vec!["src/lib.rs", "README.md"]
+        );
+        assert_eq!(
+            response.evidence.availability,
+            EXPORT_AVAILABILITY_METADATA_ONLY
+        );
+        assert!(response.chunks.is_empty());
+        let serialized = serde_json::to_value(&response).expect("serialize audit export");
+        assert_eq!(serialized["schema"], HISTORY_EXPORT_SCHEMA_AUDIT_V1);
+        assert_eq!(serialized["session"]["model"], "claude-sonnet");
+        assert_eq!(serialized["token_usage"]["total_tokens"], 125);
+    }
+
+    #[test]
+    fn source_metadata_export_preserves_index_fields() {
+        let response = build_source_metadata_export(source_session_record_for_export());
+
+        assert_eq!(response.schema, HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1);
+        assert_eq!(response.source_session.source_id, "claude_code");
+        assert_eq!(response.source_session.external_session_id, "session-1");
+        assert_eq!(response.source_session.source_size, Some(123));
+        assert_eq!(
+            response.source_session.source_fingerprint.as_deref(),
+            Some("sha256:abc")
+        );
+        assert_eq!(response.source_session.total_tokens, Some(125));
+        assert!(response.chunks.is_empty());
+        let serialized = serde_json::to_value(&response).expect("serialize metadata export");
+        assert_eq!(
+            serialized["schema"],
+            HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1
+        );
+        assert_eq!(
+            serialized["source_session"]["parser_version"],
+            "claude-code-jsonl-v1"
+        );
     }
 
     #[test]

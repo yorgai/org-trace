@@ -47,6 +47,8 @@ cargo run -q -p brick -- history sources --format json
 cargo run -q -p brick -- history sessions --source claude_code --limit 20 --format json
 cargo run -q -p brick -- history recent-paths --source all --limit 20 --format json
 cargo run -q -p brick -- history chunks --source claude_code --session-id <native-id> --format json
+cargo run -q -p brick -- history export --source claude_code --session-id <native-id> --schema audit-v1 --format json
+cargo run -q -p brick -- history export --source claude_code --session-id <native-id> --schema source-metadata-v1 --format json
 ```
 
 Create an Org, Project, Mission, agent-friendly current Session, and Artifacts:

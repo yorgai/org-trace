@@ -269,6 +269,15 @@ impl MetadataDb {
         )?;
         usize::try_from(count).context("metadata source-session count exceeds usize")
     }
+
+    /// Reads one source-session row by source and external session ID.
+    pub fn get_source_session(
+        &self,
+        source_id: &str,
+        external_session_id: &str,
+    ) -> Result<Option<SourceSessionRecord>> {
+        read_source_session(&self.connection, source_id, external_session_id)
+    }
 }
 
 fn prepare_schema(connection: &Connection) -> Result<()> {
