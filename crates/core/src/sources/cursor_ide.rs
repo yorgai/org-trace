@@ -11,13 +11,14 @@ use crate::{
 };
 
 use super::cursor_family::{
-    composer_header_session, cursor_family_state_db_path,
+    apply_composer_data_flags, composer_header_session, cursor_family_state_db_path,
     format_chunks as format_cursor_family_chunks, list_sessions_from_composer_data, open_state_db,
     read_kv_value, ComposerSessionOptions,
 };
 
 const CURSOR_IDE_SOURCE_ID: &str = "cursor_ide";
 const CURSOR_COMPOSER_HEADERS_KEY: &str = "composer.composerHeaders";
+const CURSOR_COMPOSER_DATA_PREFIX: &str = "composerData:";
 const CURSOR_PLAN_REGISTRY_KEY: &str = "composer.planRegistry";
 const CURSOR_IDE_COMPOSER_DATA_PARSER_VERSION: &str = "cursor-ide-composer-data-v1";
 const CURSOR_IDE_HEADERS_PARSER_VERSION: &str = "cursor-ide-composer-headers-v1";
@@ -28,6 +29,16 @@ pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
+    // Composer headers are the authoritative session list and carry the rich
+    // metadata (name, model, repo, branch, impact stats). The per-composer
+    // `composerData:` rows only hold conversation bubbles plus the
+    // draft/subagent/parent listability flags, so we merge those flags onto the
+    // header-derived sessions. When headers are absent (older Cursor state DBs)
+    // we fall back to the composerData-only path.
+    let header_sessions = list_sessions_from_composer_headers(profile, limit)?;
+    if !header_sessions.is_empty() {
+        return Ok(header_sessions);
+    }
     let options = ComposerSessionOptions {
         source_id: CURSOR_IDE_SOURCE_ID,
         parser_version: CURSOR_IDE_COMPOSER_DATA_PARSER_VERSION,
@@ -35,11 +46,7 @@ pub(super) fn list_sessions(
         include_context_tokens: true,
         skip_best_of_n: true,
     };
-    let sessions = list_sessions_from_composer_data(profile, limit, options)?;
-    if !sessions.is_empty() {
-        return Ok(sessions);
-    }
-    list_sessions_from_composer_headers(profile, limit)
+    list_sessions_from_composer_data(profile, limit, options)
 }
 
 fn list_sessions_from_composer_headers(
@@ -88,6 +95,25 @@ fn list_sessions_from_composer_headers(
             .transpose()
         })
         .collect::<Result<Vec<_>>>()?;
+    // Merge draft/subagent/parent-link flags from each session's composerData
+    // row; headers alone do not expose listability state.
+    for session in sessions.iter_mut() {
+        let composer_data_key = format!(
+            "{CURSOR_COMPOSER_DATA_PREFIX}{}",
+            session.external_session_id
+        );
+        let Some(composer_data_json) = read_kv_value(&connection, &composer_data_key)? else {
+            continue;
+        };
+        let Ok(composer_data) = serde_json::from_str::<Value>(&composer_data_json) else {
+            continue;
+        };
+        apply_composer_data_flags(
+            session,
+            &session.external_session_id.clone(),
+            &composer_data,
+        );
+    }
     sessions.sort_by(|left, right| {
         right
             .session_updated_at
@@ -716,6 +742,71 @@ mod tests {
         assert_eq!(
             sessions[0].parser_version,
             CURSOR_IDE_HEADERS_PARSER_VERSION
+        );
+    }
+
+    #[test]
+    fn merges_composer_data_subagent_flag_onto_header_session() {
+        let path = temp_state_db("headers-subagent-merge");
+        let connection = create_cursor_kv_db(&path);
+        let headers = serde_json::json!({
+            "allComposers": {
+                "composer-sub-1": {
+                    "name": "Subagent run",
+                    "createdAt": 1_766_000_000_000_u64,
+                    "lastUpdatedAt": 1_766_000_060_000_u64,
+                    "trackedGitRepos": [
+                        {
+                            "repoPath": "/workspace/repo",
+                            "branches": [{ "branchName": "main" }]
+                        }
+                    ],
+                    "modelConfig": { "modelName": "cursor-model" }
+                }
+            }
+        });
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                [CURSOR_COMPOSER_HEADERS_KEY, &headers.to_string()],
+            )
+            .expect("insert headers");
+        let composer_data = serde_json::json!({
+            "composerId": "composer-sub-1",
+            "fullConversationHeadersOnly": [{ "bubbleId": "user-1" }],
+            "subagentInfo": {
+                "parentComposerId": "composer-parent-1",
+                "toolCallId": "tool-7",
+                "subagentTypeName": "explorer"
+            }
+        });
+        insert_cursor_kv(&connection, "composerData:composer-sub-1", composer_data);
+        drop(connection);
+
+        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("Subagent run"));
+        assert_eq!(
+            sessions[0].repo_path.as_deref(),
+            Some(Path::new("/workspace/repo"))
+        );
+        assert_eq!(
+            sessions[0].parser_version,
+            CURSOR_IDE_HEADERS_PARSER_VERSION
+        );
+        assert!(!sessions[0].listable);
+        let metadata = sessions[0]
+            .metadata_json
+            .as_ref()
+            .expect("subagent metadata");
+        assert_eq!(
+            metadata.get("kind").and_then(Value::as_str),
+            Some("subagent")
+        );
+        assert_eq!(
+            metadata.get("parentSessionId").and_then(Value::as_str),
+            Some("composer-parent-1")
         );
     }
 

@@ -336,17 +336,33 @@ fn composer_data_session(
     else {
         return Ok(None);
     };
-    if let Some(parent_link_metadata) = parent_link_metadata(&composer) {
-        session.metadata_json = Some(parent_link_metadata);
+    apply_composer_data_flags(&mut session, &composer_id, &composer);
+    Ok(Some(session))
+}
+
+/// Merges draft/subagent/parent-link listability flags derived from a
+/// `composerData:` row into a session. Shared by the composerData-first path
+/// and the headers-authoritative path so flag semantics stay identical no
+/// matter which path produced the base session.
+pub(in crate::sources) fn apply_composer_data_flags(
+    session: &mut NativeSourceSession,
+    composer_id: &str,
+    composer: &Value,
+) {
+    if let Some(parent_link_metadata) = parent_link_metadata(composer) {
+        session.metadata_json = Some(merge_metadata(
+            session.metadata_json.take(),
+            parent_link_metadata,
+        ));
     }
-    if let Some(subagent_metadata) = subagent_metadata(&composer_id, &composer) {
+    if let Some(subagent_metadata) = subagent_metadata(composer_id, composer) {
         session.listable = false;
         session.metadata_json = Some(merge_metadata(
             session.metadata_json.take(),
             subagent_metadata,
         ));
     } else if let Some(non_listable_metadata) =
-        non_listable_composer_metadata(&composer_id, &composer)
+        non_listable_composer_metadata(composer_id, composer)
     {
         session.listable = false;
         session.metadata_json = Some(merge_metadata(
@@ -354,7 +370,6 @@ fn composer_data_session(
             non_listable_metadata,
         ));
     }
-    Ok(Some(session))
 }
 
 fn parent_link_metadata(composer: &Value) -> Option<Value> {
