@@ -37,6 +37,54 @@ const EXPORT_REFRESH_LIMIT: usize = SOURCE_INDEX_REFRESH_LIMIT;
 /// Version of the `brick history` adapter contract this binary implements.
 pub const HISTORY_CONTRACT_VERSION: u32 = 1;
 
+/// Truncates every long string value inside a chunk's `args`/`result` so a single
+/// huge tool output (e.g. a multi-KB command stdout) cannot blow up a paginated
+/// listing. Each truncated value is replaced with its head plus a marker that
+/// tells the caller exactly how to refetch the full chunk untruncated.
+fn truncate_chunk_fields(chunk: &mut ActivityChunk, max_bytes: usize, absolute_offset: usize) {
+    truncate_value(&mut chunk.args, max_bytes, absolute_offset);
+    truncate_value(&mut chunk.result, max_bytes, absolute_offset);
+}
+
+/// Recursively truncates string leaves over `max_bytes`, descending into arrays
+/// and objects. Non-string scalars are left untouched.
+fn truncate_value(value: &mut Value, max_bytes: usize, absolute_offset: usize) {
+    match value {
+        Value::String(text) => {
+            if text.len() > max_bytes {
+                *text = truncate_string(text, max_bytes, absolute_offset);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                truncate_value(item, max_bytes, absolute_offset);
+            }
+        }
+        Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                truncate_value(item, max_bytes, absolute_offset);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keeps the first `max_bytes` of `text` (cut on a UTF-8 char boundary) and
+/// appends a marker recording the original byte length and the exact refetch
+/// command (`--offset N --limit 1 --max-field-bytes 0`) for the full value.
+fn truncate_string(text: &str, max_bytes: usize, absolute_offset: usize) -> String {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}…[truncated, full {} bytes — refetch: --offset {} --limit 1 --max-field-bytes 0]",
+        &text[..end],
+        text.len(),
+        absolute_offset
+    )
+}
+
 /// Prints machine-readable Brick version and schema info for adapter gating.
 pub fn print_version(format: HistoryFormatArg) -> Result<()> {
     ensure_json(format);
@@ -429,6 +477,7 @@ pub fn handle_history(
             session_id,
             limit,
             offset,
+            max_field_bytes,
             format,
         } => {
             ensure_json(format);
@@ -446,8 +495,14 @@ pub fn handle_history(
                 })?;
             let all_chunks = format_chunks_for_record(&record)?;
             let total_chunks = all_chunks.len();
-            let page: Vec<_> = all_chunks.into_iter().skip(offset).take(limit).collect();
+            let mut page: Vec<_> = all_chunks.into_iter().skip(offset).take(limit).collect();
             let returned = page.len();
+            if max_field_bytes > 0 {
+                for (index, chunk) in page.iter_mut().enumerate() {
+                    let absolute = offset + index;
+                    truncate_chunk_fields(chunk, max_field_bytes, absolute);
+                }
+            }
             print_json(&HistoryChunksResponse {
                 source_id: source,
                 session_id,
@@ -1721,6 +1776,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn truncate_string_keeps_short_values_via_value_walker() {
+        let mut value = json!("short");
+        truncate_value(&mut value, 100, 0);
+        assert_eq!(value, json!("short"));
+    }
+
+    #[test]
+    fn truncate_value_cuts_long_string_and_records_refetch() {
+        let mut value = json!("x".repeat(5000));
+        truncate_value(&mut value, 100, 7);
+        let text = value.as_str().expect("string");
+        assert!(text.len() < 5000);
+        assert!(text.contains("full 5000 bytes"));
+        assert!(text.contains("--offset 7 --limit 1 --max-field-bytes 0"));
+    }
+
+    #[test]
+    fn truncate_value_descends_into_nested_objects_and_arrays() {
+        let mut value = json!({
+            "output": "y".repeat(3000),
+            "nested": { "deep": ["z".repeat(3000), "ok"] },
+            "small": "fine",
+            "count": 42,
+        });
+        truncate_value(&mut value, 50, 2);
+        assert!(value["output"].as_str().unwrap().contains("truncated"));
+        assert!(value["nested"]["deep"][0]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+        assert_eq!(value["nested"]["deep"][1], json!("ok"));
+        assert_eq!(value["small"], json!("fine"));
+        assert_eq!(value["count"], json!(42)); // non-strings untouched
+    }
+
+    #[test]
+    fn truncate_string_cuts_on_utf8_char_boundary() {
+        // Each '中' is 3 bytes; a max of 7 must not split the 3rd char.
+        let text = "中".repeat(10);
+        let out = truncate_string(&text, 7, 0);
+        // Head is valid UTF-8 (no panic) and shorter than original.
+        assert!(out.starts_with("中中"));
+        assert!(out.contains("truncated"));
+    }
 
     fn temp_repo_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

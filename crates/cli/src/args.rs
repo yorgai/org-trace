@@ -485,6 +485,9 @@ pub enum HistoryCommand {
         limit: usize,
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// Truncate any string value longer than this many bytes (0 disables).
+        #[arg(long, default_value_t = 2000)]
+        max_field_bytes: usize,
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
