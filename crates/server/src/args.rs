@@ -30,6 +30,10 @@ pub enum Command {
         brick_bin: PathBuf,
         #[arg(long)]
         repo_root: Option<PathBuf>,
+        /// Require `Authorization: Bearer <token>` on all routes except
+        /// `/health`. When unset the server stays open (append-only MVP).
+        #[arg(long, env = "BRICK_SERVER_AUTH_TOKEN")]
+        auth_token: Option<String>,
     },
     RebuildIndex {
         #[arg(long, default_value = ".brick-server")]

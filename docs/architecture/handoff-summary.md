@@ -599,14 +599,20 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions
+### 8. Server auth and repo/org permissions — PARTIAL
 
-The server is intentionally unauthenticated MVP. Before real team/self-host usage, add:
+First slice landed: optional bearer-token auth. `brick-server serve --auth-token
+<token>` (or `BRICK_SERVER_AUTH_TOKEN`) requires `Authorization: Bearer <token>`
+on every route except `/health`; mismatches return 401. When unset the server
+stays open (append-only MVP, unchanged), so this is non-breaking. Implemented as
+an axum `from_fn_with_state` middleware layered on the protected sub-router, with
+unit + live verification.
 
-- repo/org authorization
-- write tokens
-- read tokens
-- push/pull auth headers
+Still needed before real team/self-host usage:
+
+- repo/org authorization scopes (tokens are global, not per-repo/org yet)
+- separate read vs write tokens
+- multiple tokens / token issuance (`create-admin` is still a stub)
 - audit events for sync identity
 
 ## Design cautions

@@ -32,6 +32,23 @@ pub struct AppState {
     pub local_history: Option<LocalHistoryBridge>,
 }
 
+/// Optional bearer-token gate. When `Some`, every route except `/health`
+/// requires `Authorization: Bearer <token>`. When `None`, the server stays
+/// open (append-only MVP behavior). This is the first slice of server auth;
+/// per-repo/org scopes and read/write token tiers remain future work.
+#[derive(Clone)]
+pub struct AuthConfig {
+    token: Arc<String>,
+}
+
+impl AuthConfig {
+    pub fn new(token: String) -> Self {
+        Self {
+            token: Arc::new(token),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalHistoryBridge {
     brick_bin: Arc<PathBuf>,
@@ -77,9 +94,16 @@ struct SourceIndexRequest {
 }
 
 /// Builds the self-hosted server router.
-pub fn build_router(store: ServerStore, local_history: Option<LocalHistoryBridge>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+pub fn build_router(
+    store: ServerStore,
+    local_history: Option<LocalHistoryBridge>,
+    auth: Option<AuthConfig>,
+) -> Router {
+    let state = AppState {
+        store: Arc::new(store),
+        local_history,
+    };
+    let protected = Router::new()
         .route("/v1/events", get(list_events).post(push_events))
         .route("/v1/index/status", get(global_index_status))
         .route("/v1/sessions", get(global_sessions))
@@ -106,11 +130,41 @@ pub fn build_router(store: ServerStore, local_history: Option<LocalHistoryBridge
             get(list_repo_events).post(push_repo_events),
         )
         .route("/v1/repos/:repo_id/index/status", get(repo_index_status))
-        .route("/v1/repos/:repo_id/sessions", get(repo_sessions))
-        .with_state(AppState {
-            store: Arc::new(store),
-            local_history,
-        })
+        .route("/v1/repos/:repo_id/sessions", get(repo_sessions));
+    let protected = if let Some(auth) = auth {
+        protected.layer(axum::middleware::from_fn_with_state(
+            auth,
+            require_bearer_token,
+        ))
+    } else {
+        protected
+    };
+    // `/health` is always reachable so liveness probes work without a token.
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
+        .with_state(state)
+}
+
+/// Rejects requests lacking a valid `Authorization: Bearer <token>` header.
+async fn require_bearer_token(
+    State(auth): State<AuthConfig>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if token == auth.token.as_str() => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid bearer token" })),
+        )
+            .into_response(),
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -527,11 +581,20 @@ pub async fn serve(
     bind: String,
     store: ServerStore,
     local_history: Option<LocalHistoryBridge>,
+    auth: Option<AuthConfig>,
 ) -> Result<()> {
     store.init()?;
-    let app = build_router(store, local_history);
+    let authenticated = auth.is_some();
+    let app = build_router(store, local_history, auth);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    println!("brick-server listening on http://{bind}");
+    println!(
+        "brick-server listening on http://{bind} (auth: {})",
+        if authenticated {
+            "bearer-token"
+        } else {
+            "disabled"
+        }
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -588,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn health_route_is_registered() {
         let store = ServerStore::new(temp_data_dir("health"));
-        let app = build_router(store, None);
+        let app = build_router(store, None, None);
         let routes = app.into_make_service();
         let _ = routes;
     }
@@ -596,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn local_history_routes_require_explicit_enablement() {
         let store = ServerStore::new(temp_data_dir("history-disabled"));
-        let app = build_router(store, None);
+        let app = build_router(store, None, None);
 
         let response = app
             .oneshot(
@@ -615,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn repo_events_route_pushes_and_lists_scoped_events() {
         let store = ServerStore::new(temp_data_dir("repo-events"));
-        let app = build_router(store, None);
+        let app = build_router(store, None, None);
         let request = PushEventsRequest {
             events: vec![event(None)],
         };
@@ -658,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn repo_events_route_rejects_mismatched_repo() {
         let store = ServerStore::new(temp_data_dir("repo-mismatch"));
-        let app = build_router(store, None);
+        let app = build_router(store, None, None);
         let request = PushEventsRequest {
             events: vec![event(Some("repo-b"))],
         };
@@ -677,5 +740,68 @@ mod tests {
             .expect("post events");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn auth_token_gates_protected_routes_but_not_health() {
+        let store = ServerStore::new(temp_data_dir("auth"));
+        let app = build_router(store, None, Some(AuthConfig::new("s3cret".to_string())));
+
+        // /health stays open without a token.
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("health request");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        // A protected route with no token is rejected.
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/sessions")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("unauthed request");
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        // A protected route with the wrong token is rejected.
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/sessions")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("wrong-token request");
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        // The correct token passes the gate (route then handles normally).
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/sessions")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("authed request");
+        assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
     }
 }

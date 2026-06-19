@@ -13,7 +13,7 @@ mod store;
 
 use args::{Cli, Command};
 use index::{rebuild_server_index, server_index_status};
-use routes::{serve, LocalHistoryBridge};
+use routes::{serve, AuthConfig, LocalHistoryBridge};
 use store::ServerStore;
 
 #[tokio::main]
@@ -27,10 +27,14 @@ async fn main() -> Result<()> {
             enable_local_history,
             brick_bin,
             repo_root,
+            auth_token,
         } => {
             let history_bridge =
                 enable_local_history.then(|| LocalHistoryBridge::new(brick_bin, repo_root));
-            serve(bind, ServerStore::new(data_dir), history_bridge).await?
+            let auth = auth_token
+                .filter(|token| !token.is_empty())
+                .map(AuthConfig::new);
+            serve(bind, ServerStore::new(data_dir), history_bridge, auth).await?
         }
         Command::RebuildIndex { data_dir, repo_id } => {
             let store = ServerStore::new(data_dir);
