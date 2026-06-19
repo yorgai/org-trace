@@ -23,6 +23,7 @@ mod context;
 mod db;
 mod history;
 mod inspect;
+mod mcp;
 mod metadata;
 mod output;
 mod source;
@@ -74,6 +75,7 @@ fn main() -> Result<()> {
         Command::Source { .. }
         | Command::History { .. }
         | Command::Metadata { .. }
+        | Command::McpServe
         | Command::Agent { .. } => None,
         _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
@@ -186,6 +188,7 @@ fn main() -> Result<()> {
         )?,
         Command::History { command } => handle_history(command, &source_profiles, &store)?,
         Command::Metadata { command } => handle_metadata(command, &source_profiles, &store)?,
+        Command::McpServe => mcp::serve(&source_profiles, &store)?,
         Command::Sync { command } => match command {
             SyncCommand::Run(args) => handle_sync(&store, args.dry_run, args.remote, args.repo_id)?,
             SyncCommand::Push(args) => {

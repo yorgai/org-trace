@@ -165,7 +165,7 @@ pub struct RecallSession {
     pub recall_chunks_hint: Option<String>,
 }
 
-fn build_recall_response(
+pub(crate) fn build_recall_response(
     store: &LocalStore,
     profiles: &SourceProfileStore,
     file_path: &str,
@@ -247,7 +247,7 @@ pub struct QueryMatch {
     pub recall_chunks_hint: String,
 }
 
-fn build_query_response(
+pub(crate) fn build_query_response(
     profiles: &SourceProfileStore,
     query: &str,
     source: &str,

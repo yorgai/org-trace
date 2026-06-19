@@ -46,6 +46,46 @@ fn truncate_chunk_fields(chunk: &mut ActivityChunk, max_bytes: usize, absolute_o
     truncate_value(&mut chunk.result, max_bytes, absolute_offset);
 }
 
+/// Builds a paginated, optionally field-truncated chunk page for one session.
+/// Shared by the `history chunks` CLI handler and the MCP `read_session` tool so
+/// both stay in lockstep on pagination + truncation behavior.
+pub(crate) fn build_chunks_response(
+    profile: &SourceProfile,
+    source_id: &str,
+    session_id: &str,
+    limit: usize,
+    offset: usize,
+    max_field_bytes: usize,
+) -> Result<HistoryChunksResponse> {
+    let mut metadata_db = MetadataDb::open_global()?;
+    refresh_profiles_to_metadata(
+        &mut metadata_db,
+        std::slice::from_ref(profile),
+        EXPORT_REFRESH_LIMIT,
+    )?;
+    let record = metadata_db
+        .get_source_session(&profile.name, session_id)?
+        .ok_or_else(|| anyhow!("source session not found: {}/{}", profile.name, session_id))?;
+    let all_chunks = format_chunks_for_record(&record)?;
+    let total_chunks = all_chunks.len();
+    let mut page: Vec<_> = all_chunks.into_iter().skip(offset).take(limit).collect();
+    let returned = page.len();
+    if max_field_bytes > 0 {
+        for (index, chunk) in page.iter_mut().enumerate() {
+            truncate_chunk_fields(chunk, max_field_bytes, offset + index);
+        }
+    }
+    Ok(HistoryChunksResponse {
+        source_id: source_id.to_string(),
+        session_id: session_id.to_string(),
+        total_chunks,
+        offset,
+        returned,
+        has_more: offset + returned < total_chunks,
+        chunks: page,
+    })
+}
+
 /// Recursively truncates string leaves over `max_bytes`, descending into arrays
 /// and objects. Non-string scalars are left untouched.
 fn truncate_value(value: &mut Value, max_bytes: usize, absolute_offset: usize) {
@@ -482,36 +522,15 @@ pub fn handle_history(
         } => {
             ensure_json(format);
             let profile = read_profile(profiles, &source)?;
-            let mut metadata_db = MetadataDb::open_global()?;
-            refresh_profiles_to_metadata(
-                &mut metadata_db,
-                std::slice::from_ref(&profile),
-                EXPORT_REFRESH_LIMIT,
-            )?;
-            let record = metadata_db
-                .get_source_session(&profile.name, &session_id)?
-                .ok_or_else(|| {
-                    anyhow!("source session not found: {}/{}", profile.name, session_id)
-                })?;
-            let all_chunks = format_chunks_for_record(&record)?;
-            let total_chunks = all_chunks.len();
-            let mut page: Vec<_> = all_chunks.into_iter().skip(offset).take(limit).collect();
-            let returned = page.len();
-            if max_field_bytes > 0 {
-                for (index, chunk) in page.iter_mut().enumerate() {
-                    let absolute = offset + index;
-                    truncate_chunk_fields(chunk, max_field_bytes, absolute);
-                }
-            }
-            print_json(&HistoryChunksResponse {
-                source_id: source,
-                session_id,
-                total_chunks,
+            let response = build_chunks_response(
+                &profile,
+                &source,
+                &session_id,
+                limit,
                 offset,
-                returned,
-                has_more: offset + returned < total_chunks,
-                chunks: page,
-            })
+                max_field_bytes,
+            )?;
+            print_json(&response)
         }
         HistoryCommand::Export {
             source,

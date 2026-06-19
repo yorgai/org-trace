@@ -93,6 +93,8 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Run as an MCP server over stdio so any MCP-capable agent can query Brick.
+    McpServe,
     Source {
         #[command(subcommand)]
         command: SourceCommand,
