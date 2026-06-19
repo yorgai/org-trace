@@ -10,9 +10,15 @@
 //! stderr. A stray println on stdout corrupts the framing and breaks the client.
 
 use std::io::{BufRead, Write};
+use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{AnnouncementStore, LocalStore, NewAnnouncement, SourceProfileStore};
+use brick_protocol::{
+    ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
+    ArtifactKind, FileRefId, MissionCreatedPayload, MissionId, MissionStatus, MissionUpdatedPayload,
+    ProjectId, SessionId, TraceEvent,
+};
 use chrono::Duration;
 use serde_json::{json, Value};
 
@@ -98,12 +104,19 @@ fn initialize_result() -> Value {
             "name": "brick",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Brick exposes cross-tool AI coding session memory. Use \
-    explore_memory for an open question, recall_file before editing a file, \
-    search_sessions to find past work by topic, and read_session to page through a \
-    specific session's transcript. Before starting a non-trivial edit, call \
-    announce_work to post a heads-up so other sessions hold off; recall_file \
-    surfaces any active claims on the file you ask about."
+        "instructions": "Brick gives any agent a shared work surface across tools: \
+    memory, planning, and coordination. \
+    MEMORY — explore_memory for an open question, recall_file before editing a file, \
+    search_sessions to find past work by topic, read_session to page through a \
+    session's transcript. \
+    PLANNING — at the start of a task call current_context (what am I working on) and \
+    list_missions (what's in flight); turn a request into a tracked goal with \
+    manage_mission action='create'; as work moves, manage_mission action='update' its \
+    status; log deliverables with record_artifact and back them with attach_evidence. \
+    COORDINATION — before a non-trivial edit call announce_work so other sessions hold \
+    off, and recall_file surfaces any active claims on the file you ask about. \
+    A natural flow: current_context → list_missions → manage_mission(create) → work → \
+    record_artifact → attach_evidence → announce_work."
     })
 }
 
@@ -257,6 +270,156 @@ fn tools_list_result() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "current_context",
+                "description": "Report your current work context: the active org, \
+    project, mission (work item), and session Brick has on record. Call this at the \
+    START of a task to know what you're working on and where new work should be \
+    filed. Pairs with list_missions to see what's in flight.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "list_missions",
+                "description": "List missions (work items / goals) Brick is tracking, \
+    newest first. Use this to see 'what is in flight' before starting work, to find \
+    an existing mission to attach output to, or to pick up an unfinished task. \
+    Optionally filter by status or project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by status: planned | active | blocked \
+    | completed | archived. Omit for all."
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Filter to one project id. Omit for all projects."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max missions to return (default 50)."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "show_mission",
+                "description": "Show one mission in detail: status, description, and the \
+    sessions and artifacts linked to it. Use to inspect a work item before updating \
+    it or recording output against it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mission": {
+                            "type": "string",
+                            "description": "The mission id to show (e.g. msn-…)."
+                        }
+                    },
+                    "required": ["mission"]
+                }
+            },
+            {
+                "name": "manage_mission",
+                "description": "Create or update a mission (work item / goal) — Brick's \
+    planning primitive. action='create' opens a new work item under a project; \
+    action='update' changes its title/description/status as work progresses \
+    (planned→active→blocked→completed). Use this to turn a user request into a \
+    tracked goal, then record artifacts and evidence against it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "'create' a new mission or 'update' an existing one.",
+                            "enum": ["create", "update"]
+                        },
+                        "mission": {
+                            "type": "string",
+                            "description": "Mission id — REQUIRED for action='update'."
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project id this mission belongs to — REQUIRED \
+    for action='create'. For update, moves the mission to another project."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Short imperative goal title, e.g. 'Add OAuth \
+    login'. Required for create."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional longer description / acceptance notes."
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "planned | active | blocked | completed | \
+    archived. Defaults to 'planned' on create.",
+                            "enum": ["planned", "active", "blocked", "completed", "archived"]
+                        },
+                        "session_id": { "type": "string", "description": "Your session id (optional)." },
+                        "source": { "type": "string", "description": "Your tool/app id (optional)." }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
+                "name": "record_artifact",
+                "description": "Record a deliverable you produced (a PR, a design doc, a \
+    decision, a test result) and link it to a mission. This closes the planning \
+    loop: a mission states the goal, an artifact is the proof of work. Call after \
+    finishing a meaningful piece of work.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "What the artifact is, e.g. 'PR #42: OAuth login'."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": "decision | file_ref | patch | review | \
+    test_result | acceptance | note. Defaults to 'note'.",
+                            "enum": ["decision", "file_ref", "patch", "review", "test_result", "acceptance", "note"]
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional details / link / summary."
+                        },
+                        "mission": {
+                            "type": "string",
+                            "description": "Mission id to link this artifact to (optional \
+    but recommended so the work item shows its outputs)."
+                        },
+                        "session_id": { "type": "string", "description": "Your session id (optional)." },
+                        "source": { "type": "string", "description": "Your tool/app id (optional)." }
+                    },
+                    "required": ["title"]
+                }
+            },
+            {
+                "name": "attach_evidence",
+                "description": "Attach a file-path piece of evidence to an artifact — the \
+    concrete file(s) that back up a deliverable, forming an auditable trail. Call \
+    after record_artifact to point at the files the work touched.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "artifact": {
+                            "type": "string",
+                            "description": "Artifact id the evidence belongs to (from record_artifact)."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File path the artifact represents or touched."
+                        },
+                        "session_id": { "type": "string", "description": "Your session id (optional)." },
+                        "source": { "type": "string", "description": "Your tool/app id (optional)." }
+                    },
+                    "required": ["artifact", "path"]
+                }
             }
         ]
     })
@@ -409,6 +572,201 @@ fn handle_tool_call(
             };
             json!({ "count": claims.len(), "announcements": claims })
         }
+        "current_context" => {
+            // Rebuild (not load) so reads reflect events just written by other MCP
+            // calls — the cached index goes stale the moment append_event runs.
+            let index = store.rebuild_index()?;
+            let context = store.read_current_context().ok().flatten();
+            let current_mission = context
+                .as_ref()
+                .and_then(|ctx| ctx.mission_id.as_ref())
+                .and_then(|id| index.missions.get(id.as_str()));
+            json!({
+                "current": context,
+                "current_mission": current_mission,
+                "counts": {
+                    "orgs": index.orgs.len(),
+                    "projects": index.projects.len(),
+                    "missions": index.missions.len(),
+                    "sessions": index.sessions.len(),
+                    "artifacts": index.artifacts.len(),
+                },
+                "note": "Use list_missions to see in-flight work, manage_mission to \
+    open or update a goal, and record_artifact to log deliverables."
+            })
+        }
+        "list_missions" => {
+            let index = store.rebuild_index()?;
+            let status_filter = args
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|raw| raw.trim().to_lowercase());
+            let project_filter = args
+                .get("project")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let limit = usize_arg(&args, "limit").unwrap_or(50);
+            let mut missions: Vec<_> = index
+                .missions
+                .values()
+                .filter(|mission| match &status_filter {
+                    Some(status) => mission_status_str(mission.status) == status,
+                    None => true,
+                })
+                .filter(|mission| match project_filter {
+                    Some(project) => mission.project_id.as_deref() == Some(project),
+                    None => true,
+                })
+                .collect();
+            // Newest activity first so "what's in flight" surfaces at the top.
+            missions.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
+            missions.truncate(limit);
+            json!({ "count": missions.len(), "missions": missions })
+        }
+        "show_mission" => {
+            let mission = str_arg(&args, "mission")?;
+            let index = store.rebuild_index()?;
+            let item = index
+                .missions
+                .get(&mission)
+                .ok_or_else(|| anyhow::anyhow!("mission not found: {mission}"))?;
+            serde_json::to_value(item)?
+        }
+        "manage_mission" => {
+            let action = str_arg(&args, "action")?;
+            let actor = mcp_actor(&args);
+            match action.as_str() {
+                "create" => {
+                    let project = str_arg(&args, "project")?;
+                    let title = str_arg(&args, "title")?;
+                    let project_id = ProjectId::from_str(&project)
+                        .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?;
+                    let mission_id = MissionId::new();
+                    let event = TraceEvent::mission_created(
+                        actor,
+                        mission_id.clone(),
+                        MissionCreatedPayload {
+                            project_id,
+                            title,
+                            description: opt_str_arg(&args, "description"),
+                            status: mission_status_from_str(args.get("status").and_then(Value::as_str))?,
+                            repo_context_id: None,
+                        },
+                    )?;
+                    store.append_event(&event)?;
+                    json!({
+                        "created": true,
+                        "mission_id": mission_id.to_string(),
+                        "note": "Mission opened. Record deliverables against it with \
+    record_artifact, and update its status with manage_mission action='update'."
+                    })
+                }
+                "update" => {
+                    let mission = str_arg(&args, "mission")?;
+                    let mission_id = MissionId::from_str(&mission)
+                        .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?;
+                    let project_id = match args.get("project").and_then(Value::as_str) {
+                        Some(project) if !project.is_empty() => Some(
+                            ProjectId::from_str(project)
+                                .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?,
+                        ),
+                        _ => None,
+                    };
+                    let title = opt_str_arg(&args, "title");
+                    let description = opt_str_arg(&args, "description");
+                    let status = match args.get("status").and_then(Value::as_str) {
+                        Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
+                        _ => None,
+                    };
+                    if project_id.is_none() && title.is_none() && description.is_none() && status.is_none() {
+                        return Err(anyhow::anyhow!(
+                            "manage_mission update needs at least one of project, title, description, or status"
+                        ));
+                    }
+                    let event = TraceEvent::mission_updated(
+                        actor,
+                        mission_id.clone(),
+                        MissionUpdatedPayload {
+                            project_id,
+                            title,
+                            description,
+                            status,
+                            repo_context_id: None,
+                        },
+                    )?;
+                    store.append_event(&event)?;
+                    json!({ "updated": true, "mission_id": mission_id.to_string() })
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "unknown manage_mission action: {other} (expected 'create' or 'update')"
+                    ))
+                }
+            }
+        }
+        "record_artifact" => {
+            let title = str_arg(&args, "title")?;
+            let actor = mcp_actor(&args);
+            let mission_id = match args.get("mission").and_then(Value::as_str) {
+                Some(mission) if !mission.is_empty() => Some(
+                    MissionId::from_str(mission)
+                        .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let session_id = match args.get("session_id").and_then(Value::as_str) {
+                Some(session) if !session.is_empty() => Some(
+                    SessionId::from_str(session)
+                        .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let artifact_id = ArtifactId::new();
+            let event = TraceEvent::artifact_created(
+                actor,
+                artifact_id.clone(),
+                mission_id,
+                session_id,
+                ArtifactCreatedPayload {
+                    artifact_kind: artifact_kind_from_str(args.get("kind").and_then(Value::as_str)),
+                    title,
+                    body: opt_str_arg(&args, "body"),
+                    repo_context_id: None,
+                },
+            )?;
+            store.append_event(&event)?;
+            json!({
+                "recorded": true,
+                "artifact_id": artifact_id.to_string(),
+                "note": "Deliverable logged. Attach the backing files with attach_evidence."
+            })
+        }
+        "attach_evidence" => {
+            let artifact = str_arg(&args, "artifact")?;
+            let path = str_arg(&args, "path")?;
+            let actor = mcp_actor(&args);
+            let artifact_id = ArtifactId::from_str(&artifact)
+                .map_err(|err| anyhow::anyhow!("invalid artifact id: {err}"))?;
+            let session_id = match args.get("session_id").and_then(Value::as_str) {
+                Some(session) if !session.is_empty() => Some(
+                    SessionId::from_str(session)
+                        .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let event = TraceEvent::artifact_file_ref_recorded(
+                actor,
+                artifact_id.clone(),
+                session_id,
+                ArtifactFileRefRecordedPayload {
+                    file_ref_id: FileRefId::new(),
+                    path,
+                    repo_context_id: None,
+                },
+            )?;
+            store.append_event(&event)?;
+            json!({ "attached": true, "artifact_id": artifact_id.to_string() })
+        }
         other => return Err(anyhow::anyhow!("unknown tool: {other}")),
     };
 
@@ -461,6 +819,75 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
+}
+
+/// Returns a trimmed non-empty string argument, or None.
+fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Builds the actor for an MCP-authored write. MCP has no logged-in human, so
+/// the actor is the calling tool: `actor_id`/`source` arg, else `mcp`. This
+/// mirrors how `announce_work` attributes claims.
+fn mcp_actor(args: &Value) -> ActorRef {
+    let actor_id = opt_str_arg(args, "actor_id")
+        .or_else(|| opt_str_arg(args, "source"))
+        .unwrap_or_else(|| "mcp".to_string());
+    ActorRef {
+        actor_type: ActorType::Agent,
+        actor_id,
+        display_name: None,
+    }
+}
+
+/// snake_case wire string for a mission status (matches the serde rename).
+fn mission_status_str(status: MissionStatus) -> &'static str {
+    match status {
+        MissionStatus::Planned => "planned",
+        MissionStatus::Active => "active",
+        MissionStatus::Blocked => "blocked",
+        MissionStatus::Completed => "completed",
+        MissionStatus::Archived => "archived",
+    }
+}
+
+/// Parses a mission status from a wire string, erroring on unknown values.
+fn parse_mission_status(raw: &str) -> Result<MissionStatus> {
+    match raw.trim().to_lowercase().as_str() {
+        "planned" => Ok(MissionStatus::Planned),
+        "active" => Ok(MissionStatus::Active),
+        "blocked" => Ok(MissionStatus::Blocked),
+        "completed" => Ok(MissionStatus::Completed),
+        "archived" => Ok(MissionStatus::Archived),
+        other => Err(anyhow::anyhow!(
+            "unknown mission status: {other} (planned|active|blocked|completed|archived)"
+        )),
+    }
+}
+
+/// Status for a create call: defaults to Planned when omitted.
+fn mission_status_from_str(raw: Option<&str>) -> Result<MissionStatus> {
+    match raw {
+        Some(value) if !value.trim().is_empty() => parse_mission_status(value),
+        _ => Ok(MissionStatus::Planned),
+    }
+}
+
+/// Maps an artifact kind wire string to the enum, defaulting to Note.
+fn artifact_kind_from_str(raw: Option<&str>) -> ArtifactKind {
+    match raw.map(|value| value.trim().to_lowercase()).as_deref() {
+        Some("decision") => ArtifactKind::Decision,
+        Some("file_ref") => ArtifactKind::FileRef,
+        Some("patch") => ArtifactKind::Patch,
+        Some("review") => ArtifactKind::Review,
+        Some("test_result") => ArtifactKind::TestResult,
+        Some("acceptance") => ArtifactKind::Acceptance,
+        _ => ArtifactKind::Note,
+    }
 }
 
 fn success(id: Value, result: Value) -> Value {
