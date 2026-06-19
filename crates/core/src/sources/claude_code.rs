@@ -16,7 +16,7 @@ use super::jsonl::{
 };
 
 const CLAUDE_CODE_SOURCE_ID: &str = "claude_code";
-const CLAUDE_CODE_JSONL_PARSER_VERSION: &str = "claude-code-jsonl-v3";
+const CLAUDE_CODE_JSONL_PARSER_VERSION: &str = "claude-code-jsonl-v4";
 const CLAUDE_CODE_PROVIDER_SLUG: &str = "claudecode";
 
 pub(super) fn list_sessions(

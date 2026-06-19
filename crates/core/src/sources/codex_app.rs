@@ -16,7 +16,7 @@ use super::jsonl::{
 };
 
 const CODEX_APP_SOURCE_ID: &str = "codex_app";
-const CODEX_APP_JSONL_PARSER_VERSION: &str = "codex-app-jsonl-v3";
+const CODEX_APP_JSONL_PARSER_VERSION: &str = "codex-app-jsonl-v4";
 const CODEX_APP_PROVIDER_SLUG: &str = "codex";
 
 #[derive(Debug, Default)]

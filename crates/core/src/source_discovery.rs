@@ -20,6 +20,7 @@ pub enum DiscoveredSourceKind {
     Codex,
     Windsurf,
     OpenCode,
+    Gemini,
 }
 
 impl DiscoveredSourceKind {
@@ -32,6 +33,7 @@ impl DiscoveredSourceKind {
             DiscoveredSourceKind::Codex => "codex_app",
             DiscoveredSourceKind::Windsurf => "windsurf",
             DiscoveredSourceKind::OpenCode => "opencode",
+            DiscoveredSourceKind::Gemini => "gemini",
         }
     }
 
@@ -49,6 +51,7 @@ impl DiscoveredSourceKind {
             DiscoveredSourceKind::Codex => "Codex",
             DiscoveredSourceKind::Windsurf => "Windsurf",
             DiscoveredSourceKind::OpenCode => "OpenCode",
+            DiscoveredSourceKind::Gemini => "Gemini",
         }
     }
 }
@@ -126,6 +129,11 @@ pub fn discover_sources() -> Vec<DiscoveredSource> {
         &mut sources,
         DiscoveredSourceKind::OpenCode,
         opencode_paths(&home),
+    );
+    push_source(
+        &mut sources,
+        DiscoveredSourceKind::Gemini,
+        gemini_paths(&home),
     );
     sources
 }
@@ -211,6 +219,13 @@ fn opencode_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
         .into_iter()
         .map(|candidate| path(DiscoveredPathKind::SessionDatabase, candidate))
         .collect()
+}
+
+fn gemini_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
+    vec![path(
+        DiscoveredPathKind::SessionLogRoot,
+        home.join(".gemini").join("tmp"),
+    )]
 }
 
 fn path(kind: DiscoveredPathKind, path: PathBuf) -> DiscoveredSourcePath {

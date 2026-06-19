@@ -7,13 +7,15 @@ use crate::{
     SourceProfile,
 };
 
-use super::{claude_code, codex_app, cursor_ide, opencode, windsurf};
+use super::{claude_code, codex_app, cursor_ide, gemini, opencode, orgii, windsurf};
 
 const SOURCE_CLAUDE_CODE: &str = "claude_code";
 const SOURCE_CODEX_APP: &str = "codex_app";
 const SOURCE_CURSOR_IDE: &str = "cursor_ide";
 const SOURCE_OPENCODE: &str = "opencode";
 const SOURCE_WINDSURF: &str = "windsurf";
+const SOURCE_ORGII: &str = "orgii";
+const SOURCE_GEMINI: &str = "gemini";
 
 /// Lists native sessions through the app-specific provider for a source profile.
 pub fn list_source_sessions(
@@ -26,6 +28,8 @@ pub fn list_source_sessions(
         SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit),
         SOURCE_OPENCODE => opencode::list_sessions(profile, limit),
         SOURCE_WINDSURF => windsurf::list_sessions(profile, limit),
+        SOURCE_ORGII => orgii::list_sessions(profile, limit),
+        SOURCE_GEMINI => gemini::list_sessions(profile, limit),
         _ => list_native_source_sessions(profile, limit),
     }
 }
@@ -50,6 +54,8 @@ pub fn format_source_session_chunks(
         SOURCE_CURSOR_IDE => cursor_ide::format_chunks(external_session_id, source_path),
         SOURCE_OPENCODE => opencode::format_chunks(external_session_id, source_path),
         SOURCE_WINDSURF => windsurf::format_chunks(external_session_id, source_path),
+        SOURCE_ORGII => orgii::format_chunks(external_session_id, source_path),
+        SOURCE_GEMINI => gemini::format_chunks(external_session_id, source_path),
         _ => Ok(Vec::new()),
     }
 }
@@ -103,7 +109,7 @@ mod tests {
             list_source_sessions(&source_profile, Some(10)).expect("list claude sessions");
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].parser_version, "claude-code-jsonl-v3");
+        assert_eq!(sessions[0].parser_version, "claude-code-jsonl-v4");
         assert_eq!(sessions[0].model.as_deref(), Some("claude-sonnet"));
         assert_eq!(sessions[0].input_tokens, Some(11));
         assert_eq!(sessions[0].output_tokens, Some(7));

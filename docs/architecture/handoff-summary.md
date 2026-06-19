@@ -734,8 +734,39 @@ absolute *and* relative path. Note: a tool with no file-edit signal in its
 history (the user's recent Claude sessions are chat/research) correctly yields no
 hits — a data fact, not a parser failure (Claude extraction is unit-tested).
 
-Next (still out of scope here): Gemini provider, and `brick memory recall` — both
-now unblocked because blame returns real data.
+### All-source blame coverage (every provider verified) — DONE
+
+Extended touched-files extraction across every provider and verified
+`file-session-blame` live against the user's real machine. Per-source result
+(`status: ok` with real rows unless noted):
+
+- **codex_app** ✅ — Codex apply_patch envelope + exec_command shell edits;
+  52 sessions carry touched_files; blamed `sample_sales.csv`.
+- **cursor_ide** ✅ — already populated via composer `touchedFiles`; blamed
+  `src-tauri/Cargo.toml`.
+- **claude_code** ✅ — Edit/Write/Bash extraction; verified by *triggering the
+  real `claude` CLI* to create `blame_target.py`, then blaming it.
+- **orgii** ✅ — **new provider** `sources/orgii.rs`: reads
+  `~/.orgii/sessions.db` (`agent_sessions` + `events`), mapping
+  `edit_file`/`write_file`/`apply_patch` args and `run_shell` commands to
+  touched_files; blamed a real ORGII `.tsx` across 5 sessions.
+- **gemini** ✅ — **new provider** `sources/gemini.rs` + new
+  `DiscoveredSourceKind::Gemini` (discovery root `~/.gemini/tmp`): parses
+  `<projectHash>/chats/session-*.json`, mapping `write_file`/`replace` and
+  `run_shell_command` tool calls to touched_files; 7 sessions populated, blamed
+  `handler.py`.
+- **windsurf** ✅ (synthetic) — parser already extracts composer `touchedFiles`;
+  the user's machine has *no* Windsurf data (empty `~/.codeium/windsurf` store,
+  no `.vscdb`), so the full path was proven with a synthetic `state.vscdb` in the
+  real `cursorDiskKV` format → blame returned the session. Real-data parity is
+  identical to cursor_ide (shared `cursor_family`).
+
+Shared infra reused: the `shell_edits` helper (redirect/tee/sed/apply_patch
+heredoc recognition, with bare-punctuation and fd-token rejection) is now used by
+codex, claude, orgii, and gemini. The blame query's repo-path relaxation +
+`path_matches` (added earlier) means every source works from any CWD by absolute
+or relative path. Parser versions fold into the source fingerprint, so each parser
+upgrade auto-reindexes without a manual command.
 
 ## Design cautions
 

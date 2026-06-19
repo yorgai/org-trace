@@ -995,11 +995,13 @@ fn provider_kind(source_id: &str) -> &'static str {
 
 fn parser_kind(source_id: &str) -> &'static str {
     match source_id {
-        "claude_code" => "claude-code-jsonl-v3",
-        "codex_app" => "codex-app-jsonl-v3",
+        "claude_code" => "claude-code-jsonl-v4",
+        "codex_app" => "codex-app-jsonl-v4",
         "cursor_ide" => "cursor-ide-composer-headers-v1",
         "windsurf" => "windsurf-composer-data-v1",
         "opencode" => "opencode-sqlite-v1",
+        "orgii" => "orgii-sqlite-v2",
+        "gemini" => "gemini-chat-json-v1",
         _ => "native-file-v1",
     }
 }
@@ -1755,7 +1757,7 @@ mod tests {
         assert_eq!(row.source_id, "claude_code");
         assert_eq!(row.status, "error");
         assert_eq!(row.provider_kind, "claude_code_jsonl");
-        assert_eq!(row.parser_kind, "claude-code-jsonl-v3");
+        assert_eq!(row.parser_kind, "claude-code-jsonl-v4");
         assert!(!row.profile.exists);
         assert!(row
             .errors
@@ -1990,7 +1992,7 @@ mod tests {
             source_mtime: Some(updated_at),
             source_size: Some(123),
             source_fingerprint: Some("sha256:abc".to_string()),
-            parser_version: Some("claude-code-jsonl-v3".to_string()),
+            parser_version: Some("claude-code-jsonl-v4".to_string()),
             session_created_at: Some(created_at),
             session_updated_at: Some(updated_at),
             model: Some("claude-sonnet".to_string()),
@@ -2055,7 +2057,7 @@ mod tests {
         );
         assert_eq!(
             serialized["source_session"]["parser_version"],
-            "claude-code-jsonl-v3"
+            "claude-code-jsonl-v4"
         );
     }
 

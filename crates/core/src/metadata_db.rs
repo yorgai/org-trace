@@ -370,8 +370,8 @@ impl MetadataDb {
             }
         }
         // Stable sort keeps the SQL ordering within each rank group; same-repo
-        // first.
-        matched.sort_by(|left, right| right.0.cmp(&left.0));
+        // first (true sorts before false via Reverse).
+        matched.sort_by_key(|(same_repo, _)| std::cmp::Reverse(*same_repo));
         let mut records: Vec<FileSessionBlameRow> =
             matched.into_iter().map(|(_, row)| row).collect();
         records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));

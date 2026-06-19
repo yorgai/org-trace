@@ -188,6 +188,12 @@ fn push_path(token: &str, files: &mut BTreeSet<String>) {
     {
         return;
     }
+    // A real file path always contains at least one alphanumeric character;
+    // reject bare punctuation tokens (`,`, `.`, `&&`-leftovers) that complex
+    // multi-line commands can leave on a redirect boundary.
+    if !trimmed.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return;
+    }
     files.insert(trimmed.to_string());
 }
 
@@ -269,5 +275,13 @@ mod tests {
     fn rejects_fd_and_operator_tokens_in_plain_commands() {
         assert!(shell_edit_targets("python run.py 2>&1 | tee").is_empty());
         assert!(shell_edit_targets("echo done > 1").is_empty());
+    }
+
+    #[test]
+    fn rejects_bare_punctuation_redirect_tokens() {
+        // Complex multi-line commands can leave a stray `,` on a redirect
+        // boundary; a real path always has an alphanumeric char.
+        assert!(shell_edit_targets("echo x > ,").is_empty());
+        assert!(shell_edit_targets("printf y >> .").is_empty());
     }
 }
