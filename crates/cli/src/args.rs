@@ -89,6 +89,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Source {
         #[command(subcommand)]
         command: SourceCommand,
@@ -532,6 +536,66 @@ pub enum HistoryExportFormatArg {
 pub enum HistoryExportSchemaArg {
     AuditV1,
     SourceMetadataV1,
+}
+
+/// Which agent memory file(s) to inject Brick awareness into.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum AgentTargetArg {
+    /// `CLAUDE.md` (Claude Code).
+    Claude,
+    /// `AGENTS.md` (Codex, Cursor, Copilot, OpenCode, etc.).
+    Codex,
+    /// `GEMINI.md` (Gemini).
+    Gemini,
+    /// Every known target.
+    All,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum AgentFormatArg {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Inject the Brick managed block into agent memory files.
+    Install(AgentInstallArgs),
+    /// Remove the Brick managed block, leaving the rest of the file intact.
+    Uninstall(AgentTargetArgs),
+    /// Report, per target file, whether a Brick block is present and current.
+    Status(AgentTargetArgs),
+}
+
+/// Targeting/scope flags shared by the agent subcommands.
+#[derive(Debug, Args)]
+pub struct AgentTargetArgs {
+    /// Write to per-user memory locations instead of the working directory.
+    #[arg(long)]
+    pub global: bool,
+    /// Which memory file(s) to act on.
+    #[arg(long, value_enum, default_value_t = AgentTargetArg::All)]
+    pub target: AgentTargetArg,
+    /// Working directory to operate in (defaults to the current directory).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = AgentFormatArg::Text)]
+    pub format: AgentFormatArg,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentInstallArgs {
+    #[command(flatten)]
+    pub target: AgentTargetArgs,
+    /// Rewrite the managed block even if it is already up to date.
+    #[arg(long)]
+    pub force: bool,
+    /// Print the block to stdout without writing any file.
+    #[arg(long)]
+    pub print: bool,
 }
 
 #[derive(Debug, Subcommand)]

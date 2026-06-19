@@ -119,6 +119,31 @@ Sessions are evidence attached to Missions. A Session may be produced by an agen
 
 Artifacts are the work products and proof attached to Missions and Sessions. They can represent decisions, reviews, diffs, CI results, documents, screenshots, recordings, notes, or uploaded files. Video recordings and other large human proof-of-work files should be stored as artifact attachments so events keep only metadata, hashes, and storage URIs.
 
+## Agent awareness
+
+`brick agent install` injects a Brick instruction block into the memory files
+coding agents read as standing context — `CLAUDE.md` (Claude Code), `AGENTS.md`
+(Codex, Cursor, Copilot, OpenCode, …), and `GEMINI.md` (Gemini). The block tells
+the agent to call `brick history` (especially `brick history file-session-blame
+--path <file> --format json`) to recall what past sessions did to the files it is
+about to touch, turning Brick into a shared, cross-tool memory agents use on their
+own — no MCP, daemon, or agent forks required.
+
+```bash
+brick agent install            # inject into this repo's CLAUDE.md/AGENTS.md/GEMINI.md
+brick agent install --target claude   # one tool only
+brick agent install --global   # per-user memory locations (best-effort)
+brick agent status             # report present / stale / absent per file
+brick agent uninstall          # remove only Brick's block
+```
+
+The injected text lives between `<!-- brick:managed:start v=N -->` and
+`<!-- brick:managed:end -->` sentinels. Edits are confined to that region and
+written atomically, so a user's existing memory file is never clobbered;
+re-running `install` is idempotent and rolls the block forward when the template
+version changes. `brick init` offers to run this for the current repo. All
+`brick history` commands emit `--format json` so agents can parse them directly.
+
 ## Local storage model
 
 Local writes use append-only JSONL under `.brick/provenance/` by default. `brick init` automatically adds `.brick/` to the repository `.gitignore` idempotently, because Brick local state is not source code and should not be committed. The effective store root resolves in this order: `--store-root`, `BRICK_STORE_ROOT`, selected source profile `store_root`, then repo-local `.brick/provenance`.

@@ -674,6 +674,31 @@ event log removed, org-scoped routes still resolve purely from the projection.
 actor binding, and O(1) org resolution. Further hardening (external identity /
 OIDC, richer org hierarchy, projection compaction) is post-MVP and not blocking.
 
+### Agent awareness (`brick agent install`) — DONE
+
+`brick agent install` makes coding agents use Brick on their own by injecting a
+managed instruction block into their native memory files: `CLAUDE.md` (Claude
+Code), `AGENTS.md` (Codex/Cursor/Copilot/OpenCode/…), `GEMINI.md` (Gemini). The
+block (in `crates/cli/src/agent.rs`) points agents at `brick history` — primarily
+`brick history file-session-blame --path <file> --format json` — so they recall
+what prior sessions did to a file before editing it. This is the Multica-style
+convention-file mechanism: no MCP, daemon, or agent forks.
+
+Contract: the block is delimited by `<!-- brick:managed:start v=N -->` /
+`<!-- brick:managed:end -->` sentinels with a version `N`. Edits are confined to
+that region and written atomically (temp + rename), so a user's existing memory
+file is never clobbered; `install` is idempotent and replaces a stale-version
+block in place. Subcommands: `install` (`--target claude|codex|gemini|all`,
+`--global`, `--dir`, `--force`, `--print`), `uninstall` (removes only the block),
+`status` (present/stale/absent). Default scope is the working directory; `--global`
+writes per-user locations (`~/.claude`, `~/.codex`, `~/.gemini`) best-effort and
+skips-with-reason when a path can't be resolved. `brick init` offers to run it.
+
+Out of scope (future): a higher-level `brick memory recall` that aggregates
+`file-session-blame` + `chunks` into a short summary, and per-turn dynamic prompt
+injection via tool hooks/daemon. The static convention-file layer ships first
+because it is the highest-leverage step with no runtime dependencies.
+
 ## Design cautions
 
 - Treat ORGII external-history code as a whole subsystem: scan, parse, metadata indexing, source-specific loading/windowing, chunk load, recent paths, impact stats, backfill, and diagnostics move together into Brick over time.

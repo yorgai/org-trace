@@ -15,6 +15,7 @@ use brick_core::{
 use clap::Parser;
 use dialoguer::{Confirm, Input, MultiSelect};
 
+mod agent;
 mod args;
 mod commands;
 mod context;
@@ -25,6 +26,7 @@ mod output;
 mod source;
 mod sync;
 
+use agent::handle_agent;
 use args::{Cli, Command, EvidenceCommand, MaintenanceCommand, SessionCommand, SyncCommand};
 use commands::{
     handle_artifact, handle_evidence, handle_import, handle_mission, handle_org, handle_project,
@@ -66,7 +68,7 @@ fn main() -> Result<()> {
         }
     }
     let selected_source_profile = match &command {
-        Command::Source { .. } | Command::History { .. } => None,
+        Command::Source { .. } | Command::History { .. } | Command::Agent { .. } => None,
         _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
     };
@@ -83,6 +85,7 @@ fn main() -> Result<()> {
             source_profiles.write_config(&brick_config)?;
             println!("Initialized Brick at {}", store.provenance_dir().display());
             init_source_discovery(&source_profiles)?;
+            agent::init_prompt(&work_dir)?;
         }
         Command::Version { .. } => unreachable!("version handled before repo discovery"),
         Command::Org { command } => match command {
@@ -167,6 +170,7 @@ fn main() -> Result<()> {
             &store,
             selected_source_profile.as_ref(),
         )?,
+        Command::Agent { command } => handle_agent(command)?,
         Command::Source { command } => handle_source(command, &source_profiles)?,
         Command::Import { command } => handle_import(
             command,
