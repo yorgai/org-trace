@@ -79,6 +79,13 @@ pub struct TokenRecord {
     /// `None` so token tables written before expiry support still load.
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Optional bound actor identity. When `Some`, pushed events must carry an
+    /// `actor.actor_id` equal to this value (enforced at the push route).
+    /// `None` (the default) means unbound: events are not actor-checked, which
+    /// preserves legacy/admin token behavior. Defaults to `None` so token
+    /// tables written before actor binding still load.
+    #[serde(default)]
+    pub actor_id: Option<String>,
 }
 
 impl TokenRecord {
@@ -234,7 +241,7 @@ impl TokenStore {
         self.tokens.iter().find(|token| token.token_sha256 == hash)
     }
 
-    /// Authorizes a request: returns the matching record's label on success.
+    /// Authorizes a request: returns the matching record's identity on success.
     ///
     /// Returns `Err` describing why the request is denied so the route layer can
     /// map it to the right status: unknown or expired token → 401, valid token
@@ -244,7 +251,7 @@ impl TokenStore {
         plaintext: &str,
         target: &ResourceTarget,
         required: Access,
-    ) -> Result<String, AuthDenial> {
+    ) -> Result<AuthedIdentity, AuthDenial> {
         self.authorize_at(plaintext, target, required, Utc::now())
     }
 
@@ -255,17 +262,29 @@ impl TokenStore {
         target: &ResourceTarget,
         required: Access,
         now: DateTime<Utc>,
-    ) -> Result<String, AuthDenial> {
+    ) -> Result<AuthedIdentity, AuthDenial> {
         let record = self.lookup(plaintext).ok_or(AuthDenial::UnknownToken)?;
         if record.is_expired(now) {
             return Err(AuthDenial::Expired);
         }
         if record.authorizes(target, required) {
-            Ok(record.label.clone())
+            Ok(AuthedIdentity {
+                label: record.label.clone(),
+                actor_id: record.actor_id.clone(),
+            })
         } else {
             Err(AuthDenial::Forbidden)
         }
     }
+}
+
+/// Identity resolved by a successful authorization: the token's label plus its
+/// optional bound actor. Carried from the auth middleware to request handlers
+/// so push routes can enforce actor binding and the audit log can record it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthedIdentity {
+    pub label: String,
+    pub actor_id: Option<String>,
 }
 
 /// Reason an authorization attempt failed.
@@ -291,6 +310,10 @@ pub struct AuditEntry {
     pub at: DateTime<Utc>,
     /// Label of the token that authorized the request.
     pub token_label: String,
+    /// The token's bound actor, if any. `None` for unbound tokens. Defaults to
+    /// `None` so audit logs written before actor binding still load.
+    #[serde(default)]
+    pub actor_id: Option<String>,
     pub method: String,
     pub path: String,
 }
@@ -441,6 +464,7 @@ pub fn single_token_store(plaintext: &str) -> TokenStore {
         scopes: vec![Scope::All],
         access: Access::Write,
         expires_at: None,
+        actor_id: None,
     });
     store
 }
@@ -465,7 +489,14 @@ pub fn scope_summary(store: &TokenStore) -> BTreeMap<String, String> {
                 Some(at) => format!(" expires={}", at.to_rfc3339()),
                 None => String::new(),
             };
-            (token.label.clone(), format!("{access} [{scopes}]{expiry}"))
+            let actor = match &token.actor_id {
+                Some(id) => format!(" actor={id}"),
+                None => String::new(),
+            };
+            (
+                token.label.clone(),
+                format!("{access} [{scopes}]{expiry}{actor}"),
+            )
         })
         .collect()
 }
@@ -491,6 +522,7 @@ mod tests {
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Write,
             expires_at: None,
+            actor_id: None,
         });
 
         let target = ResourceTarget::Repo {
@@ -498,11 +530,17 @@ mod tests {
             org_id: None,
         };
         assert_eq!(
-            store.authorize("secret", &target, Access::Read).unwrap(),
+            store
+                .authorize("secret", &target, Access::Read)
+                .unwrap()
+                .label,
             "ci"
         );
         assert_eq!(
-            store.authorize("secret", &target, Access::Write).unwrap(),
+            store
+                .authorize("secret", &target, Access::Write)
+                .unwrap()
+                .label,
             "ci"
         );
     }
@@ -516,13 +554,17 @@ mod tests {
             scopes: vec![Scope::All],
             access: Access::Read,
             expires_at: None,
+            actor_id: None,
         });
         let target = ResourceTarget::Repo {
             repo_id: "repo-a".to_string(),
             org_id: None,
         };
         assert_eq!(
-            store.authorize("secret", &target, Access::Read).unwrap(),
+            store
+                .authorize("secret", &target, Access::Read)
+                .unwrap()
+                .label,
             "viewer"
         );
         assert_eq!(
@@ -542,6 +584,7 @@ mod tests {
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Write,
             expires_at: None,
+            actor_id: None,
         });
 
         assert_eq!(
@@ -604,6 +647,7 @@ mod tests {
             scopes: vec![Scope::All],
             access: Access::Write,
             expires_at: Some(issued + chrono::Duration::days(1)),
+            actor_id: None,
         });
 
         // Valid before expiry.
@@ -642,6 +686,7 @@ mod tests {
             scopes: vec![Scope::Org("acme".to_string())],
             access: Access::Write,
             expires_at: None,
+            actor_id: None,
         });
 
         let in_org = ResourceTarget::Repo {
@@ -649,7 +694,10 @@ mod tests {
             org_id: Some("acme".to_string()),
         };
         assert_eq!(
-            store.authorize("secret", &in_org, Access::Write).unwrap(),
+            store
+                .authorize("secret", &in_org, Access::Write)
+                .unwrap()
+                .label,
             "org-team"
         );
 
@@ -685,6 +733,7 @@ mod tests {
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Write,
             expires_at: None,
+            actor_id: None,
         });
         let target = ResourceTarget::Repo {
             repo_id: "repo-a".to_string(),
@@ -699,7 +748,10 @@ mod tests {
             AuthDenial::UnknownToken
         );
         assert_eq!(
-            store.authorize("new", &target, Access::Write).unwrap(),
+            store
+                .authorize("new", &target, Access::Write)
+                .unwrap()
+                .label,
             "ci"
         );
         // Scope is unchanged: a different repo is still denied.
@@ -730,6 +782,7 @@ mod tests {
             scopes: vec![Scope::All],
             access: Access::Read,
             expires_at: None,
+            actor_id: None,
         });
         assert_eq!(store.expiry_for_label("ci"), Some(None));
     }
@@ -743,6 +796,7 @@ mod tests {
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Read,
             expires_at: None,
+            actor_id: None,
         });
         assert!(!store.has_org_scope());
         store.add(TokenRecord {
@@ -751,6 +805,7 @@ mod tests {
             scopes: vec![Scope::Org("acme".to_string())],
             access: Access::Read,
             expires_at: None,
+            actor_id: None,
         });
         assert!(store.has_org_scope());
     }
@@ -831,21 +886,79 @@ mod tests {
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Read,
             expires_at: None,
+            actor_id: None,
         });
         store.save(&dir).expect("save tokens");
         let loaded = TokenStore::load(&dir).expect("load tokens");
         assert_eq!(loaded.len(), 1);
         assert_eq!(
-            loaded.authorize(
-                "secret",
-                &ResourceTarget::Repo {
-                    repo_id: "repo-a".to_string(),
-                    org_id: None,
-                },
-                Access::Read
-            ),
-            Ok("ci".to_string())
+            loaded
+                .authorize(
+                    "secret",
+                    &ResourceTarget::Repo {
+                        repo_id: "repo-a".to_string(),
+                        org_id: None,
+                    },
+                    Access::Read
+                )
+                .unwrap()
+                .label,
+            "ci"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authorize_returns_bound_actor_id() {
+        let mut store = TokenStore::default();
+        store.add(TokenRecord {
+            label: "agent-ci".to_string(),
+            token_sha256: hash_token("secret"),
+            scopes: vec![Scope::All],
+            access: Access::Write,
+            expires_at: None,
+            actor_id: Some("agent-ci".to_string()),
+        });
+        let identity = store
+            .authorize("secret", &ResourceTarget::Global, Access::Write)
+            .expect("authorized");
+        assert_eq!(identity.label, "agent-ci");
+        assert_eq!(identity.actor_id.as_deref(), Some("agent-ci"));
+    }
+
+    #[test]
+    fn authorize_returns_none_actor_for_unbound_token() {
+        let store = single_token_store("admin");
+        let identity = store
+            .authorize("admin", &ResourceTarget::Global, Access::Read)
+            .expect("authorized");
+        assert_eq!(identity.actor_id, None);
+    }
+
+    #[test]
+    fn audit_entry_round_trips_actor() {
+        let entry = AuditEntry {
+            at: Utc::now(),
+            token_label: "agent-ci".to_string(),
+            actor_id: Some("agent-ci".to_string()),
+            method: "POST".to_string(),
+            path: "/v1/repos/repo-a/events".to_string(),
+        };
+        let serialized = serde_json::to_string(&entry).expect("serialize");
+        let parsed: AuditEntry = serde_json::from_str(&serialized).expect("parse");
+        assert_eq!(parsed, entry);
+
+        let legacy = r#"{"at":"2026-01-01T00:00:00Z","token_label":"ci","method":"POST","path":"/v1/events"}"#;
+        let parsed: AuditEntry = serde_json::from_str(legacy).expect("parse legacy");
+        assert_eq!(parsed.actor_id, None);
+    }
+
+    #[test]
+    fn token_record_without_actor_field_defaults_to_unbound() {
+        let legacy =
+            r#"{"label":"ci","token_sha256":"abc","scopes":[{"kind":"all"}],"access":"write"}"#;
+        let record: TokenRecord = serde_json::from_str(legacy).expect("parse legacy token");
+        assert_eq!(record.actor_id, None);
+        assert_eq!(record.expires_at, None);
     }
 }

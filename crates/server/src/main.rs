@@ -53,7 +53,8 @@ async fn main() -> Result<()> {
             scopes,
             write,
             expires_in_days,
-        } => create_token(&data_dir, label, scopes, write, expires_in_days)?,
+            actor_id,
+        } => create_token(&data_dir, label, scopes, write, expires_in_days, actor_id)?,
         Command::ListTokens { data_dir } => list_tokens(&data_dir)?,
         Command::RevokeToken { data_dir, label } => revoke_token(&data_dir, &label)?,
         Command::RotateToken {
@@ -85,6 +86,7 @@ fn resolve_serve_auth(
             scopes: vec![Scope::All],
             access: Access::Write,
             expires_at: None,
+            actor_id: None,
         });
     }
     if tokens.is_empty() {
@@ -100,6 +102,7 @@ fn create_token(
     scopes: Vec<String>,
     write: bool,
     expires_in_days: Option<u32>,
+    actor_id: Option<String>,
 ) -> Result<()> {
     let mut store = TokenStore::load(data_dir)?;
     if store.labels().iter().any(|existing| *existing == label) {
@@ -122,12 +125,16 @@ fn create_token(
         scopes: parsed_scopes,
         access: if write { Access::Write } else { Access::Read },
         expires_at,
+        actor_id: actor_id.clone(),
     });
     store.save(data_dir)?;
     println!("token_label={label}");
     println!("access={}", if write { "write" } else { "read" });
     if let Some(expiry) = expires_at {
         println!("expires_at={}", expiry.to_rfc3339());
+    }
+    if let Some(actor) = &actor_id {
+        println!("actor_id={actor}");
     }
     // Plaintext is shown once and never persisted.
     println!("token={plaintext}");
@@ -193,12 +200,17 @@ fn show_audit(data_dir: &std::path::Path, limit: Option<usize>) -> Result<()> {
     };
     println!("audit_count={}", entries.len() - start);
     for entry in &entries[start..] {
+        let actor = match &entry.actor_id {
+            Some(id) => format!(" actor={id}"),
+            None => String::new(),
+        };
         println!(
-            "{} {} {} {}",
+            "{} {} {} {}{}",
             entry.at.to_rfc3339(),
             entry.token_label,
             entry.method,
-            entry.path
+            entry.path,
+            actor
         );
     }
     Ok(())
@@ -240,6 +252,7 @@ mod tests {
             vec!["repo:repo-a".to_string()],
             true,
             None,
+            None,
         )
         .expect("create");
         let store = TokenStore::load(&dir).expect("load");
@@ -257,8 +270,8 @@ mod tests {
             "brick-token-dup-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        create_token(&dir, "ci".to_string(), vec![], false, None).expect("create");
-        assert!(create_token(&dir, "ci".to_string(), vec![], false, None).is_err());
+        create_token(&dir, "ci".to_string(), vec![], false, None, None).expect("create");
+        assert!(create_token(&dir, "ci".to_string(), vec![], false, None, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

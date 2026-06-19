@@ -599,7 +599,7 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions — PARTIAL (stages A–E done)
+### 8. Server auth and repo/org permissions — PARTIAL (stages A–F done)
 
 **Stage A (scoped token table) landed.** The server auth gate is now a token
 table persisted as `tokens.json` in the data dir. Each token has a label, a
@@ -647,10 +647,20 @@ access; the old secret stops working immediately. Expiry is preserved by default
 `--expires-in-days <n>` resets it, and `--expires-in-days 0` clears it. Rotating
 an unknown label errors rather than creating a token.
 
+**Stage F (actor binding) landed.** A token may be bound to an actor identity
+via `create-token --actor-id <id>`. When bound, the push routes reject any event
+whose `actor.actor_id` differs from the token's bound actor (`403`, whole-batch,
+no partial accept), so a token can only speak for its own actor. Unbound tokens
+(legacy `--auth-token`, admin tokens) are not actor-checked — binding is opt-in
+and backward compatible (`TokenRecord.actor_id` is `#[serde(default)]`). The
+resolved identity flows from the auth middleware to handlers via request
+extensions (`AuthedIdentity`), and the audit log now records the verified actor
+(`AuditEntry.actor_id`), surfaced by `list-tokens` and `audit`. For bound tokens
+the audit actor is guaranteed equal to the event actor, making it the
+trustworthy "who did this write" field.
+
 Still needed before real team/self-host usage:
 
-- bind auth identity to the `ActorRef` recorded on pushed events (audit currently
-  records the token label, not the event actor).
 - a persisted repo→org projection (the current resolver scans the event log per
   repo-routed request when org scopes are in use; fine for MVP, worth indexing
   if org-scoped traffic grows).

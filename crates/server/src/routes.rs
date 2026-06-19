@@ -8,18 +8,18 @@ use std::{path::PathBuf, process::Stdio, sync::Arc};
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use brick_protocol::{ListEventsResponse, PushEventsRequest, PushEventsResponse};
+use brick_protocol::{ListEventsResponse, PushEventsRequest, PushEventsResponse, TraceEvent};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Command;
 
-use crate::auth::{self, AuditLog, TokenStore};
+use crate::auth::{self, AuditLog, AuthedIdentity, TokenStore};
 use crate::index::{
     query_server_sessions, rebuild_server_index, server_index_status, ServerIndexStatus,
     ServerSessionQuery, ServerSessionsResponse,
@@ -165,7 +165,7 @@ pub fn build_router(
 /// for the requested resource (403).
 async fn require_bearer_token(
     State(auth): State<AuthConfig>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let presented = request
@@ -187,15 +187,19 @@ async fn require_bearer_token(
     );
     let required = auth::required_access(request.method());
     match auth.tokens.authorize(token, &target, required) {
-        Ok(label) => {
+        Ok(identity) => {
             if required == auth::Access::Write {
                 auth.audit.record(&auth::AuditEntry {
                     at: chrono::Utc::now(),
-                    token_label: label,
+                    token_label: identity.label.clone(),
+                    actor_id: identity.actor_id.clone(),
                     method: request.method().to_string(),
                     path: request.uri().path().to_string(),
                 });
             }
+            // Carry the resolved identity to handlers (e.g. push routes that
+            // enforce actor binding) via request extensions.
+            request.extensions_mut().insert(identity);
             next.run(request).await
         }
         Err(auth::AuthDenial::UnknownToken | auth::AuthDenial::Expired) => unauthorized(),
@@ -252,8 +256,10 @@ async fn list_repo_events(
 
 async fn push_events(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthedIdentity>>,
     Json(request): Json<PushEventsRequest>,
 ) -> std::result::Result<Json<PushEventsResponse>, (StatusCode, String)> {
+    enforce_actor_binding(identity.as_deref(), &request.events)?;
     let response = state
         .store
         .append_events(&request.events)
@@ -264,13 +270,43 @@ async fn push_events(
 async fn push_repo_events(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
+    identity: Option<Extension<AuthedIdentity>>,
     Json(request): Json<PushEventsRequest>,
 ) -> std::result::Result<Json<PushEventsResponse>, (StatusCode, String)> {
+    enforce_actor_binding(identity.as_deref(), &request.events)?;
     let response = state
         .store
         .append_events_for_repo(Some(&repo_id), &request.events)
         .map_err(route_error)?;
     Ok(Json(response))
+}
+
+/// Enforces a token's bound actor against the events it is pushing.
+///
+/// When `identity` carries `actor_id == Some(bound)`, every event whose
+/// `actor.actor_id` differs is rejected with `403` (no partial accept,
+/// consistent with the repo-mismatch rejection in `append_events_for_repo`).
+/// Unbound tokens (or the open/no-auth server, where `identity` is `None`) are
+/// not actor-checked.
+fn enforce_actor_binding(
+    identity: Option<&AuthedIdentity>,
+    events: &[TraceEvent],
+) -> std::result::Result<(), (StatusCode, String)> {
+    let Some(bound) = identity.and_then(|id| id.actor_id.as_deref()) else {
+        return Ok(());
+    };
+    for event in events {
+        if event.actor.actor_id != bound {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "event {} actor_id {:?} does not match token's bound actor {:?}",
+                    event.event_id, event.actor.actor_id, bound
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn global_index_status(
@@ -863,5 +899,129 @@ mod tests {
             .await
             .expect("authed request");
         assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn event_with_actor(actor_id: &str) -> TraceEvent {
+        TraceEvent::mission_created(
+            ActorRef {
+                actor_type: ActorType::Agent,
+                actor_id: actor_id.to_string(),
+                display_name: None,
+            },
+            MissionId::new(),
+            MissionCreatedPayload {
+                project_id: ProjectId::new(),
+                title: "Server route".to_string(),
+                description: None,
+                status: MissionStatus::Planned,
+                repo_context_id: None,
+            },
+        )
+        .expect("mission event")
+    }
+
+    #[test]
+    fn enforce_actor_binding_is_noop_when_unbound() {
+        // No identity (open server) and an unbound identity both pass any actor.
+        assert!(enforce_actor_binding(None, &[event_with_actor("anyone")]).is_ok());
+        let unbound = AuthedIdentity {
+            label: "admin".to_string(),
+            actor_id: None,
+        };
+        assert!(enforce_actor_binding(Some(&unbound), &[event_with_actor("anyone")]).is_ok());
+    }
+
+    #[test]
+    fn enforce_actor_binding_rejects_mismatched_actor() {
+        let bound = AuthedIdentity {
+            label: "agent-ci".to_string(),
+            actor_id: Some("agent-ci".to_string()),
+        };
+        // Matching actor passes.
+        assert!(enforce_actor_binding(Some(&bound), &[event_with_actor("agent-ci")]).is_ok());
+        // A single mismatched event in the batch rejects the whole push (403).
+        let err = enforce_actor_binding(
+            Some(&bound),
+            &[event_with_actor("agent-ci"), event_with_actor("intruder")],
+        )
+        .expect_err("mismatched actor must be rejected");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("intruder"));
+    }
+
+    /// Builds an auth config with one bound write token (`agent-ci`) for the
+    /// HTTP-level binding test.
+    fn bound_auth(data_dir: &std::path::Path) -> AuthConfig {
+        let mut tokens = TokenStore::default();
+        tokens.add(crate::auth::TokenRecord {
+            label: "agent-ci".to_string(),
+            token_sha256: crate::auth::hash_token("ci-secret"),
+            scopes: vec![crate::auth::Scope::All],
+            access: crate::auth::Access::Write,
+            expires_at: None,
+            actor_id: Some("agent-ci".to_string()),
+        });
+        AuthConfig::new(tokens, AuditLog::new(data_dir))
+    }
+
+    async fn push_with_token(app: &Router, token: &str, actor_id: &str) -> StatusCode {
+        let request = PushEventsRequest {
+            events: vec![event_with_actor(actor_id)],
+        };
+        let body = serde_json::to_vec(&request).expect("serialize request");
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/events")
+                    .header("content-type", "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("push request")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn bound_token_enforces_event_actor_over_http() {
+        let store = ServerStore::new(temp_data_dir("bound-actor"));
+        let app = build_router(store, None, Some(bound_auth(&temp_data_dir("bound-audit"))));
+
+        // Matching actor → accepted.
+        assert_eq!(
+            push_with_token(&app, "ci-secret", "agent-ci").await,
+            StatusCode::OK
+        );
+        // Mismatched actor → 403, even though the token's scope/access allow the
+        // write.
+        assert_eq!(
+            push_with_token(&app, "ci-secret", "someone-else").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn open_server_does_not_actor_check() {
+        // No auth config: the open server accepts any actor (backward compat).
+        let store = ServerStore::new(temp_data_dir("open-actor"));
+        let app = build_router(store, None, None);
+        let request = PushEventsRequest {
+            events: vec![event_with_actor("anyone")],
+        };
+        let body = serde_json::to_vec(&request).expect("serialize request");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("push request");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

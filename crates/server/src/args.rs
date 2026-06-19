@@ -60,6 +60,11 @@ pub enum Command {
         /// Expire the token this many days after issuance. Omit for no expiry.
         #[arg(long)]
         expires_in_days: Option<u32>,
+        /// Bind the token to an actor identity. When set, pushed events must
+        /// carry an `actor.actor_id` equal to this value. Omit to leave the
+        /// token unbound (events are not actor-checked).
+        #[arg(long)]
+        actor_id: Option<String>,
     },
     /// List issued tokens (labels + scope/access summary; never plaintext).
     ListTokens {
