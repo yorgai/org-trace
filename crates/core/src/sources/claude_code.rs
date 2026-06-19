@@ -258,6 +258,7 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
     for value in lines {
         update_session_times(&mut metadata, value.get("timestamp"));
         set_first_path(&mut metadata.repo_path, value.get("cwd"));
+        set_first_path(&mut metadata.cwd, value.get("cwd"));
         set_first_string(&mut metadata.branch, value.get("gitBranch"));
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             saw_sidechain = true;

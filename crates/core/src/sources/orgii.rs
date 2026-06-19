@@ -136,7 +136,7 @@ fn session_from_row(
         model: row.model.clone(),
         input_tokens: None,
         output_tokens: None,
-        repo_path: repo_path.map(PathBuf::from),
+        repo_path: repo_path.clone().map(PathBuf::from),
         branch: row.branch.clone(),
         files_changed,
         lines_added: None,
@@ -145,6 +145,9 @@ fn session_from_row(
         parser_version: ORGII_SQLITE_PARSER_VERSION.to_string(),
         listable: true,
         metadata_json: None,
+        cwd: repo_path.map(PathBuf::from),
+        liveness: crate::Liveness::Unknown,
+        last_activity: None,
     }
 }
 

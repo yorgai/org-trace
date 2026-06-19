@@ -1,12 +1,13 @@
 use anyhow::Result;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
-    list_native_source_sessions, ActivityChunk, NativeSourceSession, SourcePlanWithEdgesUpsert,
-    SourceProfile,
+    list_native_source_sessions, ActivityChunk, Liveness, NativeSourceSession,
+    SourcePlanWithEdgesUpsert, SourceProfile,
 };
 
+use super::liveness::probe_liveness;
 use super::{claude_code, codex_app, cursor_ide, gemini, opencode, orgii, windsurf};
 
 const SOURCE_CLAUDE_CODE: &str = "claude_code";
@@ -18,11 +19,15 @@ const SOURCE_ORGII: &str = "orgii";
 const SOURCE_GEMINI: &str = "gemini";
 
 /// Lists native sessions through the app-specific provider for a source profile.
+///
+/// This is the single funnel through which every provider's results pass, so it
+/// is also where transient [`Liveness`] is computed (never inside providers,
+/// never persisted) — see [`super::liveness`].
 pub fn list_source_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
-    match profile.name.as_str() {
+    let mut sessions = match profile.name.as_str() {
         SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit),
         SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit),
         SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit),
@@ -31,7 +36,63 @@ pub fn list_source_sessions(
         SOURCE_ORGII => orgii::list_sessions(profile, limit),
         SOURCE_GEMINI => gemini::list_sessions(profile, limit),
         _ => list_native_source_sessions(profile, limit),
+    }?;
+    fill_liveness(&mut sessions);
+    Ok(sessions)
+}
+
+/// Fills the transient `liveness` and `last_activity` of each session in place.
+fn fill_liveness(sessions: &mut [NativeSourceSession]) {
+    for session in sessions.iter_mut() {
+        session.liveness =
+            probe_liveness(&session.path, &session.source_app_id, session.modified_at);
+        session.last_activity = session.session_updated_at.or(session.modified_at);
     }
+}
+
+/// Resolves a session's "work scope" — the directory other sessions are judged
+/// to overlap with. Priority: git repo root → recorded cwd → none. A scope that
+/// is the user's home directory or a very shallow path is rejected (returns
+/// `None`) so "everything under `~`" never counts as one shared scope; such
+/// sessions can still match at file granularity.
+pub fn work_scope(session: &NativeSourceSession) -> Option<PathBuf> {
+    let candidate = session.repo_path.clone().or_else(|| session.cwd.clone())?;
+    if is_too_shallow(&candidate) {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// True for paths too broad to be a meaningful shared scope: the home dir, root,
+/// or any path with fewer than two components below root (e.g. `/Users`).
+fn is_too_shallow(path: &Path) -> bool {
+    if let Some(home) = dirs_home() {
+        if path == home {
+            return true;
+        }
+    }
+    // Count non-root components; `/`, `/Users`, `C:\` are too shallow.
+    let depth = path
+        .components()
+        .filter(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+        .count();
+    depth < 2
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Marks whether a session is currently active (convenience for callers).
+pub fn is_active(session: &NativeSourceSession) -> bool {
+    session.liveness == Liveness::Active
 }
 
 /// Lists source plans and recovered plan-session edges through supported providers.

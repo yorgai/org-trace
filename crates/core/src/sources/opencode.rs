@@ -291,6 +291,9 @@ fn session_from_row(
         touched_files: Vec::new(),
         listable: true,
         metadata_json: None,
+        cwd: None,
+        liveness: crate::Liveness::Unknown,
+        last_activity: None,
     })
 }
 

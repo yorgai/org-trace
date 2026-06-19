@@ -135,6 +135,9 @@ pub(in crate::sources) fn composer_header_session(
         touched_files: touched_files_from_composer(composer),
         listable: true,
         metadata_json: None,
+        cwd: None,
+        liveness: crate::Liveness::Unknown,
+        last_activity: None,
     }))
 }
 

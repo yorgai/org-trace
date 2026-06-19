@@ -444,6 +444,19 @@ pub enum HistoryCommand {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
+    /// Lists sessions that appear to be running right now across all sources.
+    Live {
+        /// Source name to scope to, or "all" (default) for every configured source.
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Treat a transcript touched within this many seconds as possibly active.
+        #[arg(long, default_value_t = 120)]
+        window_secs: u64,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     Sessions {
         #[arg(long)]
         source: String,

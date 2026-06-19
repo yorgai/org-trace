@@ -232,6 +232,7 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
         let payload_type = payload.get("type").and_then(Value::as_str);
 
         set_first_path(&mut metadata.repo_path, payload.get("cwd"));
+        set_first_path(&mut metadata.cwd, payload.get("cwd"));
         set_first_string(&mut metadata.model, payload.get("model"));
 
         if metadata.title.is_none() && payload_type == Some("user_message") {

@@ -444,6 +444,25 @@ pub fn handle_history(
             ensure_json(format);
             print_json(&build_sources_response(profiles)?)
         }
+        HistoryCommand::Live {
+            source,
+            limit,
+            window_secs,
+            format,
+        } => {
+            ensure_json(format);
+            let selected_profiles = if source == "all" {
+                profiles.list_profiles()?
+            } else {
+                vec![read_profile(profiles, &source)?]
+            };
+            print_json(&build_live_response(
+                &selected_profiles,
+                &source,
+                limit,
+                window_secs,
+            )?)
+        }
         HistoryCommand::Sessions {
             source,
             limit,
@@ -741,6 +760,184 @@ fn build_sessions_response(
         has_more,
         sessions,
     })
+}
+
+/// JSON DTO for `brick history live`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct HistoryLiveResponse {
+    pub source_id: String,
+    pub window_secs: u64,
+    pub count: usize,
+    pub sessions: Vec<LiveSessionRow>,
+}
+
+/// One currently-active session, with the resolved work scope and a short
+/// "what it is doing" summary for cross-session awareness.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LiveSessionRow {
+    pub source_id: String,
+    pub app_id: String,
+    pub external_session_id: String,
+    pub title: Option<String>,
+    pub path: String,
+    /// Resolved work scope (git repo root or cwd); `None` when too shallow.
+    pub work_scope: Option<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub last_activity: Option<String>,
+    pub touched_files: Vec<String>,
+}
+
+/// Scans the given profiles, returning only sessions whose liveness is `Active`,
+/// most-recent first. Shared by the `history live` CLI and the MCP `live_sessions`
+/// tool so both report identical state. Probe failures on one source are skipped,
+/// not fatal — one unreadable source must not blind the others.
+pub(crate) fn collect_live_sessions(
+    profiles: &[SourceProfile],
+    window_secs: u64,
+    limit: usize,
+) -> Vec<NativeSourceSession> {
+    let _ = window_secs; // window is enforced inside the core liveness probe.
+    let mut live: Vec<NativeSourceSession> = Vec::new();
+    for profile in profiles {
+        let Ok(sessions) = list_source_sessions(profile, Some(limit.max(50))) else {
+            continue;
+        };
+        live.extend(sessions.into_iter().filter(brick_core::is_active));
+    }
+    live.sort_by_key(|session| std::cmp::Reverse(session.last_activity));
+    live.truncate(limit);
+    live
+}
+
+fn build_live_response(
+    profiles: &[SourceProfile],
+    source_label: &str,
+    limit: usize,
+    window_secs: u64,
+) -> Result<HistoryLiveResponse> {
+    let live = collect_live_sessions(profiles, window_secs, limit);
+    let sessions = live.iter().map(live_session_row).collect::<Vec<_>>();
+    Ok(HistoryLiveResponse {
+        source_id: source_label.to_string(),
+        window_secs,
+        count: sessions.len(),
+        sessions,
+    })
+}
+
+/// Projects a live `NativeSourceSession` into its JSON row, resolving work scope.
+pub(crate) fn live_session_row(session: &NativeSourceSession) -> LiveSessionRow {
+    LiveSessionRow {
+        source_id: session.source_app_id.clone(),
+        app_id: session.source_app_id.clone(),
+        external_session_id: session.external_session_id.clone(),
+        title: session.title.clone(),
+        path: session.path.display().to_string(),
+        work_scope: brick_core::work_scope(session).map(|path| path.display().to_string()),
+        repo_path: display_path(session.repo_path.clone()),
+        branch: session.branch.clone(),
+        last_activity: session.last_activity.map(system_time_to_rfc3339),
+        touched_files: session.touched_files.clone(),
+    }
+}
+
+/// Formats a `SystemTime` as an RFC3339 UTC string.
+fn system_time_to_rfc3339(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+/// A tiered cross-session awareness notice for a file the caller is about to
+/// touch. Tier 1 = another live session touched the *same file*; Tier 2 =
+/// another live session is active in the *same work scope* (different file).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LiveBroadcast {
+    /// "file" (same file collision) or "scope" (same work scope, different file).
+    pub tier: &'static str,
+    pub message: String,
+    pub sessions: Vec<LiveSessionRow>,
+}
+
+/// Builds the tiered live broadcast for `path`, excluding the caller's own
+/// session(s) by path identity. Returns `None` when no live session overlaps —
+/// the common case, so recall stays quiet unless there is real contention.
+///
+/// `self_path` is the transcript path of the calling session when known, so a
+/// session never warns about itself.
+pub(crate) fn build_live_broadcast(
+    profiles: &[SourceProfile],
+    target_path: &str,
+    self_path: Option<&str>,
+) -> Option<LiveBroadcast> {
+    let live = collect_live_sessions(profiles, 0, 50);
+    let target = PathBuf::from(target_path);
+    let target_name = target.file_name().map(|name| name.to_owned());
+
+    let mut file_hits: Vec<LiveSessionRow> = Vec::new();
+    let mut scope_hits: Vec<LiveSessionRow> = Vec::new();
+
+    for session in &live {
+        if self_path.is_some_and(|own| own == session.path.to_string_lossy()) {
+            continue;
+        }
+        // Tier 1: did this session touch the same file (by full path or basename)?
+        let touched_same = session.touched_files.iter().any(|touched| {
+            touched == target_path
+                || PathBuf::from(touched)
+                    .file_name()
+                    .map(|name| name.to_owned())
+                    == target_name
+        });
+        if touched_same {
+            file_hits.push(live_session_row(session));
+            continue;
+        }
+        // Tier 2: is this session active in the same work scope as the target?
+        if let Some(scope) = brick_core::work_scope(session) {
+            if target.starts_with(&scope) {
+                scope_hits.push(live_session_row(session));
+            }
+        }
+    }
+
+    if !file_hits.is_empty() {
+        let who = describe_sessions(&file_hits);
+        return Some(LiveBroadcast {
+            tier: "file",
+            message: format!(
+                "⚠️ {} active session(s) recently changed this same file: {who}. \
+                 Coordinate or re-check the file before editing.",
+                file_hits.len()
+            ),
+            sessions: file_hits,
+        });
+    }
+    if !scope_hits.is_empty() {
+        let who = describe_sessions(&scope_hits);
+        return Some(LiveBroadcast {
+            tier: "scope",
+            message: format!(
+                "ℹ️ {} active session(s) are working in this same project right now: {who}. \
+                 Your view of the code here may change under you.",
+                scope_hits.len()
+            ),
+            sessions: scope_hits,
+        });
+    }
+    None
+}
+
+/// Renders a short "who + what" phrase from live session rows for the broadcast
+/// message — uses each session's title as the "what it is doing" summary.
+fn describe_sessions(rows: &[LiveSessionRow]) -> String {
+    rows.iter()
+        .take(3)
+        .map(|row| {
+            let what = row.title.as_deref().unwrap_or("(no title)");
+            format!("{} \"{}\"", row.app_id, what)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn build_plans_response(

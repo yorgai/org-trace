@@ -15,7 +15,10 @@ use anyhow::Result;
 use brick_core::{LocalStore, SourceProfileStore};
 use serde_json::{json, Value};
 
-use crate::history::{build_chunks_response, read_profile};
+use crate::history::{
+    build_chunks_response, build_live_broadcast, collect_live_sessions, live_session_row,
+    read_profile,
+};
 use crate::metadata::{build_query_response, build_recall_response};
 
 /// MCP protocol revision this server speaks.
@@ -179,6 +182,24 @@ fn tools_list_result() -> Value {
                     },
                     "required": ["source", "session_id"]
                 }
+            },
+            {
+                "name": "live_sessions",
+                "description": "List AI coding sessions that appear to be running \
+    RIGHT NOW across every tool on this machine (Claude Code, Codex, Cursor, …). \
+    Each result includes its work scope (repo or working dir), the file(s) it \
+    recently touched, and what it is doing. Use this to coordinate with other \
+    in-flight sessions and avoid editing files someone else is actively changing.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "description": "Optional path prefix; only sessions whose \
+    work scope is at or under this path are returned. Omit for all live sessions."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -209,7 +230,21 @@ fn handle_tool_call(
             let path = str_arg(&args, "path")?;
             let recall =
                 build_recall_response(store, profiles, &path, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-            serde_json::to_value(recall)?
+            let mut value = serde_json::to_value(recall)?;
+            // Tiered live-awareness: if another running session collides with this
+            // file or its work scope, attach a broadcast so the agent can avoid a
+            // cross-session edit conflict. Silent when there is no overlap.
+            if let Ok(all_profiles) = profiles.list_profiles() {
+                if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
+                    if let Value::Object(map) = &mut value {
+                        map.insert(
+                            "live_broadcast".to_string(),
+                            serde_json::to_value(broadcast)?,
+                        );
+                    }
+                }
+            }
+            value
         }
         "search_sessions" => {
             let query = str_arg(&args, "query")?;
@@ -233,6 +268,27 @@ fn handle_tool_call(
                 max_field_bytes,
             )?;
             serde_json::to_value(response)?
+        }
+        "live_sessions" => {
+            let scope = args.get("scope").and_then(Value::as_str);
+            let all_profiles = profiles.list_profiles()?;
+            let live = collect_live_sessions(&all_profiles, 0, 50);
+            let rows: Vec<Value> = live
+                .iter()
+                .filter(|session| match scope {
+                    Some(prefix) => brick_core::work_scope(session)
+                        .map(|path| path.starts_with(prefix))
+                        .unwrap_or(false),
+                    None => true,
+                })
+                .map(|session| serde_json::to_value(live_session_row(session)))
+                .collect::<std::result::Result<_, _>>()?;
+            json!({
+                "count": rows.len(),
+                "sessions": rows,
+                "note": "These sessions appear to be running now. Avoid editing files \
+            they recently touched; call read_session to see what one is doing."
+            })
         }
         other => return Err(anyhow::anyhow!("unknown tool: {other}")),
     };

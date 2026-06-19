@@ -16,6 +16,23 @@ const DEFAULT_NATIVE_SESSION_LIMIT: usize = 50;
 const MAX_NATIVE_SCAN_ENTRIES: usize = 10_000;
 pub(crate) const GENERIC_NATIVE_FILE_PARSER_VERSION: &str = "native-file-v1";
 
+/// Whether a source session appears to be running right now.
+///
+/// This is a *transient*, scan-time value — never persisted to SQLite, because a
+/// stored liveness would be stale the moment it lands. It is recomputed on every
+/// `list_source_sessions` call from the source's own turn signals plus file
+/// recency (see [`crate::sources::liveness`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Liveness {
+    /// A turn is in progress, or the transcript changed within the active window.
+    Active,
+    /// No recent activity; the session is idle or finished.
+    Idle,
+    /// Could not determine (unsupported source, unreadable file).
+    #[default]
+    Unknown,
+}
+
 /// Metadata for an external source session that can be imported into Brick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeSourceSession {
@@ -39,6 +56,13 @@ pub struct NativeSourceSession {
     pub touched_files: Vec<String>,
     pub listable: bool,
     pub metadata_json: Option<Value>,
+    /// Working directory the session ran in, used as a work-scope fallback when
+    /// `repo_path` is absent (e.g. Codex sessions in non-git folders).
+    pub cwd: Option<PathBuf>,
+    /// Transient liveness, recomputed per scan (never persisted).
+    pub liveness: Liveness,
+    /// Most recent activity instant (turn signal or file mtime), for ranking.
+    pub last_activity: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -58,6 +82,7 @@ pub(crate) struct NativeSessionMetadata {
     pub touched_files: Vec<String>,
     pub listable: bool,
     pub metadata_json: Option<Value>,
+    pub cwd: Option<PathBuf>,
 }
 
 impl Default for NativeSessionMetadata {
@@ -78,6 +103,7 @@ impl Default for NativeSessionMetadata {
             touched_files: Vec::new(),
             listable: true,
             metadata_json: None,
+            cwd: None,
         }
     }
 }
@@ -233,6 +259,9 @@ fn session_from_path(
         touched_files: extracted.touched_files,
         listable: extracted.listable,
         metadata_json: extracted.metadata_json,
+        cwd: extracted.cwd,
+        liveness: Liveness::Unknown,
+        last_activity: None,
     })
 }
 
