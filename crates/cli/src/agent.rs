@@ -34,27 +34,27 @@ fn managed_block() -> String {
 /// The agent-directed instructions. Command-first and short so agents reliably
 /// act on it. Update `TEMPLATE_VERSION` when this changes.
 const BLOCK_BODY: &str = "\
-## Brick — cross-tool session memory
+## Brick — cross-tool session metadata
 
-Brick is a local index of past AI coding sessions across every tool on this
+Brick is a local metadata index of past AI coding sessions across every tool on this
 machine. Use it to recall prior decisions instead of rediscovering them.
 
 ### Workflow
 
 - Before editing a file, recall who changed it and why in one call:
-  `brick memory recall --path <file> --format json`
+  `brick metadata recall --path <file> --format json`
   This returns a one-line summary plus per-session intent, change size, and a
   `recall_chunks_hint` command for the full transcript when you need detail.
-- To find past sessions by topic (not a specific file), search the index:
-  `brick memory query --query \"<keywords>\" --format json`
+- To find past sessions by topic (not a specific file), search the metadata index:
+  `brick metadata query --query \"<keywords>\" --format json`
   Matches session intent, touched files, repo, and branch; each hit includes a
   `recall_chunks_hint` for the full transcript.
-- For broader project memory, list sources then drill in:
+- For broader project history, list sources then drill in:
   `brick history sources --format json`
   `brick history sessions --source <id> --format json`
   `brick history chunks --source <id> --session-id <sid> --format json`
 
-All `brick memory` and `brick history` commands support `--format json`.";
+All `brick metadata` and `brick history` commands support `--format json`.";
 
 /// One memory file to act on, resolved from a target + scope.
 #[derive(Debug, Clone)]
@@ -87,7 +87,7 @@ pub fn init_prompt(dir: &Path) -> Result<()> {
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        println!("Run `brick agent install` to make coding agents use Brick memory.");
+        println!("Run `brick agent install` to make coding agents use Brick metadata.");
         return Ok(());
     }
     let confirm = dialoguer::Confirm::new()
@@ -398,7 +398,7 @@ mod tests {
         let content = std::fs::read_to_string(&file.path).expect("read");
         assert_eq!(content.matches(BLOCK_START_PREFIX).count(), 1);
         assert_eq!(content.matches(BLOCK_END).count(), 1);
-        assert!(content.contains("brick memory recall"));
+        assert!(content.contains("brick metadata recall"));
     }
 
     #[test]

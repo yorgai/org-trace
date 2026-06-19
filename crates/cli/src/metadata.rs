@@ -1,4 +1,4 @@
-//! `brick memory recall` — agent-facing recall over indexed history.
+//! `brick metadata recall` — agent-facing recall over indexed metadata.
 //!
 //! Where `brick history file-session-blame` returns raw attribution rows, this
 //! command aggregates them into a compact, human/agent-readable summary of *who*
@@ -14,7 +14,7 @@ use brick_core::{
 };
 use serde::Serialize;
 
-use crate::args::MemoryCommand;
+use crate::args::MetadataCommand;
 use crate::history::{
     build_file_session_blame_response, ensure_json, print_json, read_profile,
     refresh_profiles_to_metadata,
@@ -23,14 +23,14 @@ use crate::history::{
 /// Refresh ceiling shared with `brick history`: index all sessions before query.
 const QUERY_REFRESH_LIMIT: usize = 100_000;
 
-/// Entry point for `brick memory <subcommand>`.
-pub fn handle_memory(
-    command: MemoryCommand,
+/// Entry point for `brick metadata <subcommand>`.
+pub fn handle_metadata(
+    command: MetadataCommand,
     profiles: &SourceProfileStore,
     store: &LocalStore,
 ) -> Result<()> {
     match command {
-        MemoryCommand::Recall {
+        MetadataCommand::Recall {
             path,
             source,
             limit,
@@ -41,7 +41,7 @@ pub fn handle_memory(
                 store, profiles, &path, &source, limit,
             )?)
         }
-        MemoryCommand::Query {
+        MetadataCommand::Query {
             query,
             source,
             limit,
@@ -55,7 +55,7 @@ pub fn handle_memory(
 
 /// The aggregated recall payload: a short summary plus per-session entries.
 #[derive(Debug, Serialize, PartialEq)]
-pub struct MemoryRecallResponse {
+pub struct MetadataRecallResponse {
     pub schema: String,
     pub file_path: String,
     pub source: String,
@@ -89,7 +89,7 @@ fn build_recall_response(
     file_path: &str,
     source: &str,
     limit: usize,
-) -> Result<MemoryRecallResponse> {
+) -> Result<MetadataRecallResponse> {
     let blame = build_file_session_blame_response(store, profiles, file_path, source, limit)?;
 
     // Enrich each blame row with the session title from the metadata DB so the
@@ -123,8 +123,8 @@ fn build_recall_response(
     }
 
     let summary = summarize(file_path, &sessions);
-    Ok(MemoryRecallResponse {
-        schema: "memory-recall-v1".to_string(),
+    Ok(MetadataRecallResponse {
+        schema: "metadata-recall-v1".to_string(),
         file_path: file_path.to_string(),
         source: source.to_string(),
         status: blame.status,
@@ -137,7 +137,7 @@ fn build_recall_response(
 
 /// The free-text query payload: a summary plus matching sessions, newest first.
 #[derive(Debug, Serialize, PartialEq)]
-pub struct MemoryQueryResponse {
+pub struct MetadataQueryResponse {
     pub schema: String,
     pub query: String,
     pub source: String,
@@ -169,7 +169,7 @@ fn build_query_response(
     query: &str,
     source: &str,
     limit: usize,
-) -> Result<MemoryQueryResponse> {
+) -> Result<MetadataQueryResponse> {
     let mut errors = Vec::new();
     let selected_profiles = if source == "all" {
         profiles.list_profiles()?
@@ -214,8 +214,8 @@ fn build_query_response(
     };
 
     let summary = summarize_query(query, &matches);
-    Ok(MemoryQueryResponse {
-        schema: "memory-query-v1".to_string(),
+    Ok(MetadataQueryResponse {
+        schema: "metadata-query-v1".to_string(),
         query: query.to_string(),
         source: source.to_string(),
         status: status.to_string(),

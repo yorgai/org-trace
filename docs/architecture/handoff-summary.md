@@ -694,10 +694,10 @@ block in place. Subcommands: `install` (`--target claude|codex|gemini|all`,
 writes per-user locations (`~/.claude`, `~/.codex`, `~/.gemini`) best-effort and
 skips-with-reason when a path can't be resolved. `brick init` offers to run it.
 
-Out of scope (future): a higher-level `brick memory recall` that aggregates
-`file-session-blame` + `chunks` into a short summary, and per-turn dynamic prompt
-injection via tool hooks/daemon. The static convention-file layer ships first
-because it is the highest-leverage step with no runtime dependencies.
+Out of scope (future): a higher-level `brick memory` system beyond metadata-only
+recall/query, and per-turn dynamic prompt injection via tool hooks/daemon. The
+static convention-file layer ships first because it is the highest-leverage step
+with no runtime dependencies.
 
 ### Touched-files backfill (`file-session-blame` now returns real data) — DONE
 
@@ -768,14 +768,14 @@ codex, claude, orgii, and gemini. The blame query's repo-path relaxation +
 or relative path. Parser versions fold into the source fingerprint, so each parser
 upgrade auto-reindexes without a manual command.
 
-### `brick memory recall` — one-call agent recall — DONE
+### `brick metadata recall` — one-call metadata recall — DONE
 
-`crates/cli/src/memory.rs` adds `brick memory recall --path <file>`, the single
+`crates/cli/src/metadata.rs` adds `brick metadata recall --path <file>`, the single
 command the agent-awareness block now points at (TEMPLATE_VERSION bumped to 2).
 It reuses `build_file_session_blame_response` (so it aggregates across every
 source) and enriches each blame row by joining `(source_id, external_session_id)`
 back to the metadata DB for the session title — the *intent*/"why". Output
-(`memory-recall-v1`):
+(`metadata-recall-v1`):
 
 - `summary` — one natural-language line ("N prior sessions touched <file> (via
   <tools>). Most recent: \"<intent>\".") for direct agent consumption.
@@ -787,18 +787,18 @@ back to the metadata DB for the session title — the *intent*/"why". Output
 Verified live: recall returns real intent across codex (`sample_sales.csv`),
 claude (`blame_target.py`), orgii (`index.tsx`, 5 sessions), and gemini
 (`handler.py`); a never-touched path returns `status: empty` with a friendly
-summary. Wiring note: `Command::Memory` is exempted from global
+summary. Wiring note: `Command::Metadata` is exempted from global
 `selected_profile` resolution in `main.rs` (like `History`) so `--source all`
 works.
 
-### `brick memory query` — free-text session search — DONE
+### `brick metadata query` — free-text session metadata search — DONE
 
-`brick memory query --query "<keywords>"` finds past sessions by topic when you
+`brick metadata query --query "<keywords>"` finds past sessions by topic when you
 don't have a specific file in hand. `metadata_db.query_source_sessions_text`
 (new) does case-insensitive substring matching over the *already-indexed*
 session metadata — title/name (intent), touched files, repo path, branch, and
 model — so it is instant and never loads a transcript. Output
-(`memory-query-v1`): a one-line `summary` plus `matches[]` (source, intent,
+(`metadata-query-v1`): a one-line `summary` plus `matches[]` (source, intent,
 repo/branch, change size, touched files, and a `recall_chunks_hint`). `status`
 is `ok` / `empty` / `error`.
 

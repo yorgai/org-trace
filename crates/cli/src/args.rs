@@ -105,9 +105,9 @@ pub enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
-    Memory {
+    Metadata {
         #[command(subcommand)]
-        command: MemoryCommand,
+        command: MetadataCommand,
     },
     Sync {
         #[command(subcommand)]
@@ -528,9 +528,9 @@ pub enum HistoryFormatArg {
     Json,
 }
 
-/// `brick memory <subcommand>` — agent-facing recall over indexed history.
+/// `brick metadata <subcommand>` — agent-facing recall over indexed metadata.
 #[derive(Debug, Subcommand)]
-pub enum MemoryCommand {
+pub enum MetadataCommand {
     /// Summarize who changed a file across past sessions and why.
     Recall {
         #[arg(long)]
