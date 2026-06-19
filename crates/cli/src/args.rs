@@ -95,6 +95,11 @@ pub enum Command {
     },
     /// Run as an MCP server over stdio so any MCP-capable agent can query Brick.
     McpServe,
+    /// Publish, list, or clear active-work announcements (the bulletin board).
+    Announce {
+        #[command(subcommand)]
+        command: AnnounceCommand,
+    },
     Source {
         #[command(subcommand)]
         command: SourceCommand,
@@ -435,6 +440,51 @@ pub enum SourceCommand {
     Use {
         #[arg(long)]
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AnnounceCommand {
+    /// Publish a claim: "I'm working on <scope>, here's a heads-up".
+    Claim {
+        /// File path or glob being claimed (e.g. auth.rs, crates/core/src/**/*.rs).
+        scope: String,
+        /// One-line note: what you're doing / why others should hold off.
+        #[arg(long)]
+        message: String,
+        /// Source/app id of the publisher (defaults to the global --source).
+        #[arg(long)]
+        source: Option<String>,
+        /// Publisher session id (defaults to the global --session).
+        #[arg(long)]
+        session: Option<String>,
+        /// Working dir / repo the claim is made from (defaults to cwd).
+        #[arg(long)]
+        work_dir: Option<String>,
+        /// Time-to-live in minutes before the claim auto-expires (default 240).
+        #[arg(long)]
+        ttl_minutes: Option<i64>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    /// Remove your claims: a specific --scope, or all for the session.
+    Release {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    /// List active claims; with --path, only those covering that path.
+    List {
+        /// Only show claims whose scope covers this path.
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
     },
 }
 

@@ -16,6 +16,7 @@ use clap::Parser;
 use dialoguer::{Confirm, Input, MultiSelect};
 
 mod agent;
+mod announce;
 mod args;
 mod claude_hook;
 mod commands;
@@ -31,6 +32,7 @@ mod source;
 mod sync;
 
 use agent::handle_agent;
+use announce::handle_announce;
 use args::{Cli, Command, EvidenceCommand, MaintenanceCommand, SessionCommand, SyncCommand};
 use commands::{
     handle_artifact, handle_evidence, handle_import, handle_mission, handle_org, handle_project,
@@ -77,6 +79,7 @@ fn main() -> Result<()> {
         | Command::History { .. }
         | Command::Metadata { .. }
         | Command::McpServe
+        | Command::Announce { .. }
         | Command::Agent { .. } => None,
         _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
@@ -190,6 +193,11 @@ fn main() -> Result<()> {
         Command::History { command } => handle_history(command, &source_profiles, &store)?,
         Command::Metadata { command } => handle_metadata(command, &source_profiles, &store)?,
         Command::McpServe => mcp::serve(&source_profiles, &store)?,
+        Command::Announce { command } => handle_announce(
+            command,
+            cli.source.as_deref(),
+            cli.identity.session.as_deref(),
+        )?,
         Command::Sync { command } => match command {
             SyncCommand::Run(args) => handle_sync(&store, args.dry_run, args.remote, args.repo_id)?,
             SyncCommand::Push(args) => {

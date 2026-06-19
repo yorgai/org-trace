@@ -12,7 +12,8 @@
 use std::io::{BufRead, Write};
 
 use anyhow::Result;
-use brick_core::{LocalStore, SourceProfileStore};
+use brick_core::{AnnouncementStore, LocalStore, NewAnnouncement, SourceProfileStore};
+use chrono::Duration;
 use serde_json::{json, Value};
 
 use crate::history::{
@@ -100,7 +101,9 @@ fn initialize_result() -> Value {
         "instructions": "Brick exposes cross-tool AI coding session memory. Use \
     explore_memory for an open question, recall_file before editing a file, \
     search_sessions to find past work by topic, and read_session to page through a \
-    specific session's transcript."
+    specific session's transcript. Before starting a non-trivial edit, call \
+    announce_work to post a heads-up so other sessions hold off; recall_file \
+    surfaces any active claims on the file you ask about."
     })
 }
 
@@ -200,6 +203,60 @@ fn tools_list_result() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "announce_work",
+                "description": "Post a heads-up on the cross-session bulletin board \
+    BEFORE you start editing: 'I'm changing X, hold off'. Other sessions calling \
+    recall_file on a matching path will see your note and avoid clobbering your \
+    work. The claim auto-expires (default 4h) so you don't have to remember to \
+    clear it. Call this when you begin a non-trivial change to a file or area.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "description": "File path or glob you are claiming, e.g. \
+    'crates/core/src/auth.rs' or 'crates/cli/src/**/*.rs'. A bare filename like \
+    'auth.rs' matches that file anywhere."
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "One line: what you're doing and any warning, \
+    e.g. 'refactoring token validation, please hold off ~1h'."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Your session id, so others can tell who to \
+    coordinate with and the claim clears when your session ends. Optional."
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Your tool/app id (e.g. claude_code). Optional."
+                        },
+                        "ttl_minutes": {
+                            "type": "integer",
+                            "description": "Minutes until the claim auto-expires (default 240)."
+                        }
+                    },
+                    "required": ["scope", "message"]
+                }
+            },
+            {
+                "name": "list_announcements",
+                "description": "List active bulletin-board claims (other sessions' \
+    'I'm working on X' notes). With `path`, only claims covering that path. Call \
+    before editing to check nobody has claimed the area you're about to touch.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Only show claims whose scope covers this path. \
+    Omit to list every active claim."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -241,6 +298,25 @@ fn handle_tool_call(
                             "live_broadcast".to_string(),
                             serde_json::to_value(broadcast)?,
                         );
+                    }
+                }
+            }
+            // Bulletin-board claims: another session may have explicitly asked
+            // others to hold off this file/area. Surface those notes directly.
+            if let Ok(announce_store) = AnnouncementStore::open_global() {
+                if let Ok(claims) = announce_store.matching(&path) {
+                    if !claims.is_empty() {
+                        if let Value::Object(map) = &mut value {
+                            map.insert(
+                                "active_claims".to_string(),
+                                json!({
+                                    "count": claims.len(),
+                                    "message": "Another session posted a heads-up covering \
+                                this path. Review before editing.",
+                                    "claims": claims,
+                                }),
+                            );
+                        }
                     }
                 }
             }
@@ -289,6 +365,49 @@ fn handle_tool_call(
                 "note": "These sessions appear to be running now. Avoid editing files \
             they recently touched; call read_session to see what one is doing."
             })
+        }
+        "announce_work" => {
+            let scope = str_arg(&args, "scope")?;
+            let message = str_arg(&args, "message")?;
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("mcp-session")
+                .to_string();
+            let source_id = args
+                .get("source")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("mcp")
+                .to_string();
+            let ttl =
+                usize_arg(&args, "ttl_minutes").map(|minutes| Duration::minutes(minutes as i64));
+            let work_dir = std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string());
+            let announce_store = AnnouncementStore::open_global()?;
+            let announcement = announce_store.publish(NewAnnouncement {
+                source_id,
+                session_id,
+                scope,
+                message,
+                work_dir,
+                ttl,
+            })?;
+            json!({
+                "published": announcement,
+                "note": "Heads-up posted. Other sessions calling recall_file on a \
+            matching path will see it. It auto-expires; no need to clear it manually."
+            })
+        }
+        "list_announcements" => {
+            let announce_store = AnnouncementStore::open_global()?;
+            let claims = match args.get("path").and_then(Value::as_str) {
+                Some(path) if !path.is_empty() => announce_store.matching(path)?,
+                _ => announce_store.list_active()?,
+            };
+            json!({ "count": claims.len(), "announcements": claims })
         }
         other => return Err(anyhow::anyhow!("unknown tool: {other}")),
     };
