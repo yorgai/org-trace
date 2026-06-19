@@ -813,6 +813,42 @@ Verified live: `--query csv` → codex session (intent = the user's prompt),
 `--query nonexistent` → `status: empty`. Agent block (TEMPLATE_VERSION 3) now
 documents both `recall` and `query`.
 
+### Claude Code PreToolUse hook — automatic recall — DONE
+
+The markdown block is a *soft* nudge the agent can forget. For Claude Code,
+recall is now *automatic*: `brick agent install` registers a `PreToolUse` hook so
+before every `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, Claude runs
+`brick metadata recall-hook`, which recalls the target file and injects the
+result into Claude's context — zero reliance on the agent remembering.
+
+Pieces:
+- **`brick metadata recall-hook`** (`metadata.rs`): reads Claude's PreToolUse JSON
+  on stdin, extracts `tool_input.file_path` (then `path`, `notebook_path`), runs
+  the existing recall, and emits `hookSpecificOutput.additionalContext`. Stays
+  *silent* (exit 0, no output) when there's no path or no history, and swallows
+  errors to stderr — a memory hook must never block a tool call. Output is the
+  compact recall summary (well under Claude's 10k additionalContext cap; chunks
+  are never dumped).
+- **`claude_hook.rs`**: merges a Brick-owned hook entry into
+  `~/.claude/settings.json` (global) or `<dir>/.claude/settings.json` (local),
+  keyed by the `brick metadata recall-hook` command marker so install is
+  idempotent, uninstall is exact, and the user's other settings/hooks are
+  untouched. Atomic temp-file + rename writes; empty containers pruned on
+  uninstall. The hook command embeds the absolute `brick` path
+  (`current_exe()`), so it works regardless of PATH.
+- **`agent.rs`**: `install`/`uninstall`/`status` now also drive the hook for the
+  claude (or `all`) target, reported as a `claude_hook` outcome row. Other
+  targets skip it silently (Codex/Gemini have no equivalent hook).
+
+Verified live with the real `claude` CLI (`--settings <file> --permission-mode
+acceptEdits`): a PreToolUse wrapper captured the genuine stdin (`tool_name:Edit`,
+absolute `file_path`) and the hook emitted a valid `additionalContext` recalling
+the file — confirming the full auto-inject loop. Install/idempotent/status/
+uninstall round-trip verified; uninstall returns settings.json to `{}`.
+
+Next platforms (same pattern, not yet done): Cursor `.cursor/rules/*.mdc` with a
+glob trigger; Codex/Gemini remain markdown-only (weaker hook story).
+
 ## Design cautions
 
 - Treat ORGII external-history code as a whole subsystem: scan, parse, metadata indexing, source-specific loading/windowing, chunk load, recent paths, impact stats, backfill, and diagnostics move together into Brick over time.

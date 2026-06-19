@@ -1,0 +1,358 @@
+//! Claude Code `PreToolUse` hook management for `brick agent`.
+//!
+//! The agent-awareness markdown block is a *soft* nudge — the agent has to
+//! remember to call `brick metadata recall`. A Claude Code hook makes recall
+//! *automatic*: before every `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, Claude
+//! runs `brick metadata recall-hook`, which recalls the target file and injects
+//! the result into Claude's context. This module merges a Brick-owned hook entry
+//! into `settings.json` without disturbing the user's other hooks, keyed by a
+//! stable marker command so install is idempotent and uninstall is exact.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+/// Tool names whose edits should trigger a recall. Kept to the file-mutating
+/// tools so reads/searches/Bash don't spam context.
+const HOOK_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
+
+/// Stable marker so we can find (and only touch) the Brick-owned hook entry even
+/// if the user reorders or adds their own hooks. The actual command embeds the
+/// resolved `brick` path; this substring identifies ours.
+const HOOK_COMMAND_MARKER: &str = "brick metadata recall-hook";
+
+/// Result of an install/uninstall/status operation on the hook config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookAction {
+    Installed,
+    Updated,
+    Unchanged,
+    Removed,
+    Absent,
+    Present,
+}
+
+impl HookAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookAction::Installed => "installed",
+            HookAction::Updated => "updated",
+            HookAction::Unchanged => "unchanged",
+            HookAction::Removed => "removed",
+            HookAction::Absent => "absent",
+            HookAction::Present => "present",
+        }
+    }
+}
+
+/// The Claude `settings.json` path for a scope: `<dir>/.claude/settings.json`
+/// locally, or `~/.claude/settings.json` globally. Returns `None` when a global
+/// home cannot be resolved.
+pub fn settings_path(global: bool, dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    if global {
+        home.map(|home| home.join(".claude").join("settings.json"))
+    } else {
+        dir.map(|dir| dir.join(".claude").join("settings.json"))
+    }
+}
+
+/// The exact command string the hook runs, embedding the current `brick` binary
+/// path so the hook works regardless of `PATH`.
+fn hook_command(brick_bin: &str) -> String {
+    format!("{brick_bin} metadata recall-hook")
+}
+
+/// Builds the Brick-owned `PreToolUse` matcher block.
+fn brick_hook_entry(brick_bin: &str) -> Value {
+    json!({
+        "matcher": HOOK_MATCHER,
+        "hooks": [
+            {
+                "type": "command",
+                "command": hook_command(brick_bin),
+            }
+        ]
+    })
+}
+
+/// Whether a `PreToolUse` matcher entry is the Brick-owned one (identified by the
+/// marker substring in any of its hook commands).
+fn is_brick_entry(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| command.contains(HOOK_COMMAND_MARKER))
+            })
+        })
+}
+
+/// Installs or refreshes the Brick `PreToolUse` hook in `settings.json`, leaving
+/// all other settings and hooks untouched. Creates the file if absent.
+pub fn install(path: &Path, brick_bin: &str, force: bool) -> Result<HookAction> {
+    let mut root = read_settings(path)?;
+    let desired = brick_hook_entry(brick_bin);
+
+    let pre_tool_use = ensure_pre_tool_use_array(&mut root)?;
+    let existing_index = pre_tool_use.iter().position(is_brick_entry);
+    let action = match existing_index {
+        Some(index) => {
+            if !force && pre_tool_use[index] == desired {
+                return Ok(HookAction::Unchanged);
+            }
+            pre_tool_use[index] = desired;
+            HookAction::Updated
+        }
+        None => {
+            pre_tool_use.push(desired);
+            HookAction::Installed
+        }
+    };
+    write_settings(path, &root)?;
+    Ok(action)
+}
+
+/// Removes the Brick-owned `PreToolUse` hook entry if present, pruning emptied
+/// containers so we don't leave `{"hooks":{"PreToolUse":[]}}` behind.
+pub fn uninstall(path: &Path) -> Result<HookAction> {
+    if !path.exists() {
+        return Ok(HookAction::Absent);
+    }
+    let mut root = read_settings(path)?;
+    let Some(pre_tool_use) = pre_tool_use_array_mut(&mut root) else {
+        return Ok(HookAction::Absent);
+    };
+    let before = pre_tool_use.len();
+    pre_tool_use.retain(|entry| !is_brick_entry(entry));
+    if pre_tool_use.len() == before {
+        return Ok(HookAction::Absent);
+    }
+    prune_empty_hook_containers(&mut root);
+    write_settings(path, &root)?;
+    Ok(HookAction::Removed)
+}
+
+/// Reports whether the Brick hook is present.
+pub fn status(path: &Path) -> Result<HookAction> {
+    if !path.exists() {
+        return Ok(HookAction::Absent);
+    }
+    let mut root = read_settings(path)?;
+    let present =
+        pre_tool_use_array_mut(&mut root).is_some_and(|entries| entries.iter().any(is_brick_entry));
+    Ok(if present {
+        HookAction::Present
+    } else {
+        HookAction::Absent
+    })
+}
+
+/// Reads `settings.json` as a JSON object, returning an empty object when the
+/// file does not exist.
+fn read_settings(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let value: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as JSON", path.display()))?;
+    if !value.is_object() {
+        anyhow::bail!("{} is not a JSON object", path.display());
+    }
+    Ok(value)
+}
+
+/// Writes `settings.json` atomically (temp file + rename), pretty-printed,
+/// creating parent dirs as needed.
+fn write_settings(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let rendered = serde_json::to_string_pretty(value)?;
+    let tmp = path.with_extension("json.brick-tmp");
+    std::fs::write(&tmp, format!("{rendered}\n"))
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("failed to commit {}", path.display()))?;
+    Ok(())
+}
+
+/// Returns a mutable ref to `hooks.PreToolUse`, creating both as needed.
+fn ensure_pre_tool_use_array(root: &mut Value) -> Result<&mut Vec<Value>> {
+    let object = root
+        .as_object_mut()
+        .context("settings root is not a JSON object")?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("settings `hooks` is not a JSON object")?;
+    let pre = hooks
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("settings `hooks.PreToolUse` is not a JSON array")?;
+    Ok(pre)
+}
+
+/// Returns a mutable ref to an existing `hooks.PreToolUse` array, or `None` when
+/// either container is missing.
+fn pre_tool_use_array_mut(root: &mut Value) -> Option<&mut Vec<Value>> {
+    root.get_mut("hooks")?.get_mut("PreToolUse")?.as_array_mut()
+}
+
+/// Drops `hooks.PreToolUse` if it became empty, and `hooks` if that left it
+/// empty, so uninstall is a clean inverse of install.
+fn prune_empty_hook_containers(root: &mut Value) {
+    let Some(object) = root.as_object_mut() else {
+        return;
+    };
+    let Some(hooks) = object.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if hooks
+        .get("PreToolUse")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        hooks.remove("PreToolUse");
+    }
+    if hooks.is_empty() {
+        object.remove("hooks");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_settings(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "brick-hook-{name}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join(".claude").join("settings.json")
+    }
+
+    #[test]
+    fn install_creates_file_with_hook() {
+        let path = temp_settings("create");
+        assert_eq!(
+            install(&path, "/usr/bin/brick", false).unwrap(),
+            HookAction::Installed
+        );
+        let value = read_settings(&path).unwrap();
+        let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(is_brick_entry(&entries[0]));
+        assert_eq!(entries[0]["matcher"], HOOK_MATCHER);
+    }
+
+    #[test]
+    fn install_twice_is_idempotent() {
+        let path = temp_settings("idempotent");
+        install(&path, "/usr/bin/brick", false).unwrap();
+        assert_eq!(
+            install(&path, "/usr/bin/brick", false).unwrap(),
+            HookAction::Unchanged
+        );
+        let value = read_settings(&path).unwrap();
+        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_preserves_user_settings_and_hooks() {
+        let path = temp_settings("preserve");
+        let user = json!({
+            "model": "claude-opus-4",
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo user" }] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Edit", "hooks": [{ "type": "command", "command": "echo post" }] }
+                ]
+            }
+        });
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&user).unwrap()).unwrap();
+
+        install(&path, "/usr/bin/brick", false).unwrap();
+        let value = read_settings(&path).unwrap();
+        assert_eq!(value["model"], "claude-opus-4");
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2); // user's Bash hook + Brick hook
+        assert!(pre.iter().any(|e| e["matcher"] == "Bash"));
+        assert!(pre.iter().any(is_brick_entry));
+        assert_eq!(value["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn force_updates_command_path() {
+        let path = temp_settings("force");
+        install(&path, "/old/brick", false).unwrap();
+        assert_eq!(
+            install(&path, "/new/brick", true).unwrap(),
+            HookAction::Updated
+        );
+        let value = read_settings(&path).unwrap();
+        let cmd = value["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(cmd, "/new/brick metadata recall-hook");
+    }
+
+    #[test]
+    fn uninstall_removes_only_brick_hook_and_prunes() {
+        let path = temp_settings("uninstall");
+        install(&path, "/usr/bin/brick", false).unwrap();
+        assert_eq!(uninstall(&path).unwrap(), HookAction::Removed);
+        let value = read_settings(&path).unwrap();
+        // hooks container pruned because it became empty
+        assert!(value.get("hooks").is_none());
+    }
+
+    #[test]
+    fn uninstall_keeps_user_hooks() {
+        let path = temp_settings("uninstall-keep");
+        let user = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo user" }] }
+                ]
+            }
+        });
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&user).unwrap()).unwrap();
+        install(&path, "/usr/bin/brick", false).unwrap();
+
+        assert_eq!(uninstall(&path).unwrap(), HookAction::Removed);
+        let value = read_settings(&path).unwrap();
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn status_reports_present_absent() {
+        let path = temp_settings("status");
+        assert_eq!(status(&path).unwrap(), HookAction::Absent);
+        install(&path, "/usr/bin/brick", false).unwrap();
+        assert_eq!(status(&path).unwrap(), HookAction::Present);
+    }
+
+    #[test]
+    fn uninstall_absent_when_no_file() {
+        let path = temp_settings("uninstall-absent");
+        assert_eq!(uninstall(&path).unwrap(), HookAction::Absent);
+    }
+}

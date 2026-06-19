@@ -7,6 +7,11 @@
 //! `brick history` to recall what past sessions did to the files it is about to
 //! touch. Edits are confined to the managed region and written atomically, so a
 //! user's existing memory file is never corrupted.
+//!
+//! The markdown block is a *soft* nudge. For Claude Code, `install` additionally
+//! registers a `PreToolUse` hook (see [`crate::claude_hook`]) so recall fires
+//! *automatically* before every edit — the seamless path that does not depend on
+//! the agent remembering to call Brick.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +21,7 @@ use serde::Serialize;
 use crate::args::{
     AgentCommand, AgentFormatArg, AgentInstallArgs, AgentTargetArg, AgentTargetArgs,
 };
+use crate::claude_hook;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
@@ -123,6 +129,10 @@ fn install(args: AgentInstallArgs) -> Result<()> {
         let action = file.install(args.force)?;
         outcomes.push(file.outcome(action));
     }
+    if let Some(outcome) = claude_hook_outcome(&args.target, HookOp::Install { force: args.force })
+    {
+        outcomes.push(outcome);
+    }
     report(&outcomes, format);
     Ok(())
 }
@@ -134,6 +144,9 @@ fn uninstall(args: AgentTargetArgs) -> Result<()> {
     for file in files {
         let action = file.uninstall()?;
         outcomes.push(file.outcome(action));
+    }
+    if let Some(outcome) = claude_hook_outcome(&args, HookOp::Uninstall) {
+        outcomes.push(outcome);
     }
     report(&outcomes, format);
     Ok(())
@@ -147,8 +160,67 @@ fn status(args: AgentTargetArgs) -> Result<()> {
         let action = file.status()?;
         outcomes.push(file.outcome(action));
     }
+    if let Some(outcome) = claude_hook_outcome(&args, HookOp::Status) {
+        outcomes.push(outcome);
+    }
     report(&outcomes, format);
     Ok(())
+}
+
+/// Which hook operation to run, paired with `claude_hook_outcome`.
+enum HookOp {
+    Install { force: bool },
+    Uninstall,
+    Status,
+}
+
+/// Runs the requested Claude `PreToolUse` hook operation when the claude target
+/// (or `all`) is selected, returning a reportable outcome. The hook is a
+/// Claude-only mechanism, so other targets are skipped silently. A failure to
+/// resolve the settings path or the `brick` binary is reported, not fatal.
+fn claude_hook_outcome(args: &AgentTargetArgs, op: HookOp) -> Option<AgentOutcome> {
+    if !matches!(args.target, AgentTargetArg::Claude | AgentTargetArg::All) {
+        return None;
+    }
+    let home = home_dir();
+    let Some(settings) =
+        claude_hook::settings_path(args.global, args.dir.as_deref(), home.as_deref())
+    else {
+        return Some(hook_outcome(
+            String::new(),
+            "skipped no_known_global_path".to_string(),
+        ));
+    };
+    let path_label = settings.display().to_string();
+    let result = match op {
+        HookOp::Install { force } => match brick_binary() {
+            Ok(bin) => claude_hook::install(&settings, &bin, force),
+            Err(error) => return Some(hook_outcome(path_label, format!("error {error}"))),
+        },
+        HookOp::Uninstall => claude_hook::uninstall(&settings),
+        HookOp::Status => claude_hook::status(&settings),
+    };
+    let action = match result {
+        Ok(action) => action.as_str().to_string(),
+        Err(error) => format!("error {error}"),
+    };
+    Some(hook_outcome(path_label, action))
+}
+
+/// Builds an outcome row for the Claude hook (a distinct pseudo-target).
+fn hook_outcome(path: String, action: String) -> AgentOutcome {
+    AgentOutcome {
+        target: "claude_hook".to_string(),
+        path,
+        action,
+    }
+}
+
+/// Resolves the absolute path to the running `brick` binary so the hook command
+/// works regardless of the user's `PATH`.
+fn brick_binary() -> Result<String> {
+    let exe = std::env::current_exe().context("failed to resolve brick binary path")?;
+    Ok(exe.display().to_string())
 }
 
 /// Resolves the requested targets into concrete files, returning any

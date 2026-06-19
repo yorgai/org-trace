@@ -17,6 +17,7 @@ use dialoguer::{Confirm, Input, MultiSelect};
 
 mod agent;
 mod args;
+mod claude_hook;
 mod commands;
 mod context;
 mod db;

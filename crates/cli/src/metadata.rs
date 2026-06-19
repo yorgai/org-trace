@@ -50,7 +50,88 @@ pub fn handle_metadata(
             ensure_json(format);
             print_json(&build_query_response(profiles, &query, &source, limit)?)
         }
+        MetadataCommand::RecallHook { source, limit } => {
+            run_recall_hook(store, profiles, &source, limit)
+        }
     }
+}
+
+/// Claude Code `PreToolUse` hook adapter.
+///
+/// Reads the tool-call JSON Claude sends on stdin, extracts the target file path
+/// from `tool_input` (`file_path`, then `path`, then `notebook_path`), recalls
+/// that file, and prints a `hookSpecificOutput.additionalContext` JSON object so
+/// the recall lands in Claude's context *before* it edits. When there is no path
+/// or no prior session touched it, the hook stays silent (exit 0, no output) so
+/// it never interferes with the edit. Errors are also swallowed to stderr — a
+/// memory hook must never block a tool call.
+fn run_recall_hook(
+    store: &LocalStore,
+    profiles: &SourceProfileStore,
+    source: &str,
+    limit: usize,
+) -> Result<()> {
+    use std::io::Read;
+
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return Ok(());
+    }
+    let Some(file_path) = parse_hook_file_path(&raw) else {
+        return Ok(());
+    };
+
+    let recall = match build_recall_response(store, profiles, &file_path, source, limit) {
+        Ok(recall) if recall.status == "ok" && !recall.sessions.is_empty() => recall,
+        Ok(_) => return Ok(()),
+        Err(error) => {
+            eprintln!("brick recall-hook: {error}");
+            return Ok(());
+        }
+    };
+
+    let context = render_hook_context(&recall);
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        }
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// Extracts the edited file path from a Claude PreToolUse stdin payload. Looks in
+/// `tool_input` for `file_path`, then `path`, then `notebook_path`.
+fn parse_hook_file_path(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let tool_input = value.get("tool_input")?;
+    for key in ["file_path", "path", "notebook_path"] {
+        if let Some(path) = tool_input.get(key).and_then(serde_json::Value::as_str) {
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Renders a compact recall block for hook injection. Capped well under Claude's
+/// 10k additionalContext limit by relying on the already-small recall summary and
+/// a few per-session lines.
+fn render_hook_context(recall: &MetadataRecallResponse) -> String {
+    let mut out = String::new();
+    out.push_str("Brick memory — prior sessions that changed this file:\n");
+    out.push_str(&recall.summary);
+    for session in recall.sessions.iter().take(5) {
+        let tool = session.source_id.as_deref().unwrap_or("unknown");
+        let intent = session.intent.as_deref().unwrap_or("(no recorded intent)");
+        out.push_str(&format!("\n- [{tool}] {}", truncate(intent, 140)));
+        if let Some(hint) = session.recall_chunks_hint.as_deref() {
+            out.push_str(&format!("\n  full transcript: {hint}"));
+        }
+    }
+    out
 }
 
 /// The aggregated recall payload: a short summary plus per-session entries.

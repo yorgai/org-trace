@@ -553,6 +553,14 @@ pub enum MetadataCommand {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
+    /// Claude Code PreToolUse hook adapter: reads the tool-call JSON on stdin and
+    /// emits `hookSpecificOutput.additionalContext` recalling the target file.
+    RecallHook {
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
