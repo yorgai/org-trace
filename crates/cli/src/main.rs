@@ -24,6 +24,7 @@ mod db;
 mod history;
 mod inspect;
 mod mcp;
+mod mcp_config;
 mod metadata;
 mod output;
 mod source;

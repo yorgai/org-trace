@@ -596,6 +596,8 @@ pub enum AgentTargetArg {
     Codex,
     /// `GEMINI.md` (Gemini).
     Gemini,
+    /// Cursor — MCP-server registration only (no separate memory file).
+    Cursor,
     /// Every known target.
     All,
 }

@@ -22,6 +22,7 @@ use crate::args::{
     AgentCommand, AgentFormatArg, AgentInstallArgs, AgentTargetArg, AgentTargetArgs,
 };
 use crate::claude_hook;
+use crate::mcp_config;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
@@ -133,6 +134,10 @@ fn install(args: AgentInstallArgs) -> Result<()> {
     {
         outcomes.push(outcome);
     }
+    outcomes.extend(mcp_config_outcomes(
+        &args.target,
+        &HookOp::Install { force: args.force },
+    ));
     report(&outcomes, format);
     Ok(())
 }
@@ -148,6 +153,7 @@ fn uninstall(args: AgentTargetArgs) -> Result<()> {
     if let Some(outcome) = claude_hook_outcome(&args, HookOp::Uninstall) {
         outcomes.push(outcome);
     }
+    outcomes.extend(mcp_config_outcomes(&args, &HookOp::Uninstall));
     report(&outcomes, format);
     Ok(())
 }
@@ -163,6 +169,7 @@ fn status(args: AgentTargetArgs) -> Result<()> {
     if let Some(outcome) = claude_hook_outcome(&args, HookOp::Status) {
         outcomes.push(outcome);
     }
+    outcomes.extend(mcp_config_outcomes(&args, &HookOp::Status));
     report(&outcomes, format);
     Ok(())
 }
@@ -216,6 +223,101 @@ fn hook_outcome(path: String, action: String) -> AgentOutcome {
     }
 }
 
+/// One MCP config file Brick can register `brick mcp-serve` into, with the
+/// pseudo-target label used in reports.
+struct McpConfigTarget {
+    label: &'static str,
+    path: PathBuf,
+}
+
+/// Resolves the MCP config files to act on for the selected target + scope.
+///
+/// Claude Code reads MCP servers from `~/.claude.json` (global) or a project
+/// `.mcp.json` (local); Cursor reads from `~/.cursor/mcp.json` (global or local).
+/// Codex/Gemini have no standard MCP-config story here, so they are skipped.
+/// `all` registers both Claude and Cursor; `cursor` targets only Cursor.
+fn mcp_config_targets(args: &AgentTargetArgs) -> Vec<McpConfigTarget> {
+    let is_all = matches!(args.target, AgentTargetArg::All);
+    let want_claude = is_all || matches!(args.target, AgentTargetArg::Claude);
+    let want_cursor = is_all || matches!(args.target, AgentTargetArg::Cursor);
+    let mut targets = Vec::new();
+
+    if want_claude {
+        if args.global {
+            if let Some(home) = home_dir() {
+                targets.push(McpConfigTarget {
+                    label: "claude_mcp",
+                    path: home.join(".claude.json"),
+                });
+            }
+        } else if let Some(base) = local_base(args) {
+            targets.push(McpConfigTarget {
+                label: "claude_mcp",
+                path: base.join(".mcp.json"),
+            });
+        }
+    }
+
+    if want_cursor {
+        if args.global {
+            if let Some(home) = home_dir() {
+                targets.push(McpConfigTarget {
+                    label: "cursor_mcp",
+                    path: home.join(".cursor").join("mcp.json"),
+                });
+            }
+        } else if let Some(base) = local_base(args) {
+            targets.push(McpConfigTarget {
+                label: "cursor_mcp",
+                path: base.join(".cursor").join("mcp.json"),
+            });
+        }
+    }
+    targets
+}
+
+/// Resolves the local working directory base for config files.
+fn local_base(args: &AgentTargetArgs) -> Option<PathBuf> {
+    match args.dir.as_deref() {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => std::env::current_dir().ok(),
+    }
+}
+
+/// Runs the requested MCP-config operation across all applicable targets,
+/// returning a reportable outcome per file. Mirrors `claude_hook_outcome` but for
+/// the pull-side MCP registration.
+fn mcp_config_outcomes(args: &AgentTargetArgs, op: &HookOp) -> Vec<AgentOutcome> {
+    let targets = mcp_config_targets(args);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let brick_bin = brick_binary();
+    targets
+        .into_iter()
+        .map(|target| {
+            let path_label = target.path.display().to_string();
+            let action = match (&brick_bin, op) {
+                (Ok(bin), HookOp::Install { force }) => {
+                    mcp_config::install(&target.path, bin, *force).map(|a| a.as_str().to_string())
+                }
+                (Ok(bin), HookOp::Status) => {
+                    mcp_config::status(&target.path, bin).map(|a| a.as_str().to_string())
+                }
+                (_, HookOp::Uninstall) => {
+                    mcp_config::uninstall(&target.path).map(|a| a.as_str().to_string())
+                }
+                (Err(error), _) => Err(anyhow::anyhow!("{error}")),
+            };
+            AgentOutcome {
+                target: target.label.to_string(),
+                path: path_label,
+                action: action.unwrap_or_else(|error| format!("error {error}")),
+            }
+        })
+        .collect()
+}
+
 /// Resolves the absolute path to the running `brick` binary so the hook command
 /// works regardless of the user's `PATH`.
 fn brick_binary() -> Result<String> {
@@ -233,6 +335,10 @@ fn resolve_targets(args: &AgentTargetArgs) -> Result<(Vec<MemoryFile>, Vec<Agent
             AgentTargetArg::Codex,
             AgentTargetArg::Gemini,
         ],
+        // Cursor is MCP-only — it has no markdown memory file, so it never
+        // contributes a `MemoryFile`; its registration is handled separately
+        // by `mcp_config_outcomes`.
+        AgentTargetArg::Cursor => vec![],
         single => vec![single],
     };
 
@@ -276,6 +382,7 @@ fn resolve_path(
         AgentTargetArg::Claude => home.join(".claude").join(filename),
         AgentTargetArg::Codex => home.join(".codex").join(filename),
         AgentTargetArg::Gemini => home.join(".gemini").join(filename),
+        AgentTargetArg::Cursor => unreachable!("cursor has no memory file (MCP-only)"),
         AgentTargetArg::All => unreachable!("`all` is expanded before path resolution"),
     };
     Ok(Some(path))
@@ -293,6 +400,7 @@ fn target_filename(target: AgentTargetArg) -> &'static str {
         AgentTargetArg::Claude => "CLAUDE.md",
         AgentTargetArg::Codex => "AGENTS.md",
         AgentTargetArg::Gemini => "GEMINI.md",
+        AgentTargetArg::Cursor => unreachable!("cursor has no memory file (MCP-only)"),
         AgentTargetArg::All => unreachable!("`all` is expanded before filename resolution"),
     }
 }
@@ -302,6 +410,7 @@ fn target_label(target: AgentTargetArg) -> &'static str {
         AgentTargetArg::Claude => "claude",
         AgentTargetArg::Codex => "codex",
         AgentTargetArg::Gemini => "gemini",
+        AgentTargetArg::Cursor => "cursor",
         AgentTargetArg::All => "all",
     }
 }
