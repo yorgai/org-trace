@@ -311,6 +311,15 @@ fn mcp_config_targets(args: &AgentTargetArgs) -> Vec<McpConfigTarget> {
         });
     }
 
+    // Gemini CLI: ~/.gemini/settings.json, top-level `mcpServers`.
+    if want(AgentTargetArg::Gemini) {
+        targets.push(McpConfigTarget {
+            label: "gemini_mcp",
+            path: home.join(".gemini").join("settings.json"),
+            format: Format::JsonMcpServers,
+        });
+    }
+
     // VS Code (Copilot): per-user mcp.json, `servers` root key.
     if want(AgentTargetArg::Vscode) {
         if let Some(path) = vscode_user_mcp_path(&home) {
