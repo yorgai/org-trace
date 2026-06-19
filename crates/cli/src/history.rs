@@ -167,6 +167,14 @@ pub struct HistoryRecentPathRow {
 pub struct HistoryChunksResponse {
     pub source_id: String,
     pub session_id: String,
+    /// Total chunks in the session, before pagination.
+    pub total_chunks: usize,
+    /// Zero-based offset this page started at.
+    pub offset: usize,
+    /// Number of chunks returned in this page.
+    pub returned: usize,
+    /// Whether more chunks exist after this page (offset + returned < total).
+    pub has_more: bool,
     pub chunks: Vec<ActivityChunkDto>,
 }
 
@@ -419,6 +427,8 @@ pub fn handle_history(
         HistoryCommand::Chunks {
             source,
             session_id,
+            limit,
+            offset,
             format,
         } => {
             ensure_json(format);
@@ -434,11 +444,18 @@ pub fn handle_history(
                 .ok_or_else(|| {
                     anyhow!("source session not found: {}/{}", profile.name, session_id)
                 })?;
-            let chunks = format_chunks_for_record(&record)?;
+            let all_chunks = format_chunks_for_record(&record)?;
+            let total_chunks = all_chunks.len();
+            let page: Vec<_> = all_chunks.into_iter().skip(offset).take(limit).collect();
+            let returned = page.len();
             print_json(&HistoryChunksResponse {
                 source_id: source,
                 session_id,
-                chunks,
+                total_chunks,
+                offset,
+                returned,
+                has_more: offset + returned < total_chunks,
+                chunks: page,
             })
         }
         HistoryCommand::Export {
@@ -2128,12 +2145,18 @@ mod tests {
         let response = HistoryChunksResponse {
             source_id: "cursor".to_string(),
             session_id: "session-1".to_string(),
+            total_chunks: 0,
+            offset: 0,
+            returned: 0,
+            has_more: false,
             chunks: Vec::new(),
         };
 
         let serialized = serde_json::to_value(&response).expect("serialize chunks");
         assert_eq!(serialized["source_id"], "cursor");
         assert_eq!(serialized["session_id"], "session-1");
+        assert_eq!(serialized["total_chunks"], 0);
+        assert_eq!(serialized["has_more"], false);
         assert!(serialized["chunks"]
             .as_array()
             .expect("chunks array")

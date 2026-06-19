@@ -481,6 +481,10 @@ pub enum HistoryCommand {
         source: String,
         #[arg(long)]
         session_id: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
