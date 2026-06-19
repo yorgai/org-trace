@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { metadataExportFilename, type ExportFormat } from './exportFilename.ts'
 import './App.css'
 
 type RequestState<T> = {
@@ -79,7 +80,6 @@ type HistoryRefreshResponse = {
   }
 }
 
-type ExportFormat = 'json' | 'csv'
 type ExportSchema = 'audit-v1' | 'source-metadata-v1'
 
 const DEFAULT_LIMIT = 50
@@ -350,7 +350,7 @@ function App() {
             </button>
           </div>
           {lastExportUrl ? (
-            <a className="download-link" download={`brick-metadata-${selectedSource}-${selectedSessionId}.${exportFormat}`} href={lastExportUrl}>
+            <a className="download-link" download={metadataExportFilename(selectedSource, selectedSessionId, exportFormat)} href={lastExportUrl}>
               Download {exportFormat.toUpperCase()}
             </a>
           ) : null}

@@ -472,12 +472,20 @@ async fn local_history_export(
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"brick-metadata-{source}-{session_id}.{format}\""
-        ))
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+        local_history_export_content_disposition(&source, &session_id, &format)?,
     );
     Ok((headers, output).into_response())
+}
+
+fn local_history_export_content_disposition(
+    source: &str,
+    session_id: &str,
+    format: &str,
+) -> std::result::Result<HeaderValue, (StatusCode, String)> {
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"brick-metadata-{source}-{session_id}.{format}\""
+    ))
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 async fn run_history_json(
@@ -761,6 +769,18 @@ mod tests {
             .expect("request local history sources");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn local_history_export_uses_metadata_attachment_filename() {
+        let header = local_history_export_content_disposition("codex", "session-123", "json")
+            .expect("content disposition");
+        let value = header.to_str().expect("header string");
+
+        assert_eq!(
+            value,
+            "attachment; filename=\"brick-metadata-codex-session-123.json\""
+        );
     }
 
     #[tokio::test]
