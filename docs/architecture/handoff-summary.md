@@ -507,12 +507,19 @@ Earlier product model / source discovery work:
 >   `brick history linked` commands and core link/list APIs.
 > - Native import dedup via the bridge link with `--force` override (gap 3).
 > - `brick version --format json` for ORGII adapter compatibility gating.
-> - ORGII Stage-1 shadow-read client (`src/engines/SessionCore/sync/brick/`):
->   typed command runner, version gating, DTO validation, parity capture.
+> - `brick source configure` / `source scan --write-defaults` now also persist
+>   `source_profiles` + `source_roots` into the metadata DB (best-effort,
+>   non-fatal), via a shared `persist_profile_metadata` helper.
+> - Cursor IDE reader now treats `composer.composerHeaders` as the authoritative
+>   session list (rich metadata) and merges draft/subagent/parent-link flags from
+>   `composerData:` rows; composerData-only remains a fallback for older DBs.
+> - ORGII Stage-1 shadow-read adapter (`src/engines/SessionCore/sync/brick/`):
+>   typed `BrickHistoryClient`, version gating, DTO validation, parity capture,
+>   and a production `createTauriBrickRunner` backed by the Tauri shell plugin
+>   (`sh -c 'exec "$0" "$@"'`, array args, no injection). 14 vitest cases.
 >
-> Remaining within these gaps: `brick source scan/configure` still does not
-> persist profiles/roots (only history/import refresh does); repo-context links
-> and org/project/mission-filtered sync are unaddressed; ORGII cutover beyond
+> Remaining within these gaps: repo-context links and
+> org/project/mission-filtered sync are unaddressed; ORGII cutover beyond
 > Stage-1 shadow read (dual-read, Brick-primary) is future work.
 
 ### 1. Finish global metadata integration
