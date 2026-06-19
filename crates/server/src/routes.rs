@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Command;
 
+use crate::auth::{self, TokenStore};
 use crate::index::{
     query_server_sessions, rebuild_server_index, server_index_status, ServerIndexStatus,
     ServerSessionQuery, ServerSessionsResponse,
@@ -32,19 +33,18 @@ pub struct AppState {
     pub local_history: Option<LocalHistoryBridge>,
 }
 
-/// Optional bearer-token gate. When `Some`, every route except `/health`
-/// requires `Authorization: Bearer <token>`. When `None`, the server stays
-/// open (append-only MVP behavior). This is the first slice of server auth;
-/// per-repo/org scopes and read/write token tiers remain future work.
+/// Optional token gate. When `Some`, every route except `/health` requires a
+/// bearer token from the table, and the token's scope + access must cover the
+/// requested resource. When `None`, the server stays open (append-only MVP).
 #[derive(Clone)]
 pub struct AuthConfig {
-    token: Arc<String>,
+    tokens: Arc<TokenStore>,
 }
 
 impl AuthConfig {
-    pub fn new(token: String) -> Self {
+    pub fn new(tokens: TokenStore) -> Self {
         Self {
-            token: Arc::new(token),
+            tokens: Arc::new(tokens),
         }
     }
 }
@@ -146,7 +146,8 @@ pub fn build_router(
         .with_state(state)
 }
 
-/// Rejects requests lacking a valid `Authorization: Bearer <token>` header.
+/// Rejects requests whose bearer token is unknown (401) or lacks scope/access
+/// for the requested resource (403).
 async fn require_bearer_token(
     State(auth): State<AuthConfig>,
     request: axum::extract::Request,
@@ -157,14 +158,32 @@ async fn require_bearer_token(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    match presented {
-        Some(token) if token == auth.token.as_str() => next.run(request).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing or invalid bearer token" })),
-        )
-            .into_response(),
+    let Some(token) = presented else {
+        return unauthorized();
+    };
+    let target = auth::resource_target_for_path(request.uri().path());
+    let required = auth::required_access(request.method());
+    match auth.tokens.authorize(token, &target, required) {
+        Ok(_label) => next.run(request).await,
+        Err(auth::AuthDenial::UnknownToken) => unauthorized(),
+        Err(auth::AuthDenial::Forbidden) => forbidden(),
     }
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "missing or invalid bearer token" })),
+    )
+        .into_response()
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "token not permitted for this resource" })),
+    )
+        .into_response()
 }
 
 async fn health() -> Json<Value> {
@@ -745,7 +764,11 @@ mod tests {
     #[tokio::test]
     async fn auth_token_gates_protected_routes_but_not_health() {
         let store = ServerStore::new(temp_data_dir("auth"));
-        let app = build_router(store, None, Some(AuthConfig::new("s3cret".to_string())));
+        let app = build_router(
+            store,
+            None,
+            Some(AuthConfig::new(crate::auth::single_token_store("s3cret"))),
+        );
 
         // /health stays open without a token.
         let health = app

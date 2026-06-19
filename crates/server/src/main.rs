@@ -7,11 +7,15 @@ use anyhow::Result;
 use clap::Parser;
 
 mod args;
+mod auth;
 mod index;
 mod routes;
 mod store;
 
 use args::{Cli, Command};
+use auth::{
+    generate_token, hash_token, parse_scope, scope_summary, Access, Scope, TokenRecord, TokenStore,
+};
 use index::{rebuild_server_index, server_index_status};
 use routes::{serve, AuthConfig, LocalHistoryBridge};
 use store::ServerStore;
@@ -31,9 +35,7 @@ async fn main() -> Result<()> {
         } => {
             let history_bridge =
                 enable_local_history.then(|| LocalHistoryBridge::new(brick_bin, repo_root));
-            let auth = auth_token
-                .filter(|token| !token.is_empty())
-                .map(AuthConfig::new);
+            let auth = resolve_serve_auth(&data_dir, auth_token)?;
             serve(bind, ServerStore::new(data_dir), history_bridge, auth).await?
         }
         Command::RebuildIndex { data_dir, repo_id } => {
@@ -45,7 +47,152 @@ async fn main() -> Result<()> {
         }
         Command::Migrate => println!("migrate is not implemented yet"),
         Command::CreateAdmin => println!("create-admin is not implemented yet"),
+        Command::CreateToken {
+            data_dir,
+            label,
+            scopes,
+            write,
+        } => create_token(&data_dir, label, scopes, write)?,
+        Command::ListTokens { data_dir } => list_tokens(&data_dir)?,
+        Command::RevokeToken { data_dir, label } => revoke_token(&data_dir, &label)?,
     }
 
     Ok(())
+}
+
+/// Resolves the auth gate for `serve`.
+///
+/// Precedence: a persisted token table (if it has any tokens) is used as-is.
+/// A `--auth-token` value is merged in as a convenience all-access token so the
+/// legacy single-token flow keeps working. When neither is present the server
+/// stays open.
+fn resolve_serve_auth(
+    data_dir: &std::path::Path,
+    auth_token: Option<String>,
+) -> Result<Option<AuthConfig>> {
+    let mut tokens = TokenStore::load(data_dir)?;
+    if let Some(plaintext) = auth_token.filter(|token| !token.is_empty()) {
+        tokens.add(TokenRecord {
+            label: "legacy-auth-token".to_string(),
+            token_sha256: hash_token(&plaintext),
+            scopes: vec![Scope::All],
+            access: Access::Write,
+        });
+    }
+    if tokens.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(AuthConfig::new(tokens)))
+    }
+}
+
+fn create_token(
+    data_dir: &std::path::Path,
+    label: String,
+    scopes: Vec<String>,
+    write: bool,
+) -> Result<()> {
+    let mut store = TokenStore::load(data_dir)?;
+    if store.labels().iter().any(|existing| *existing == label) {
+        anyhow::bail!("a token labeled {label:?} already exists; revoke it first");
+    }
+    let parsed_scopes = if scopes.is_empty() {
+        vec![Scope::All]
+    } else {
+        scopes
+            .iter()
+            .map(|scope| parse_scope(scope))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let plaintext = generate_token();
+    store.add(TokenRecord {
+        label: label.clone(),
+        token_sha256: hash_token(&plaintext),
+        scopes: parsed_scopes,
+        access: if write { Access::Write } else { Access::Read },
+    });
+    store.save(data_dir)?;
+    println!("token_label={label}");
+    println!("access={}", if write { "write" } else { "read" });
+    // Plaintext is shown once and never persisted.
+    println!("token={plaintext}");
+    Ok(())
+}
+
+fn list_tokens(data_dir: &std::path::Path) -> Result<()> {
+    let store = TokenStore::load(data_dir)?;
+    println!("token_count={}", store.len());
+    for (label, summary) in scope_summary(&store) {
+        println!("token={label} {summary}");
+    }
+    Ok(())
+}
+
+fn revoke_token(data_dir: &std::path::Path, label: &str) -> Result<()> {
+    let mut store = TokenStore::load(data_dir)?;
+    if store.remove_by_label(label) {
+        store.save(data_dir)?;
+        println!("revoked={label}");
+    } else {
+        println!("not_found={label}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_auth_is_open_without_tokens_or_flag() {
+        let dir = std::env::temp_dir().join(format!(
+            "brick-serve-auth-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let auth = resolve_serve_auth(&dir, None).expect("resolve");
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn serve_auth_uses_legacy_flag_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "brick-serve-auth-flag-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let auth = resolve_serve_auth(&dir, Some("secret".to_string())).expect("resolve");
+        assert!(auth.is_some());
+    }
+
+    #[test]
+    fn create_then_list_then_revoke_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "brick-token-cli-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        create_token(
+            &dir,
+            "ci".to_string(),
+            vec!["repo:repo-a".to_string()],
+            true,
+        )
+        .expect("create");
+        let store = TokenStore::load(&dir).expect("load");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.labels(), vec!["ci"]);
+        revoke_token(&dir, "ci").expect("revoke");
+        let store = TokenStore::load(&dir).expect("reload");
+        assert!(store.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_token_rejects_duplicate_label() {
+        let dir = std::env::temp_dir().join(format!(
+            "brick-token-dup-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        create_token(&dir, "ci".to_string(), vec![], false).expect("create");
+        assert!(create_token(&dir, "ci".to_string(), vec![], false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

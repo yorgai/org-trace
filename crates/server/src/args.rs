@@ -43,4 +43,31 @@ pub enum Command {
     },
     Migrate,
     CreateAdmin,
+    /// Issue a new scoped access token. Prints the plaintext once.
+    CreateToken {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        /// Human-facing label identifying who/what holds the token.
+        #[arg(long)]
+        label: String,
+        /// Resource scope; repeatable. Accepts `*`/`all`, `org:<id>`,
+        /// `repo:<id>`, or a bare repo id. Defaults to `*`.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        /// Grant write access (read + write). Omit for read-only.
+        #[arg(long)]
+        write: bool,
+    },
+    /// List issued tokens (labels + scope/access summary; never plaintext).
+    ListTokens {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+    },
+    /// Revoke a token by its label.
+    RevokeToken {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        label: String,
+    },
 }

@@ -599,21 +599,35 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions — PARTIAL
+### 8. Server auth and repo/org permissions — PARTIAL (stage A done)
 
-First slice landed: optional bearer-token auth. `brick-server serve --auth-token
-<token>` (or `BRICK_SERVER_AUTH_TOKEN`) requires `Authorization: Bearer <token>`
-on every route except `/health`; mismatches return 401. When unset the server
-stays open (append-only MVP, unchanged), so this is non-breaking. Implemented as
-an axum `from_fn_with_state` middleware layered on the protected sub-router, with
-unit + live verification.
+**Stage A (scoped token table) landed.** The server auth gate is now a token
+table persisted as `tokens.json` in the data dir. Each token has a label, a
+SHA-256 hash of the secret (plaintext shown only once at issuance), one or more
+scopes (`*`/`all`, `org:<id>`, or `repo:<id>`), and an access level (read or
+write).
+
+- Middleware: derives the resource target from the route (`/v1/repos/:repo_id/...`
+  → repo target, everything else → global) and the required access from the HTTP
+  method (GET/HEAD/OPTIONS → read, else write). Unknown token → 401; valid token
+  without scope/access → 403. `/health` is always open.
+- CLI: `brick-server create-token --label <l> --scope repo:<id> [--write]`,
+  `list-tokens` (labels + scope/access summary, never plaintext), and
+  `revoke-token --label <l>`.
+- Backward compatible: `--auth-token` / `BRICK_SERVER_AUTH_TOKEN` still works as
+  a convenience all-access write token merged into the table; with no tokens and
+  no flag the server stays open.
+- Verified: 21 server unit tests plus a live scope×access matrix (reader limited
+  to repo-a 200, cross-repo/global/write all 403, admin global+write pass, bogus
+  token 401).
 
 Still needed before real team/self-host usage:
 
-- repo/org authorization scopes (tokens are global, not per-repo/org yet)
-- separate read vs write tokens
-- multiple tokens / token issuance (`create-admin` is still a stub)
-- audit events for sync identity
+- org-scope resolution: `org:<id>` scopes are stored and parsed but do not yet
+  grant repo routes, because per-repo→org mapping is not resolved at the gate.
+- token expiry / rotation.
+- audit events for sync identity (which token/actor did which write).
+- bind auth identity to the `ActorRef` recorded on pushed events.
 
 ## Design cautions
 
