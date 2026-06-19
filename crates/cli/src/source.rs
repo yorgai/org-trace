@@ -47,7 +47,14 @@ fn scan_sources(args: SourceScanArgs, profiles: &SourceProfileStore) -> Result<(
 
     if args.write_defaults {
         for source in &discovered {
-            profiles.write_profile(&profile_from_discovered_source(source))?;
+            let profile = profile_from_discovered_source(source);
+            profiles.write_profile(&profile)?;
+            if let Err(error) = persist_profile_to_metadata(&profile) {
+                eprintln!(
+                    "warning: failed to persist source profile {} to metadata DB: {error:#}",
+                    profile.name
+                );
+            }
             written.push(source.source.profile_name().to_string());
         }
     }
@@ -165,8 +172,19 @@ fn configure_source(args: SourceConfigureArgs, profiles: &SourceProfileStore) ->
         notes: args.notes,
     };
     profiles.write_profile(&profile)?;
+    if let Err(error) = persist_profile_to_metadata(&profile) {
+        eprintln!("warning: failed to persist source profile to metadata DB: {error:#}");
+    }
     println!("source_configured={}", profile.name);
     Ok(())
+}
+
+/// Best-effort persistence of a configured profile into the global metadata DB.
+/// Kept non-fatal so repo-local config still succeeds when the metadata DB is
+/// unavailable (e.g. read-only `BRICK_HOME`).
+fn persist_profile_to_metadata(profile: &SourceProfile) -> Result<()> {
+    let mut metadata_db = brick_core::MetadataDb::open_global()?;
+    crate::history::persist_profile_metadata(&mut metadata_db, profile)
 }
 
 fn list_sources(profiles: &SourceProfileStore) -> Result<()> {

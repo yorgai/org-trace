@@ -1397,6 +1397,18 @@ fn record_source_roots(metadata_db: &mut MetadataDb, profile: &SourceProfile) ->
     Ok(())
 }
 
+/// Persists a source profile row and its configured scan roots into the global
+/// metadata DB. Shared by `source configure` / `source scan --write-defaults`
+/// so profile config side effects are not limited to history/import refreshes.
+pub(crate) fn persist_profile_metadata(
+    metadata_db: &mut MetadataDb,
+    profile: &SourceProfile,
+) -> Result<()> {
+    metadata_db.upsert_source_profile(&source_profile_upsert(profile))?;
+    record_source_roots(metadata_db, profile)?;
+    Ok(())
+}
+
 /// Links a session's repo path into workspace_roots + git_repositories M:N tables.
 fn link_session_repo(
     metadata_db: &mut MetadataDb,
