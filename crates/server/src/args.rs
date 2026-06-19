@@ -73,6 +73,18 @@ pub enum Command {
         #[arg(long)]
         label: String,
     },
+    /// Rotate a token's secret in place, keeping its scopes and access. Prints
+    /// the new plaintext once; the old secret stops working immediately.
+    RotateToken {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        label: String,
+        /// Reset expiry to this many days from now. Omit to keep the token's
+        /// current expiry; pass 0 to clear any expiry.
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+    },
     /// Print the write-audit log (one JSON line per authorized write).
     Audit {
         #[arg(long, default_value = ".brick-server")]

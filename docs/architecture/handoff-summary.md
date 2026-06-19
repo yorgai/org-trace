@@ -599,7 +599,7 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions — PARTIAL (stages A–D done)
+### 8. Server auth and repo/org permissions — PARTIAL (stages A–E done)
 
 **Stage A (scoped token table) landed.** The server auth gate is now a token
 table persisted as `tokens.json` in the data dir. Each token has a label, a
@@ -641,9 +641,14 @@ cost when the token table actually contains an org scope
 org-scoped tokens (deny-by-default). `ResourceTarget::Repo` now carries the
 resolved `org_id`.
 
+**Stage E (token rotation) landed.** `brick-server rotate-token --label <l>`
+issues a fresh secret for an existing token in place, keeping its scopes and
+access; the old secret stops working immediately. Expiry is preserved by default,
+`--expires-in-days <n>` resets it, and `--expires-in-days 0` clears it. Rotating
+an unknown label errors rather than creating a token.
+
 Still needed before real team/self-host usage:
 
-- token rotation (revoke + reissue is supported; in-place rotation is not).
 - bind auth identity to the `ActorRef` recorded on pushed events (audit currently
   records the token label, not the event actor).
 - a persisted repo→org projection (the current resolver scans the event log per

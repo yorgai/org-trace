@@ -56,6 +56,11 @@ async fn main() -> Result<()> {
         } => create_token(&data_dir, label, scopes, write, expires_in_days)?,
         Command::ListTokens { data_dir } => list_tokens(&data_dir)?,
         Command::RevokeToken { data_dir, label } => revoke_token(&data_dir, &label)?,
+        Command::RotateToken {
+            data_dir,
+            label,
+            expires_in_days,
+        } => rotate_token(&data_dir, &label, expires_in_days)?,
         Command::Audit { data_dir, limit } => show_audit(&data_dir, limit)?,
     }
 
@@ -145,6 +150,36 @@ fn revoke_token(data_dir: &std::path::Path, label: &str) -> Result<()> {
         println!("revoked={label}");
     } else {
         println!("not_found={label}");
+    }
+    Ok(())
+}
+
+fn rotate_token(
+    data_dir: &std::path::Path,
+    label: &str,
+    expires_in_days: Option<u32>,
+) -> Result<()> {
+    let mut store = TokenStore::load(data_dir)?;
+    // Keep the current expiry unless --expires-in-days was given; 0 clears it.
+    let expires_at = match expires_in_days {
+        None => match store.expiry_for_label(label) {
+            Some(current) => current,
+            None => anyhow::bail!("no token labeled {label:?}"),
+        },
+        Some(0) => None,
+        Some(days) => Some(chrono::Utc::now() + chrono::Duration::days(i64::from(days))),
+    };
+    let plaintext = generate_token();
+    if store.rotate_by_label(label, hash_token(&plaintext), expires_at) {
+        store.save(data_dir)?;
+        println!("rotated={label}");
+        if let Some(expiry) = expires_at {
+            println!("expires_at={}", expiry.to_rfc3339());
+        }
+        // Plaintext is shown once and never persisted.
+        println!("token={plaintext}");
+    } else {
+        anyhow::bail!("no token labeled {label:?}");
     }
     Ok(())
 }

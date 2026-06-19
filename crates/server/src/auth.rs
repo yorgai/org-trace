@@ -191,6 +191,36 @@ impl TokenStore {
             .collect()
     }
 
+    /// Rotates the secret of the token with the given label in place, keeping
+    /// its scopes and access. The new SHA-256 hash and the optional new expiry
+    /// replace the old ones, immediately invalidating the previous secret.
+    /// Returns whether a token matched. Caller is responsible for persisting.
+    pub fn rotate_by_label(
+        &mut self,
+        label: &str,
+        new_token_sha256: String,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> bool {
+        match self.tokens.iter_mut().find(|token| token.label == label) {
+            Some(token) => {
+                token.token_sha256 = new_token_sha256;
+                token.expires_at = expires_at;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns the current expiry of the token with the given label, if any.
+    /// The outer `Option` distinguishes "no such token" (`None`) from "token
+    /// exists but never expires" (`Some(None)`).
+    pub fn expiry_for_label(&self, label: &str) -> Option<Option<DateTime<Utc>>> {
+        self.tokens
+            .iter()
+            .find(|token| token.label == label)
+            .map(|token| token.expires_at)
+    }
+
     /// Removes the token with the given label, returning whether one matched.
     pub fn remove_by_label(&mut self, label: &str) -> bool {
         let before = self.tokens.len();
@@ -644,6 +674,64 @@ mod tests {
                 .unwrap_err(),
             AuthDenial::Forbidden
         );
+    }
+
+    #[test]
+    fn rotate_replaces_secret_and_keeps_scope() {
+        let mut store = TokenStore::default();
+        store.add(TokenRecord {
+            label: "ci".to_string(),
+            token_sha256: hash_token("old"),
+            scopes: vec![Scope::Repo("repo-a".to_string())],
+            access: Access::Write,
+            expires_at: None,
+        });
+        let target = ResourceTarget::Repo {
+            repo_id: "repo-a".to_string(),
+            org_id: None,
+        };
+
+        // Rotate to a new secret, keeping scope/access.
+        assert!(store.rotate_by_label("ci", hash_token("new"), None));
+        // Old secret no longer authorizes; new one does, with the same scope.
+        assert_eq!(
+            store.authorize("old", &target, Access::Read).unwrap_err(),
+            AuthDenial::UnknownToken
+        );
+        assert_eq!(
+            store.authorize("new", &target, Access::Write).unwrap(),
+            "ci"
+        );
+        // Scope is unchanged: a different repo is still denied.
+        let other = ResourceTarget::Repo {
+            repo_id: "repo-b".to_string(),
+            org_id: None,
+        };
+        assert_eq!(
+            store.authorize("new", &other, Access::Read).unwrap_err(),
+            AuthDenial::Forbidden
+        );
+    }
+
+    #[test]
+    fn rotate_unknown_label_is_noop() {
+        let mut store = TokenStore::default();
+        assert!(!store.rotate_by_label("ghost", hash_token("x"), None));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn expiry_for_label_distinguishes_missing_from_never() {
+        let mut store = TokenStore::default();
+        assert_eq!(store.expiry_for_label("ci"), None);
+        store.add(TokenRecord {
+            label: "ci".to_string(),
+            token_sha256: hash_token("s"),
+            scopes: vec![Scope::All],
+            access: Access::Read,
+            expires_at: None,
+        });
+        assert_eq!(store.expiry_for_label("ci"), Some(None));
     }
 
     #[test]
