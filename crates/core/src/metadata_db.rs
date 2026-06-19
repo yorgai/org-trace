@@ -102,6 +102,60 @@ pub struct SourceSessionListQuery {
     pub offset: usize,
 }
 
+/// Input for inserting or updating a source-profile row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProfileUpsert {
+    pub source_id: String,
+    pub name: Option<String>,
+    pub app_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub actor_type: Option<String>,
+    pub profile_json: Option<Value>,
+}
+
+/// Typed source-profile row returned by metadata DB queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProfileRecord {
+    pub source_id: String,
+    pub name: Option<String>,
+    pub app_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub actor_type: Option<String>,
+    pub profile_json: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Lifecycle status for a source scan row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceScanStatus {
+    Running,
+    Completed,
+    Error,
+}
+
+impl SourceScanStatus {
+    /// Returns the database string form for this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceScanStatus::Running => "running",
+            SourceScanStatus::Completed => "completed",
+            SourceScanStatus::Error => "error",
+        }
+    }
+}
+
+/// Typed source-scan row returned by metadata DB queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceScanRecord {
+    pub source_scan_id: i64,
+    pub source_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: String,
+    pub metadata_json: Option<Value>,
+}
+
 impl MetadataDb {
     /// Opens and initializes the global metadata DB under resolved `BRICK_HOME`.
     pub fn open_global() -> Result<Self> {
@@ -325,6 +379,119 @@ impl MetadataDb {
         external_session_id: &str,
     ) -> Result<Option<SourceSessionRecord>> {
         read_source_session(&self.connection, source_id, external_session_id)
+    }
+
+    /// Updates only the last-seen/updated timestamps for an existing source session.
+    pub fn touch_source_session_last_seen(
+        &mut self,
+        source_id: &str,
+        external_session_id: &str,
+        last_seen_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let affected = self.connection.execute(
+            "UPDATE source_sessions
+             SET last_seen_at = ?3, updated_at = ?4
+             WHERE source_id = ?1 AND external_session_id = ?2",
+            params![
+                source_id,
+                external_session_id,
+                last_seen_at.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Inserts or updates one source-profile row keyed by source ID.
+    pub fn upsert_source_profile(
+        &mut self,
+        profile: &SourceProfileUpsert,
+    ) -> Result<SourceProfileRecord> {
+        let now = Utc::now();
+        let profile_json = serialize_metadata_json(profile.profile_json.as_ref())?;
+        self.connection.execute(
+            "INSERT INTO source_profiles (
+                source_id, name, app_id, actor_id, actor_type, profile_json,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(source_id) DO UPDATE SET
+                name = excluded.name,
+                app_id = excluded.app_id,
+                actor_id = excluded.actor_id,
+                actor_type = excluded.actor_type,
+                profile_json = excluded.profile_json,
+                updated_at = excluded.updated_at",
+            params![
+                profile.source_id,
+                profile.name,
+                profile.app_id,
+                profile.actor_id,
+                profile.actor_type,
+                profile_json,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+        read_source_profile(&self.connection, &profile.source_id)?
+            .context("metadata source-profile row missing after upsert")
+    }
+
+    /// Reads one source-profile row by source ID.
+    pub fn get_source_profile(&self, source_id: &str) -> Result<Option<SourceProfileRecord>> {
+        read_source_profile(&self.connection, source_id)
+    }
+
+    /// Inserts a running source-scan row and returns its generated ID.
+    pub fn begin_source_scan(&mut self, source_id: &str) -> Result<i64> {
+        let now = Utc::now();
+        self.connection.execute(
+            "INSERT INTO source_scans (source_id, source_root_id, started_at, finished_at, status, metadata_json)
+             VALUES (?1, NULL, ?2, NULL, ?3, NULL)",
+            params![
+                source_id,
+                now.to_rfc3339(),
+                SourceScanStatus::Running.as_str(),
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Finalizes a source-scan row with a terminal status and optional metadata.
+    pub fn finish_source_scan(
+        &mut self,
+        source_scan_id: i64,
+        status: SourceScanStatus,
+        metadata_json: Option<&Value>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let metadata_json = serialize_metadata_json(metadata_json)?;
+        self.connection.execute(
+            "UPDATE source_scans
+             SET finished_at = ?2, status = ?3, metadata_json = ?4
+             WHERE source_scan_id = ?1",
+            params![
+                source_scan_id,
+                now.to_rfc3339(),
+                status.as_str(),
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reads one source-scan row by ID.
+    pub fn get_source_scan(&self, source_scan_id: i64) -> Result<Option<SourceScanRecord>> {
+        self.connection
+            .query_row(
+                "SELECT source_scan_id, source_id, started_at, finished_at, status, metadata_json
+                 FROM source_scans
+                 WHERE source_scan_id = ?1",
+                params![source_scan_id],
+                source_scan_from_row,
+            )
+            .optional()
+            .context("failed to read metadata source-scan row")
     }
 
     /// Inserts or updates one source-plan row and replaces its recovered session edges.
@@ -807,6 +974,53 @@ fn source_plan_session_edge_from_row(
         last_seen_at: parse_datetime(last_seen_at)?,
         created_at: parse_datetime(created_at)?,
         updated_at: parse_datetime(updated_at)?,
+        metadata_json: parse_metadata_json(metadata_json)?,
+    })
+}
+
+fn read_source_profile(
+    connection: &Connection,
+    source_id: &str,
+) -> Result<Option<SourceProfileRecord>> {
+    connection
+        .query_row(
+            "SELECT source_id, name, app_id, actor_id, actor_type, profile_json,
+                    created_at, updated_at
+             FROM source_profiles
+             WHERE source_id = ?1",
+            params![source_id],
+            source_profile_from_row,
+        )
+        .optional()
+        .context("failed to read metadata source-profile row")
+}
+
+fn source_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceProfileRecord> {
+    let profile_json: Option<String> = row.get(5)?;
+    let created_at: String = row.get(6)?;
+    let updated_at: String = row.get(7)?;
+    Ok(SourceProfileRecord {
+        source_id: row.get(0)?,
+        name: row.get(1)?,
+        app_id: row.get(2)?,
+        actor_id: row.get(3)?,
+        actor_type: row.get(4)?,
+        profile_json: parse_metadata_json(profile_json)?,
+        created_at: parse_datetime(created_at)?,
+        updated_at: parse_datetime(updated_at)?,
+    })
+}
+
+fn source_scan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceScanRecord> {
+    let started_at: String = row.get(2)?;
+    let finished_at: Option<String> = row.get(3)?;
+    let metadata_json: Option<String> = row.get(5)?;
+    Ok(SourceScanRecord {
+        source_scan_id: row.get(0)?,
+        source_id: row.get(1)?,
+        started_at: parse_datetime(started_at)?,
+        finished_at: parse_optional_datetime(finished_at)?,
+        status: row.get(4)?,
         metadata_json: parse_metadata_json(metadata_json)?,
     })
 }
@@ -1396,5 +1610,145 @@ mod tests {
             METADATA_DB_SCHEMA_VERSION
         );
         assert!(table_exists(&db.connection, "workspace_roots").expect("inspect workspace table"));
+    }
+
+    #[test]
+    fn touch_last_seen_preserves_created_at_and_other_fields() {
+        let path = temp_home("touch-last-seen").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let inserted = db
+            .upsert_source_session(&sample_upsert("Touch session", 0))
+            .expect("insert source session");
+
+        let later = inserted.last_seen_at + chrono::Duration::seconds(30);
+        let touched = db
+            .touch_source_session_last_seen(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID, later)
+            .expect("touch last seen");
+        assert!(touched);
+
+        let reread = db
+            .get_source_session(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("read source session")
+            .expect("session present");
+        assert_eq!(reread.last_seen_at, later);
+        assert_eq!(reread.created_at, inserted.created_at);
+        assert_eq!(reread.title.as_deref(), Some("Touch session"));
+        assert_eq!(reread.source_fingerprint, inserted.source_fingerprint);
+
+        let missing = db
+            .touch_source_session_last_seen(TEST_SOURCE_ID, "does-not-exist", later)
+            .expect("touch missing session");
+        assert!(!missing);
+    }
+
+    #[test]
+    fn fingerprint_change_drives_reindex_decision() {
+        let path = temp_home("fingerprint-delta").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+
+        let mut first = sample_upsert("Delta session", 0);
+        first.source_fingerprint = Some("2026-06-18T01:02:03+00:00:42".to_string());
+        let inserted = db
+            .upsert_source_session(&first)
+            .expect("insert source session");
+
+        // Same fingerprint -> caller should skip and only touch last_seen.
+        let existing = db
+            .get_source_session(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("read existing")
+            .expect("present");
+        assert_eq!(
+            existing.source_fingerprint.as_deref(),
+            Some("2026-06-18T01:02:03+00:00:42")
+        );
+
+        // Changed fingerprint -> caller should re-upsert; created_at stays stable.
+        let mut second = sample_upsert("Delta session updated", 1);
+        second.source_fingerprint = Some("2026-06-18T09:09:09+00:00:84".to_string());
+        let updated = db
+            .upsert_source_session(&second)
+            .expect("update source session");
+        assert_eq!(
+            updated.source_fingerprint.as_deref(),
+            Some("2026-06-18T09:09:09+00:00:84")
+        );
+        assert_eq!(updated.created_at, inserted.created_at);
+        assert_ne!(updated.source_fingerprint, inserted.source_fingerprint);
+    }
+
+    #[test]
+    fn upserts_and_reads_source_profile() {
+        let path = temp_home("source-profile").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+
+        let inserted = db
+            .upsert_source_profile(&SourceProfileUpsert {
+                source_id: "cursor_ide".to_string(),
+                name: Some("cursor_ide".to_string()),
+                app_id: Some("cursor".to_string()),
+                actor_id: Some("agent-1".to_string()),
+                actor_type: Some("agent".to_string()),
+                profile_json: Some(json!({ "name": "cursor_ide", "app_id": "cursor" })),
+            })
+            .expect("insert source profile");
+        assert_eq!(inserted.source_id, "cursor_ide");
+        assert_eq!(inserted.app_id.as_deref(), Some("cursor"));
+
+        let updated = db
+            .upsert_source_profile(&SourceProfileUpsert {
+                source_id: "cursor_ide".to_string(),
+                name: Some("cursor_ide".to_string()),
+                app_id: Some("cursor-renamed".to_string()),
+                actor_id: Some("agent-1".to_string()),
+                actor_type: Some("agent".to_string()),
+                profile_json: Some(json!({ "name": "cursor_ide" })),
+            })
+            .expect("update source profile");
+        assert_eq!(updated.app_id.as_deref(), Some("cursor-renamed"));
+        assert_eq!(updated.created_at, inserted.created_at);
+
+        let read = db
+            .get_source_profile("cursor_ide")
+            .expect("read source profile")
+            .expect("profile present");
+        assert_eq!(read.app_id.as_deref(), Some("cursor-renamed"));
+        assert_eq!(read.actor_type.as_deref(), Some("agent"));
+        assert!(db
+            .get_source_profile("missing")
+            .expect("read missing profile")
+            .is_none());
+    }
+
+    #[test]
+    fn source_scan_lifecycle_running_to_completed() {
+        let path = temp_home("source-scan").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+
+        let scan_id = db.begin_source_scan("claude_code").expect("begin scan");
+        let running = db
+            .get_source_scan(scan_id)
+            .expect("read scan")
+            .expect("scan present");
+        assert_eq!(running.source_id, "claude_code");
+        assert_eq!(running.status, "running");
+        assert!(running.finished_at.is_none());
+
+        db.finish_source_scan(
+            scan_id,
+            SourceScanStatus::Completed,
+            Some(&json!({ "scanned": 3, "reindexed": 1, "skipped": 2 })),
+        )
+        .expect("finish scan");
+
+        let completed = db
+            .get_source_scan(scan_id)
+            .expect("read scan")
+            .expect("scan present");
+        assert_eq!(completed.status, "completed");
+        assert!(completed.finished_at.is_some());
+        assert_eq!(
+            completed.metadata_json,
+            Some(json!({ "scanned": 3, "reindexed": 1, "skipped": 2 }))
+        );
     }
 }

@@ -15,8 +15,9 @@ use brick_core::{
     format_source_session_chunks, list_source_plans, list_source_sessions, metadata_db_path,
     query_sqlite_file_session_blame, ActivityChunk, FileSessionBlameRow, LocalStore, MetadataDb,
     NativeSourceSession, SourceFileSessionBlameQuery, SourcePlanListQuery, SourcePlanRecord,
-    SourcePlanSessionEdgeRecord, SourceProfile, SourceProfileStore, SourceSessionListQuery,
-    SourceSessionRecord, SourceSessionUpsert, SqliteFileSessionBlameQuery,
+    SourcePlanSessionEdgeRecord, SourceProfile, SourceProfileStore, SourceProfileUpsert,
+    SourceScanStatus, SourceSessionListQuery, SourceSessionRecord, SourceSessionUpsert,
+    SqliteFileSessionBlameQuery,
 };
 use brick_protocol::ActorType;
 use chrono::{DateTime, Utc};
@@ -341,11 +342,12 @@ pub fn handle_history(
             ensure_json(format);
             let profile = read_profile(profiles, &source)?;
             let mut metadata_db = MetadataDb::open_global()?;
-            refresh_profiles_to_metadata(
+            let stats = refresh_profiles_to_metadata(
                 &mut metadata_db,
                 std::slice::from_ref(&profile),
                 SOURCE_INDEX_REFRESH_LIMIT,
             )?;
+            eprint_refresh_stats(&profile.name, stats);
             print_json(&build_sessions_response(
                 &metadata_db,
                 &profile,
@@ -497,7 +499,7 @@ fn build_file_session_blame_response(
     };
     if let Some(metadata_db) = metadata_db.as_mut() {
         match refresh_profiles_to_metadata(metadata_db, &selected_profiles, EXPORT_REFRESH_LIMIT) {
-            Ok(()) => {
+            Ok(_) => {
                 let query_source = (source != "all").then(|| source.to_string());
                 match metadata_db.query_source_file_session_blame(&SourceFileSessionBlameQuery {
                     file_path: file_path.to_string(),
@@ -1214,21 +1216,111 @@ fn source_row(profile: SourceProfile, selected: Option<&str>) -> HistorySourceRo
     }
 }
 
+/// Aggregate counters describing a metadata refresh pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RefreshStats {
+    scanned: usize,
+    reindexed: usize,
+    skipped: usize,
+}
+
+impl RefreshStats {
+    fn merge(&mut self, other: RefreshStats) {
+        self.scanned += other.scanned;
+        self.reindexed += other.reindexed;
+        self.skipped += other.skipped;
+    }
+}
+
+fn eprint_refresh_stats(source_id: &str, stats: RefreshStats) {
+    eprintln!(
+        "source={source_id} scanned={} reindexed={} skipped={}",
+        stats.scanned, stats.reindexed, stats.skipped
+    );
+}
+
 fn refresh_profiles_to_metadata(
     metadata_db: &mut MetadataDb,
     profiles: &[SourceProfile],
     limit: usize,
-) -> Result<()> {
+) -> Result<RefreshStats> {
+    let mut totals = RefreshStats::default();
     for profile in profiles {
-        for session in list_source_sessions(profile, Some(limit))? {
-            let upsert = source_session_upsert(profile, session);
-            metadata_db.upsert_source_session(&upsert)?;
+        metadata_db.upsert_source_profile(&source_profile_upsert(profile))?;
+        let scan_id = metadata_db.begin_source_scan(&profile.name)?;
+        let profile_stats = refresh_single_profile(metadata_db, profile, limit);
+        match &profile_stats {
+            Ok(stats) => {
+                metadata_db.finish_source_scan(
+                    scan_id,
+                    SourceScanStatus::Completed,
+                    Some(&json!({
+                        "scanned": stats.scanned,
+                        "reindexed": stats.reindexed,
+                        "skipped": stats.skipped,
+                    })),
+                )?;
+                totals.merge(*stats);
+            }
+            Err(error) => {
+                metadata_db.finish_source_scan(
+                    scan_id,
+                    SourceScanStatus::Error,
+                    Some(&json!({ "error": error.to_string() })),
+                )?;
+            }
         }
-        for plan in list_source_plans(profile)? {
-            metadata_db.upsert_source_plan_with_edges(&plan)?;
+        profile_stats?;
+    }
+    Ok(totals)
+}
+
+fn refresh_single_profile(
+    metadata_db: &mut MetadataDb,
+    profile: &SourceProfile,
+    limit: usize,
+) -> Result<RefreshStats> {
+    let mut stats = RefreshStats::default();
+    for session in list_source_sessions(profile, Some(limit))? {
+        stats.scanned += 1;
+        let upsert = source_session_upsert(profile, session);
+        let existing =
+            metadata_db.get_source_session(&upsert.source_id, &upsert.external_session_id)?;
+        let unchanged = matches!(
+            (&existing, &upsert.source_fingerprint),
+            (Some(record), Some(fingerprint))
+                if record.source_fingerprint.as_deref() == Some(fingerprint.as_str())
+        );
+        if unchanged {
+            metadata_db.touch_source_session_last_seen(
+                &upsert.source_id,
+                &upsert.external_session_id,
+                upsert.last_seen_at,
+            )?;
+            stats.skipped += 1;
+        } else {
+            metadata_db.upsert_source_session(&upsert)?;
+            stats.reindexed += 1;
         }
     }
-    Ok(())
+    for plan in list_source_plans(profile)? {
+        metadata_db.upsert_source_plan_with_edges(&plan)?;
+    }
+    Ok(stats)
+}
+
+fn source_profile_upsert(profile: &SourceProfile) -> SourceProfileUpsert {
+    SourceProfileUpsert {
+        source_id: profile.name.clone(),
+        name: Some(profile.name.clone()),
+        app_id: profile.app_id.clone(),
+        actor_id: profile.actor_id.clone(),
+        actor_type: profile
+            .actor_type
+            .map(format_actor_type)
+            .map(str::to_string),
+        profile_json: serde_json::to_value(profile).ok(),
+    }
 }
 
 fn source_session_upsert(
@@ -1238,6 +1330,8 @@ fn source_session_upsert(
     let now = Utc::now();
     let source_mtime = session.modified_at.map(system_time_to_utc);
     let listable = session.listable;
+    let source_fingerprint =
+        source_mtime.map(|mtime| format!("{}:{}", mtime.to_rfc3339(), session.size_bytes));
     let metadata_json = source_session_metadata(profile, &session);
     SourceSessionUpsert {
         source_id: profile.name.clone(),
@@ -1248,7 +1342,7 @@ fn source_session_upsert(
         source_uri: Some(format!("file://{}", session.path.display())),
         source_mtime,
         source_size: Some(session.size_bytes),
-        source_fingerprint: None,
+        source_fingerprint,
         parser_version: Some(session.parser_version),
         session_created_at: session.session_created_at.map(system_time_to_utc),
         session_updated_at: session.session_updated_at.map(system_time_to_utc),
