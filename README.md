@@ -189,6 +189,9 @@ A natural agent flow: `current_context` → `list_missions` → `manage_mission`
 (create) → do the work → `record_artifact` → `attach_evidence` → `announce_work`.
 All of this is open-source and independent of the proprietary sync layer.
 
+See [`docs/mcp/README.md`](docs/mcp/README.md) for the full reference — every
+tool's input/output shape and the recommended end-to-end flow.
+
 ## Local storage model
 
 Local writes use append-only JSONL under `.brick/provenance/` by default. `brick init` automatically adds `.brick/` to the repository `.gitignore` idempotently, because Brick local state is not source code and should not be committed. The effective store root resolves in this order: `--store-root`, `BRICK_STORE_ROOT`, selected source profile `store_root`, then repo-local `.brick/provenance`.
@@ -201,6 +204,7 @@ Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.b
 
 ## Documentation
 
+- `docs/mcp/README.md`: the MCP capability kit — every agent-callable tool, its input/output, and the recommended flow
 - `docs/architecture/architecture.md`: source metadata index architecture and Mermaid diagrams
 - `docs/architecture/source-querying.md`: platform-specific querying methods and history JSON/CSV contracts
 - `docs/architecture/README.md`: current architecture and phase status

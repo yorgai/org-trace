@@ -66,6 +66,10 @@ The next Brick-native CLI should be Mission-first and should not keep legacy com
 
 Old recorder-shaped commands such as top-level `diff capture`, `artifact upload`, `session upload-log`, `db`, `index`, and standalone `push`/`pull` should be replaced rather than preserved as public aliases. Documentation should show only the Brick-native command set.
 
+### MCP server (`brick mcp-serve`)
+
+The same CLI binary also runs as a Model Context Protocol server over stdio, exposing Brick's memory, planning, work-item management, and coordination surface as agent-callable tools. The tool handlers reuse the same `brick-core` primitives as the CLI (event constructors, `append_event`, index rebuilds), so MCP and CLI never drift. This surface is fully open-source and does not depend on sync. See `../mcp/README.md` for the per-tool reference.
+
 ### `brick-core`
 
 `brick-core` owns local storage, source profile files, repo context capture, diff summarization, blob stores, source metadata indexing, JSON index rebuilds, SQLite rebuilds, and sync-oriented deduplication. The append-only event stream remains authoritative; `index.json` and `brick.sqlite` are disposable derived indexes. `<BRICK_HOME>/metadata.sqlite` is the source metadata index for external history; it is not a transcript store or a second cache layer.
