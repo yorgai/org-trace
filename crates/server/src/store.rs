@@ -161,6 +161,23 @@ impl ServerStore {
         })
     }
 
+    /// Resolves a repo's owning org id by scanning stored events for the first
+    /// event carrying both this `repo_id` and an `org_id`. Returns `None` when
+    /// no stored event ties the repo to an org. Best-effort: an unreadable log
+    /// yields `None` rather than an error, since this feeds an auth decision
+    /// that must stay deny-by-default.
+    pub fn resolve_repo_org(&self, repo_id: &str) -> Option<String> {
+        let events = self.read_sequenced_events().ok()?;
+        events.into_iter().find_map(|entry| {
+            let event = entry.event;
+            if event.repo_id.as_deref() == Some(repo_id) {
+                event.org_id.map(|org| org.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
     fn read_sequenced_events(&self) -> Result<Vec<SequencedEvent>> {
         let path = self.events_path();
         if !path.exists() {
@@ -307,6 +324,23 @@ mod tests {
         assert!(store
             .append_events_for_repo(Some("repo-a"), &[mismatched])
             .is_err());
+    }
+
+    #[test]
+    fn resolve_repo_org_finds_owning_org_for_repo() {
+        use brick_protocol::OrgId;
+        let store = ServerStore::new(temp_data_dir("repo-org"));
+        let mut tagged = event("tagged", Some("repo-a"));
+        tagged.org_id = Some(OrgId::new());
+        let expected = tagged.org_id.as_ref().map(ToString::to_string);
+        let untagged = event("untagged", Some("repo-b"));
+        store
+            .append_events(&[tagged, untagged])
+            .expect("append events");
+
+        assert_eq!(store.resolve_repo_org("repo-a"), expected);
+        assert_eq!(store.resolve_repo_org("repo-b"), None);
+        assert_eq!(store.resolve_repo_org("repo-missing"), None);
     }
 
     #[test]

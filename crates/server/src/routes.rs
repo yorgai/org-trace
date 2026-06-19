@@ -40,14 +40,27 @@ pub struct AppState {
 pub struct AuthConfig {
     tokens: Arc<TokenStore>,
     audit: Arc<AuditLog>,
+    /// Whether any token has an `Org` scope, so the gate only pays the repo→org
+    /// resolution cost when it can actually affect an authorization decision.
+    needs_org_resolution: bool,
+    /// Event store used to resolve a repo's owning org. Wired in `build_router`.
+    store: Option<Arc<ServerStore>>,
 }
 
 impl AuthConfig {
     pub fn new(tokens: TokenStore, audit: AuditLog) -> Self {
+        let needs_org_resolution = tokens.has_org_scope();
         Self {
             tokens: Arc::new(tokens),
             audit: Arc::new(audit),
+            needs_org_resolution,
+            store: None,
         }
+    }
+
+    fn with_store(mut self, store: Arc<ServerStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -135,7 +148,7 @@ pub fn build_router(
         .route("/v1/repos/:repo_id/sessions", get(repo_sessions));
     let protected = if let Some(auth) = auth {
         protected.layer(axum::middleware::from_fn_with_state(
-            auth,
+            auth.with_store(state.store.clone()),
             require_bearer_token,
         ))
     } else {
@@ -163,7 +176,15 @@ async fn require_bearer_token(
     let Some(token) = presented else {
         return unauthorized();
     };
-    let target = auth::resource_target_for_path(request.uri().path());
+    let target = auth::resource_target_for_path(
+        request.uri().path(),
+        auth.needs_org_resolution,
+        |repo_id| {
+            auth.store
+                .as_ref()
+                .and_then(|store| store.resolve_repo_org(repo_id))
+        },
+    );
     let required = auth::required_access(request.method());
     match auth.tokens.authorize(token, &target, required) {
         Ok(label) => {

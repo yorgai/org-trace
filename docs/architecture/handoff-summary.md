@@ -599,7 +599,7 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions — PARTIAL (stages A–C done)
+### 8. Server auth and repo/org permissions — PARTIAL (stages A–D done)
 
 **Stage A (scoped token table) landed.** The server auth gate is now a token
 table persisted as `tokens.json` in the data dir. Each token has a label, a
@@ -632,13 +632,23 @@ appends a record to `audit.jsonl` in the data dir — `{at, token_label, method,
 path}`. Reads are not audited. View with `brick-server audit [--limit N]`.
 Recording is best-effort (an I/O failure drops the entry, never the request).
 
+**Stage D (org-scope resolution) landed.** An `org:<id>` scope now authorizes a
+repo route when the server can resolve the repo's owning org. The gate resolves
+repo→org by scanning stored events for the first event carrying both the
+`repo_id` and an `org_id` (`ServerStore::resolve_repo_org`), and only pays that
+cost when the token table actually contains an org scope
+(`TokenStore::has_org_scope`). A repo whose org cannot be resolved is denied for
+org-scoped tokens (deny-by-default). `ResourceTarget::Repo` now carries the
+resolved `org_id`.
+
 Still needed before real team/self-host usage:
 
-- org-scope resolution: `org:<id>` scopes are stored and parsed but do not yet
-  grant repo routes, because per-repo→org mapping is not resolved at the gate.
 - token rotation (revoke + reissue is supported; in-place rotation is not).
 - bind auth identity to the `ActorRef` recorded on pushed events (audit currently
   records the token label, not the event actor).
+- a persisted repo→org projection (the current resolver scans the event log per
+  repo-routed request when org scopes are in use; fine for MVP, worth indexing
+  if org-scoped traffic grows).
 
 ## Design cautions
 

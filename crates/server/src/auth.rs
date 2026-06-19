@@ -55,8 +55,13 @@ pub enum Scope {
 /// A resource the caller is trying to reach, derived from the request route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceTarget {
-    /// Repo-scoped route, e.g. `/v1/repos/:repo_id/...`.
-    Repo(String),
+    /// Repo-scoped route, e.g. `/v1/repos/:repo_id/...`. The optional org is the
+    /// repo's owning org when the server could resolve it from stored events,
+    /// letting an `org:<id>` scope authorize the repo route.
+    Repo {
+        repo_id: String,
+        org_id: Option<String>,
+    },
     /// Global route not tied to a single repo, e.g. `/v1/sessions`.
     Global,
 }
@@ -93,16 +98,16 @@ impl TokenRecord {
 ///
 /// Global routes (not tied to a single repo) require an `All` scope, because a
 /// repo- or org-restricted token must not read across the whole server via an
-/// unscoped listing endpoint.
+/// unscoped listing endpoint. A repo route is granted by a matching `Repo`
+/// scope, or by an `Org` scope when the server resolved the repo's owning org.
 fn scope_matches(scope: &Scope, target: &ResourceTarget) -> bool {
     match (scope, target) {
         (Scope::All, _) => true,
-        (Scope::Repo(allowed), ResourceTarget::Repo(requested)) => allowed == requested,
-        // Org scoping is enforced at the repo route only when a repo carries an
-        // org; without per-repo org resolution here, an org scope does not by
-        // itself grant a bare repo route. Org-scoped tokens reach org-tagged
-        // global routes once org resolution lands (future work).
-        (Scope::Org(_), _) => false,
+        (Scope::Repo(allowed), ResourceTarget::Repo { repo_id, .. }) => allowed == repo_id,
+        (Scope::Org(allowed), ResourceTarget::Repo { org_id, .. }) => {
+            org_id.as_deref() == Some(allowed.as_str())
+        }
+        (Scope::Org(_), ResourceTarget::Global) => false,
         (Scope::Repo(_), ResourceTarget::Global) => false,
     }
 }
@@ -160,6 +165,17 @@ impl TokenStore {
     /// Whether the table has no tokens.
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
+    }
+
+    /// Whether any token carries an `Org` scope. The auth gate uses this to
+    /// decide whether resolving a repo's owning org is worth the lookup.
+    pub fn has_org_scope(&self) -> bool {
+        self.tokens.iter().any(|token| {
+            token
+                .scopes
+                .iter()
+                .any(|scope| matches!(scope, Scope::Org(_)))
+        })
     }
 
     /// Adds a token record. Caller is responsible for persisting.
@@ -354,17 +370,33 @@ pub fn required_access(method: &axum::http::Method) -> Access {
     }
 }
 
-/// Extracts a `ResourceTarget` from a request path.
-///
-/// Recognizes `/v1/repos/<repo_id>/...` as a repo target; everything else is a
-/// global target.
-pub fn resource_target_for_path(path: &str) -> ResourceTarget {
+/// Extracts the repo id from a `/v1/repos/<repo_id>/...` path, if present.
+pub fn repo_id_for_path(path: &str) -> Option<String> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
-        ["v1", "repos", repo_id, ..] if !repo_id.is_empty() => {
-            ResourceTarget::Repo((*repo_id).to_string())
+        ["v1", "repos", repo_id, ..] if !repo_id.is_empty() => Some((*repo_id).to_string()),
+        _ => None,
+    }
+}
+
+/// Builds a `ResourceTarget` from a request path, resolving the repo's owning
+/// org via `resolve_org` only when there is at least one `Org` scope in play
+/// (so the lookup cost is skipped entirely for repo/all-only token tables).
+pub fn resource_target_for_path(
+    path: &str,
+    needs_org_resolution: bool,
+    resolve_org: impl FnOnce(&str) -> Option<String>,
+) -> ResourceTarget {
+    match repo_id_for_path(path) {
+        Some(repo_id) => {
+            let org_id = if needs_org_resolution {
+                resolve_org(&repo_id)
+            } else {
+                None
+            };
+            ResourceTarget::Repo { repo_id, org_id }
         }
-        _ => ResourceTarget::Global,
+        None => ResourceTarget::Global,
     }
 }
 
@@ -431,7 +463,10 @@ mod tests {
             expires_at: None,
         });
 
-        let target = ResourceTarget::Repo("repo-a".to_string());
+        let target = ResourceTarget::Repo {
+            repo_id: "repo-a".to_string(),
+            org_id: None,
+        };
         assert_eq!(
             store.authorize("secret", &target, Access::Read).unwrap(),
             "ci"
@@ -452,7 +487,10 @@ mod tests {
             access: Access::Read,
             expires_at: None,
         });
-        let target = ResourceTarget::Repo("repo-a".to_string());
+        let target = ResourceTarget::Repo {
+            repo_id: "repo-a".to_string(),
+            org_id: None,
+        };
         assert_eq!(
             store.authorize("secret", &target, Access::Read).unwrap(),
             "viewer"
@@ -480,7 +518,10 @@ mod tests {
             store
                 .authorize(
                     "secret",
-                    &ResourceTarget::Repo("repo-b".to_string()),
+                    &ResourceTarget::Repo {
+                        repo_id: "repo-b".to_string(),
+                        org_id: None,
+                    },
                     Access::Read
                 )
                 .unwrap_err(),
@@ -503,7 +544,10 @@ mod tests {
         assert!(store
             .authorize(
                 "admin",
-                &ResourceTarget::Repo("anything".to_string()),
+                &ResourceTarget::Repo {
+                    repo_id: "anything".to_string(),
+                    org_id: None,
+                },
                 Access::Write
             )
             .is_ok());
@@ -560,6 +604,95 @@ mod tests {
     }
 
     #[test]
+    fn org_scope_grants_repo_only_when_org_resolves() {
+        let mut store = TokenStore::default();
+        store.add(TokenRecord {
+            label: "org-team".to_string(),
+            token_sha256: hash_token("secret"),
+            scopes: vec![Scope::Org("acme".to_string())],
+            access: Access::Write,
+            expires_at: None,
+        });
+
+        let in_org = ResourceTarget::Repo {
+            repo_id: "repo-a".to_string(),
+            org_id: Some("acme".to_string()),
+        };
+        assert_eq!(
+            store.authorize("secret", &in_org, Access::Write).unwrap(),
+            "org-team"
+        );
+
+        let other_org = ResourceTarget::Repo {
+            repo_id: "repo-b".to_string(),
+            org_id: Some("globex".to_string()),
+        };
+        assert_eq!(
+            store
+                .authorize("secret", &other_org, Access::Read)
+                .unwrap_err(),
+            AuthDenial::Forbidden
+        );
+
+        let unknown_org = ResourceTarget::Repo {
+            repo_id: "repo-c".to_string(),
+            org_id: None,
+        };
+        assert_eq!(
+            store
+                .authorize("secret", &unknown_org, Access::Read)
+                .unwrap_err(),
+            AuthDenial::Forbidden
+        );
+    }
+
+    #[test]
+    fn has_org_scope_detects_org_tokens() {
+        let mut store = TokenStore::default();
+        store.add(TokenRecord {
+            label: "repo-only".to_string(),
+            token_sha256: hash_token("a"),
+            scopes: vec![Scope::Repo("repo-a".to_string())],
+            access: Access::Read,
+            expires_at: None,
+        });
+        assert!(!store.has_org_scope());
+        store.add(TokenRecord {
+            label: "org".to_string(),
+            token_sha256: hash_token("b"),
+            scopes: vec![Scope::Org("acme".to_string())],
+            access: Access::Read,
+            expires_at: None,
+        });
+        assert!(store.has_org_scope());
+    }
+
+    #[test]
+    fn resource_target_resolves_org_only_when_requested() {
+        let target = resource_target_for_path("/v1/repos/repo-a/events", false, |_| {
+            panic!("resolver must not run when org resolution is disabled")
+        });
+        assert_eq!(
+            target,
+            ResourceTarget::Repo {
+                repo_id: "repo-a".to_string(),
+                org_id: None,
+            }
+        );
+        let target = resource_target_for_path("/v1/repos/repo-a/events", true, |repo| {
+            assert_eq!(repo, "repo-a");
+            Some("acme".to_string())
+        });
+        assert_eq!(
+            target,
+            ResourceTarget::Repo {
+                repo_id: "repo-a".to_string(),
+                org_id: Some("acme".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn parse_scope_accepts_known_forms() {
         assert_eq!(parse_scope("*").unwrap(), Scope::All);
         assert_eq!(parse_scope("all").unwrap(), Scope::All);
@@ -581,14 +714,20 @@ mod tests {
     #[test]
     fn resource_target_parses_repo_routes() {
         assert_eq!(
-            resource_target_for_path("/v1/repos/repo-a/events"),
-            ResourceTarget::Repo("repo-a".to_string())
+            resource_target_for_path("/v1/repos/repo-a/events", false, |_| None),
+            ResourceTarget::Repo {
+                repo_id: "repo-a".to_string(),
+                org_id: None,
+            }
         );
         assert_eq!(
-            resource_target_for_path("/v1/sessions"),
+            resource_target_for_path("/v1/sessions", false, |_| None),
             ResourceTarget::Global
         );
-        assert_eq!(resource_target_for_path("/health"), ResourceTarget::Global);
+        assert_eq!(
+            resource_target_for_path("/health", false, |_| None),
+            ResourceTarget::Global
+        );
     }
 
     #[test]
@@ -611,7 +750,10 @@ mod tests {
         assert_eq!(
             loaded.authorize(
                 "secret",
-                &ResourceTarget::Repo("repo-a".to_string()),
+                &ResourceTarget::Repo {
+                    repo_id: "repo-a".to_string(),
+                    org_id: None,
+                },
                 Access::Read
             ),
             Ok("ci".to_string())
