@@ -1,6 +1,6 @@
 # Brick Lab UI
 
-A small React/Vite dashboard for exercising Brick's local server while developing features. It now includes a local external-history workflow for source diagnostics, metadata refresh/backfill, paginated session browsing, and session export.
+A small React/Vite dashboard for exercising Brick's local server while developing features. It now includes a local source-metadata workflow for source diagnostics, metadata refresh/backfill, paginated session browsing, and session export.
 
 ## Run locally
 

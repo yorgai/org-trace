@@ -473,7 +473,7 @@ async fn local_history_export(
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!(
-            "attachment; filename=\"brick-history-{source}-{session_id}.{format}\""
+            "attachment; filename=\"brick-metadata-{source}-{session_id}.{format}\""
         ))
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
     );

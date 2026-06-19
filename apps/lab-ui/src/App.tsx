@@ -232,9 +232,9 @@ function App() {
       <section className="panel top-panel">
         <div className="panel-heading horizontal">
           <div>
-            <p className="eyebrow">Brick local history</p>
-            <h1>Source index and export</h1>
-            <p>Detect local agent stores, index their session metadata, browse sessions, then export one session as JSON or CSV.</p>
+            <p className="eyebrow">Brick source metadata</p>
+            <h1>Metadata index and export</h1>
+            <p>Detect local agent stores, index their session metadata, browse indexed sessions, then export one session as JSON or CSV.</p>
           </div>
           <div className="primary-actions">
             <button className="secondary-button" type="button" onClick={() => void loadSources()}>
@@ -265,7 +265,7 @@ function App() {
               {indexState.loading ? 'Refreshing…' : 'Refresh selected'}
             </button>
           </div>
-          {sources.length === 0 && !sourcesState.loading ? <div className="empty-state">No indexed sources loaded yet. Click Detect + index.</div> : null}
+          {sources.length === 0 && !sourcesState.loading ? <div className="empty-state">No metadata sources loaded yet. Click Detect + index.</div> : null}
           <div className="source-list">
             {sources.map((source) => {
               const total = indexedTotals.get(source.source_id)?.total
@@ -350,7 +350,7 @@ function App() {
             </button>
           </div>
           {lastExportUrl ? (
-            <a className="download-link" download={`brick-history-${selectedSource}-${selectedSessionId}.${exportFormat}`} href={lastExportUrl}>
+            <a className="download-link" download={`brick-metadata-${selectedSource}-${selectedSessionId}.${exportFormat}`} href={lastExportUrl}>
               Download {exportFormat.toUpperCase()}
             </a>
           ) : null}

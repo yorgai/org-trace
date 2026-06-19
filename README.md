@@ -124,10 +124,10 @@ Artifacts are the work products and proof attached to Missions and Sessions. The
 `brick agent install` injects a Brick instruction block into the memory files
 coding agents read as standing context — `CLAUDE.md` (Claude Code), `AGENTS.md`
 (Codex, Cursor, Copilot, OpenCode, …), and `GEMINI.md` (Gemini). The block tells
-the agent to call `brick history` (especially `brick history file-session-blame
---path <file> --format json`) to recall what past sessions did to the files it is
-about to touch, turning Brick into a shared, cross-tool memory agents use on their
-own — no MCP, daemon, or agent forks required.
+the agent to call `brick metadata recall --path <file> --format json` before
+editing. That command returns indexed session metadata — who touched the file,
+why, change size, and transcript chunk hints — without loading full transcripts by
+default.
 
 ```bash
 brick agent install            # inject into this repo's CLAUDE.md/AGENTS.md/GEMINI.md
@@ -141,8 +141,9 @@ The injected text lives between `<!-- brick:managed:start v=N -->` and
 `<!-- brick:managed:end -->` sentinels. Edits are confined to that region and
 written atomically, so a user's existing memory file is never clobbered;
 re-running `install` is idempotent and rolls the block forward when the template
-version changes. `brick init` offers to run this for the current repo. All
-`brick history` commands emit `--format json` so agents can parse them directly.
+version changes. `brick init` offers to run this for the current repo. `brick
+metadata` and `brick history` commands emit `--format json` so agents can parse
+them directly.
 
 ## Local storage model
 
