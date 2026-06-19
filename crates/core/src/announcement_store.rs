@@ -38,6 +38,24 @@ pub const ANNOUNCEMENTS_DB_FILE: &str = "announcements.sqlite";
 /// forgotten claim does not haunt the bulletin board for a day.
 pub const DEFAULT_CLAIM_TTL: Duration = Duration::hours(4);
 
+/// Verdict on whether the session behind a claim is still working.
+///
+/// Liveness is never persisted on the claim (it would be stale instantly);
+/// callers compute it per read from native source signals. The three-way result
+/// matters because most claims cannot be probed at all — only a claim we can
+/// *positively* tie to a dead session is retired early; everything else falls
+/// back to the TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimValidity {
+    /// The owning session is currently active — keep the claim.
+    Live,
+    /// The owning session was found and is no longer active — retire the claim.
+    Dead,
+    /// The owning session could not be identified (CLI publisher, bare `mcp`
+    /// claim, unknown source). Keep the claim on TTL alone.
+    Unknown,
+}
+
 /// A single active-work claim, as stored and returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Announcement {
@@ -198,6 +216,36 @@ impl AnnouncementStore {
         Ok(announcements)
     }
 
+    /// Like [`list_active`](Self::list_active), but also drops claims whose owning
+    /// session is no longer live.
+    ///
+    /// This is the second half of the lifecycle promised in the module docs: a
+    /// claim stops being surfaced when its session ends, not only when its TTL
+    /// passes — so a forgotten claim self-clears the moment the agent that made
+    /// it exits, instead of haunting the board for hours.
+    ///
+    /// `validity` is consulted per claim with `(source_id, session_id)` and must
+    /// return a [`ClaimValidity`]. Sessions that cannot be probed (a CLI claim, a
+    /// bare `mcp` publisher with no matching native session) return
+    /// [`ClaimValidity::Unknown`] and are kept on TTL alone — liveness only ever
+    /// *retires* a claim we can positively confirm is dead, never invents one.
+    /// Claims judged [`ClaimValidity::Dead`] are deleted so the table stays small.
+    pub fn list_live(
+        &self,
+        validity: impl Fn(&str, &str) -> ClaimValidity,
+    ) -> Result<Vec<Announcement>> {
+        let mut kept = Vec::new();
+        let mut dead_ids = Vec::new();
+        for announcement in self.list_active()? {
+            match validity(&announcement.source_id, &announcement.session_id) {
+                ClaimValidity::Dead => dead_ids.push(announcement.id.clone()),
+                ClaimValidity::Live | ClaimValidity::Unknown => kept.push(announcement),
+            }
+        }
+        self.delete_by_ids(&dead_ids)?;
+        Ok(kept)
+    }
+
     /// Returns non-expired claims whose scope matches `path` (exact, glob, or
     /// basename), newest first. This is the read path `recall_file` uses.
     pub fn matching(&self, path: &str) -> Result<Vec<Announcement>> {
@@ -207,6 +255,37 @@ impl AnnouncementStore {
             .into_iter()
             .filter(|announcement| scope_matches(&announcement.scope, &target))
             .collect())
+    }
+
+    /// Like [`matching`](Self::matching), but also drops claims whose owning
+    /// session is no longer live (see [`list_live`](Self::list_live)).
+    pub fn matching_live(
+        &self,
+        path: &str,
+        validity: impl Fn(&str, &str) -> ClaimValidity,
+    ) -> Result<Vec<Announcement>> {
+        let target = normalize_scope(path);
+        Ok(self
+            .list_live(validity)?
+            .into_iter()
+            .filter(|announcement| scope_matches(&announcement.scope, &target))
+            .collect())
+    }
+
+    /// Deletes the given claim ids in one statement. No-op on an empty slice.
+    fn delete_by_ids(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM announcements WHERE id IN ({placeholders})");
+        let params = rusqlite::params_from_iter(ids.iter());
+        self.connection
+            .execute(&sql, params)
+            .context("failed to delete dead announcements")?;
+        Ok(())
     }
 
     /// Deletes every claim whose `expires_at` is in the past. Best-effort; called
@@ -531,6 +610,77 @@ mod tests {
         store.publish(new).unwrap();
         assert_eq!(store.list_active().unwrap().len(), 0);
         assert_eq!(store.matching("a.rs").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_live_retires_dead_sessions_keeps_unknown() {
+        let store = store();
+        // Three claims from distinct sessions, all within TTL.
+        store
+            .publish(NewAnnouncement {
+                session_id: "alive".into(),
+                ..claim("alive.rs", "still editing")
+            })
+            .unwrap();
+        store
+            .publish(NewAnnouncement {
+                session_id: "ended".into(),
+                ..claim("ended.rs", "agent already exited")
+            })
+            .unwrap();
+        store
+            .publish(NewAnnouncement {
+                session_id: "mcp-session".into(),
+                ..claim("bare.rs", "no probeable session")
+            })
+            .unwrap();
+
+        // Judge: the "alive" session is active, "ended" was seen but is dead,
+        // anything else is unprobeable (Unknown).
+        let validity = |source: &str, session: &str| match (source, session) {
+            ("claude_code", "alive") => ClaimValidity::Live,
+            ("claude_code", "ended") => ClaimValidity::Dead,
+            _ => ClaimValidity::Unknown,
+        };
+
+        let kept = store.list_live(validity).unwrap();
+        let scopes: Vec<&str> = kept.iter().map(|a| a.scope.as_str()).collect();
+        // Live and Unknown survive; Dead is dropped.
+        assert!(scopes.contains(&"alive.rs"));
+        assert!(scopes.contains(&"bare.rs"));
+        assert!(!scopes.contains(&"ended.rs"));
+        assert_eq!(kept.len(), 2);
+
+        // Dead claim is deleted, not merely hidden: a later TTL-only read also
+        // no longer sees it.
+        let remaining: Vec<String> = store
+            .list_active()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.scope)
+            .collect();
+        assert!(!remaining.contains(&"ended.rs".to_string()));
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[test]
+    fn matching_live_filters_by_scope_and_liveness() {
+        let store = store();
+        store
+            .publish(NewAnnouncement {
+                session_id: "ended".into(),
+                ..claim("crates/core/src/auth.rs", "dead session claim")
+            })
+            .unwrap();
+        let dead_everything = |_: &str, _: &str| ClaimValidity::Dead;
+        // Scope matches, but the session is dead → no hit.
+        assert_eq!(
+            store
+                .matching_live("crates/core/src/auth.rs", dead_everything)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]

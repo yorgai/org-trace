@@ -222,10 +222,20 @@ path see your note (as `active_claims`).
   - `ttl_minutes` (integer, default `240`) — minutes until the claim auto-expires.
 - **Output**: `{ published: <claim>, note }`.
 
-> **Lifecycle note.** A claim auto-expires after its TTL (default 4h). Expired
-> claims are swept on the next read or write. Scope matching is generous: exact
-> path, glob (`*`, `**`, `?`, `[…]`), bare basename, relative/absolute
-> path-suffix equivalence, and directory-prefix all match.
+> **Lifecycle note.** A claim is retired on whichever comes first:
+> 1. **Session ended** — when the publishing session can be matched to a native
+>    source session that is no longer active, the claim is dropped (and deleted)
+>    on the next `recall_file` / `list_announcements` read. This is the common
+>    case: the moment an agent exits, its claims stop misleading others.
+> 2. **TTL expiry** — claims whose publisher cannot be probed (a CLI claim, a
+>    bare `mcp` publisher with no matching native session) fall back to the TTL
+>    (default 4h), swept on the next read or write.
+>
+> Liveness only ever retires a claim we can positively confirm is dead; an
+> unidentifiable publisher is always kept until its TTL, so the check never
+> over-deletes. Scope matching is generous: exact path, glob (`*`, `**`, `?`,
+> `[…]`), bare basename, relative/absolute path-suffix equivalence, and
+> directory-prefix all match.
 
 ### `list_announcements`
 

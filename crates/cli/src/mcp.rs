@@ -9,11 +9,15 @@
 //! Protocol invariant: stdout carries ONLY JSON-RPC; every diagnostic goes to
 //! stderr. A stray println on stdout corrupts the framing and breaks the client.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::str::FromStr;
 
 use anyhow::Result;
-use brick_core::{AnnouncementStore, LocalStore, NewAnnouncement, SourceProfileStore};
+use brick_core::{
+    list_source_sessions, AnnouncementStore, ClaimValidity, LocalStore, NewAnnouncement,
+    SourceProfileStore,
+};
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
     ArtifactKind, FileRefId, MissionCreatedPayload, MissionId, MissionStatus,
@@ -465,9 +469,11 @@ fn handle_tool_call(
                 }
             }
             // Bulletin-board claims: another session may have explicitly asked
-            // others to hold off this file/area. Surface those notes directly.
+            // others to hold off this file/area. Surface those notes directly,
+            // dropping any whose owning session has already ended.
             if let Ok(announce_store) = AnnouncementStore::open_global() {
-                if let Ok(claims) = announce_store.matching(&path) {
+                let validity = build_claim_validity(profiles);
+                if let Ok(claims) = announce_store.matching_live(&path, validity) {
                     if !claims.is_empty() {
                         if let Value::Object(map) = &mut value {
                             map.insert(
@@ -566,9 +572,10 @@ fn handle_tool_call(
         }
         "list_announcements" => {
             let announce_store = AnnouncementStore::open_global()?;
+            let validity = build_claim_validity(profiles);
             let claims = match args.get("path").and_then(Value::as_str) {
-                Some(path) if !path.is_empty() => announce_store.matching(path)?,
-                _ => announce_store.list_active()?,
+                Some(path) if !path.is_empty() => announce_store.matching_live(path, validity)?,
+                _ => announce_store.list_live(validity)?,
             };
             json!({ "count": claims.len(), "announcements": claims })
         }
@@ -834,6 +841,51 @@ fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Builds the `(source_id, session_id) -> ClaimValidity` judge used to retire
+/// bulletin-board claims whose owning session has ended.
+///
+/// We enumerate every source's sessions once (liveness filled per session) and
+/// fold them into two lookups: the set of sessions seen at all, and the subset
+/// currently active. The returned closure is then pure:
+/// - active                       -> `Live`   (keep)
+/// - seen but not active          -> `Dead`   (retire early)
+/// - never seen (CLI / bare `mcp`) -> `Unknown` (keep on TTL alone)
+///
+/// A source that fails to enumerate is simply absent from both sets, so its
+/// claims fall through to `Unknown` — one broken source never mass-retires
+/// claims it cannot speak to.
+fn build_claim_validity(profiles: &SourceProfileStore) -> impl Fn(&str, &str) -> ClaimValidity {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut live: HashSet<(String, String)> = HashSet::new();
+    if let Ok(all_profiles) = profiles.list_profiles() {
+        for profile in &all_profiles {
+            let Ok(sessions) = list_source_sessions(profile, Some(200)) else {
+                continue;
+            };
+            for session in sessions {
+                let key = (
+                    session.source_app_id.clone(),
+                    session.external_session_id.clone(),
+                );
+                if brick_core::is_active(&session) {
+                    live.insert(key.clone());
+                }
+                seen.insert(key);
+            }
+        }
+    }
+    move |source_id: &str, session_id: &str| {
+        let key = (source_id.to_string(), session_id.to_string());
+        if live.contains(&key) {
+            ClaimValidity::Live
+        } else if seen.contains(&key) {
+            ClaimValidity::Dead
+        } else {
+            ClaimValidity::Unknown
+        }
+    }
 }
 
 /// Builds the actor for an MCP-authored write. MCP has no logged-in human, so
