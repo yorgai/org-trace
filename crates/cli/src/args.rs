@@ -550,12 +550,25 @@ pub enum ImportCommand {
 pub enum NativeImportCommand {
     List(NativeImportListArgs),
     Ingest(NativeImportIngestArgs),
+    Pick(NativeImportPickArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct NativeImportListArgs {
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct NativeImportPickArgs {
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+
+    #[arg(long)]
+    pub mission: Option<String>,
+
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

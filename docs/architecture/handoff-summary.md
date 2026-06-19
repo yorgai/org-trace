@@ -566,38 +566,38 @@ Suggested behavior:
 - Add `--force` to import again.
 - Add tests and smoke coverage.
 
-### 4. Better native metadata extraction
+### 4. Better native metadata extraction — DONE
 
-Current native list uses file stem as ID/title. Improve per source:
+Implemented per source. Each `crates/core/src/sources/*.rs` reader now parses
+real titles, timestamps, repo/cwd paths, and model/token metadata rather than
+file stems:
 
-- Claude Code JSONL:
-  - parse timestamps
-  - parse cwd/repo path if available
-  - parse first user message/title
-  - parse model/token metadata when present
-- Codex JSONL:
-  - parse `turn_context` for cwd/model
-  - parse rollout file metadata
-- Generic JSONL:
-  - infer title from first meaningful message
+- Claude Code JSONL (`claude_code.rs`): timestamps, cwd/repo, first message
+  title, model/token metadata.
+- Codex JSONL (`codex_app.rs`): `turn_context` cwd/model, rollout metadata.
+- Generic JSONL (`jsonl.rs`): title inferred from first meaningful message.
 
-### 5. Cursor native DB importer
+### 5. Cursor native DB importer — DONE
 
-`source_discovery` already finds Cursor `state.vscdb`. Add read-only listing/import for Cursor sessions from that DB or from ORGII-style session state if available.
+`cursor_ide.rs` + `cursor_family/` read Cursor `state.vscdb` read-only:
+`composer.composerHeaders` are the authoritative session list with rich
+metadata, draft/subagent/parent-link flags merged from `composerData:` rows.
 
-### 6. OpenCode native DB importer
+### 6. OpenCode native DB importer — DONE
 
-`source_discovery` already finds `opencode.db`. Add an OpenCode-specific DB reader for session metadata and transcript pointers.
+`opencode.rs` reads `opencode.db` for session metadata and transcript pointers.
 
-### 7. Interactive native pick
-
-Add a TTY command such as:
+### 7. Interactive native pick — DONE
 
 ```bash
 brick --source claude_code import native pick --mission <mission_id>
 ```
 
-It should show a multi-select list of native sessions and ingest selected sessions.
+`import native pick` shows a `dialoguer::MultiSelect` of native sessions and
+ingests the selected ones (reusing the shared `ingest_native_session` helper,
+which also powers `ingest` and records the brick-session bridge link + dedup).
+In non-interactive contexts it prints the session count and ingest guidance
+instead of blocking.
 
 ### 8. Server auth and repo/org permissions
 

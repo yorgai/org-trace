@@ -4,6 +4,8 @@
 //! event. This preserves the provenance chain without making Git the storage
 //! backend for trace data.
 
+use std::io::IsTerminal;
+
 use anyhow::{anyhow, Context, Result};
 use brick_core::{
     capture_diff, capture_repo_context, list_source_plans, list_source_sessions, BrickConfig,
@@ -21,12 +23,14 @@ use brick_protocol::{
     SessionStartedPayload, TraceEvent,
 };
 use chrono::{DateTime, Utc};
+use dialoguer::MultiSelect;
 use serde_json::json;
 
 use crate::args::{
     AgentImportArgs, ArtifactCommand, ArtifactKindArg, CiImportArgs, DiffTargetArg,
     EvidenceCommand, IdentityArgs, ImportCommand, MissionCommand, MissionStatusArg,
-    NativeImportCommand, OrgCommand, ProjectCommand, SessionCommand, SessionLogFormatArg,
+    NativeImportCommand, NativeImportPickArgs, OrgCommand, ProjectCommand, SessionCommand,
+    SessionLogFormatArg,
 };
 use crate::context::{parse_optional_id, resolve_cli_identity};
 use crate::output::print_session_env;
@@ -579,74 +583,184 @@ fn handle_native_import(
                         args.external_session_id
                     )
                 })?;
-            index_native_source_sessions(profile, std::iter::once(&session))?;
-            if !args.force {
-                if let Some(existing) =
-                    find_existing_brick_session_link(profile, &session.external_session_id)?
-                {
-                    println!("skipped_already_imported=1");
-                    println!("brick_session_id={existing}");
-                    println!("external_session_id={}", session.external_session_id);
-                    println!("hint=pass --force to re-import");
-                    return Ok(());
-                }
-            }
-            let requested_session_id =
-                parse_optional_id::<SessionId>(args.session.as_deref(), "session")?;
-            let native_session_id = requested_session_id.unwrap_or_default();
-            let mission_id = parse_optional_id::<MissionId>(args.mission.as_deref(), "mission")?;
-            let identity = resolve_cli_identity(
-                store,
+            ingest_native_session(
                 identity_args,
-                mission_id,
-                Some(native_session_id),
-                Some(profile),
+                store,
+                profile,
+                session,
+                args.mission.as_deref(),
+                args.session.as_deref(),
+                args.force,
             )?;
-            let pointer = store.attachment_store().inspect_file(&session.path)?;
-            let brick_session_id = identity.session_id.clone();
-            let started = TraceEvent::session_started(
-                identity.actor.clone(),
-                brick_session_id.clone(),
-                identity.mission_id.clone(),
-                SessionStartedPayload {
-                    session_name: session.title.clone(),
-                    source: brick_protocol::SessionSource {
-                        app_id: Some(session.source_app_id.clone()),
-                        app_session_id: Some(session.external_session_id.clone()),
-                        app_session_name: session.title.clone(),
-                        runtime_id: None,
-                    },
-                    repo_context_id: None,
-                },
-            )
-            .context("failed to build native imported session.started event")?;
-            let log = TraceEvent::session_log_uploaded(
-                identity.actor,
-                identity.session_id,
-                SessionLogUploadedPayload {
-                    log_ref_id: LogRefId::new(),
-                    original_path: pointer.original_path.display().to_string(),
-                    format: infer_native_log_format(&session.path),
-                    source: session.source_app_id,
-                    sha256: pointer.sha256,
-                    size_bytes: pointer.size_bytes,
-                    storage_uri: format!("file://{}", session.path.display()),
-                    local_path: String::new(),
-                    external_uri: Some(format!("file://{}", session.path.display())),
-                    availability: EvidenceAvailability::LocalPointer,
-                    repo_context_id: None,
-                },
-            )
-            .context("failed to build native imported session.log_uploaded event")?;
-            store.append_event(&started)?;
-            store.append_event(&log)?;
-            record_brick_session_link(profile, &session.external_session_id, &brick_session_id)?;
-            println!("imported_event_count=2");
-            println!("session_id={brick_session_id}");
-            println!("external_session_id={}", session.external_session_id);
-            println!("path={}", session.path.display());
             Ok(())
         }
+        NativeImportCommand::Pick(args) => {
+            handle_native_import_pick(identity_args, store, profile, args)
+        }
+    }
+}
+
+/// Ingests one native source session into the provenance store as two trace
+/// events (session.started + session.log_uploaded), recording the
+/// brick-session ↔ source-session bridge link. Shared by `import native ingest`
+/// and `import native pick`. Returns false when the session was skipped because
+/// it was already imported and `force` is not set.
+#[allow(clippy::too_many_arguments)]
+fn ingest_native_session(
+    identity_args: &IdentityArgs,
+    store: &LocalStore,
+    profile: &SourceProfile,
+    session: NativeSourceSession,
+    mission: Option<&str>,
+    session_arg: Option<&str>,
+    force: bool,
+) -> Result<bool> {
+    index_native_source_sessions(profile, std::iter::once(&session))?;
+    if !force {
+        if let Some(existing) =
+            find_existing_brick_session_link(profile, &session.external_session_id)?
+        {
+            println!("skipped_already_imported=1");
+            println!("brick_session_id={existing}");
+            println!("external_session_id={}", session.external_session_id);
+            println!("hint=pass --force to re-import");
+            return Ok(false);
+        }
+    }
+    let requested_session_id = parse_optional_id::<SessionId>(session_arg, "session")?;
+    let native_session_id = requested_session_id.unwrap_or_default();
+    let mission_id = parse_optional_id::<MissionId>(mission, "mission")?;
+    let identity = resolve_cli_identity(
+        store,
+        identity_args,
+        mission_id,
+        Some(native_session_id),
+        Some(profile),
+    )?;
+    let pointer = store.attachment_store().inspect_file(&session.path)?;
+    let brick_session_id = identity.session_id.clone();
+    let started = TraceEvent::session_started(
+        identity.actor.clone(),
+        brick_session_id.clone(),
+        identity.mission_id.clone(),
+        SessionStartedPayload {
+            session_name: session.title.clone(),
+            source: brick_protocol::SessionSource {
+                app_id: Some(session.source_app_id.clone()),
+                app_session_id: Some(session.external_session_id.clone()),
+                app_session_name: session.title.clone(),
+                runtime_id: None,
+            },
+            repo_context_id: None,
+        },
+    )
+    .context("failed to build native imported session.started event")?;
+    let log = TraceEvent::session_log_uploaded(
+        identity.actor,
+        identity.session_id,
+        SessionLogUploadedPayload {
+            log_ref_id: LogRefId::new(),
+            original_path: pointer.original_path.display().to_string(),
+            format: infer_native_log_format(&session.path),
+            source: session.source_app_id.clone(),
+            sha256: pointer.sha256,
+            size_bytes: pointer.size_bytes,
+            storage_uri: format!("file://{}", session.path.display()),
+            local_path: String::new(),
+            external_uri: Some(format!("file://{}", session.path.display())),
+            availability: EvidenceAvailability::LocalPointer,
+            repo_context_id: None,
+        },
+    )
+    .context("failed to build native imported session.log_uploaded event")?;
+    store.append_event(&started)?;
+    store.append_event(&log)?;
+    record_brick_session_link(profile, &session.external_session_id, &brick_session_id)?;
+    println!("imported_event_count=2");
+    println!("session_id={brick_session_id}");
+    println!("external_session_id={}", session.external_session_id);
+    println!("path={}", session.path.display());
+    Ok(true)
+}
+
+/// Interactive multi-select import of native source sessions. Requires a TTY;
+/// in non-interactive contexts it prints guidance and exits without importing.
+fn handle_native_import_pick(
+    identity_args: &IdentityArgs,
+    store: &LocalStore,
+    profile: &SourceProfile,
+    args: NativeImportPickArgs,
+) -> Result<()> {
+    let sessions = list_source_sessions(profile, Some(args.limit))?;
+    index_native_source_sessions(profile, sessions.iter())?;
+    if sessions.is_empty() {
+        println!("native_session_count=0");
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        println!("native_session_count={}", sessions.len());
+        println!(
+            "Run `brick --source {} import native ingest --external-session-id <id>` to import a session.",
+            profile.name
+        );
+        return Ok(());
+    }
+
+    let labels = sessions
+        .iter()
+        .map(native_session_pick_label)
+        .collect::<Vec<_>>();
+    let selected = MultiSelect::new()
+        .with_prompt("Select native sessions to import")
+        .items(&labels)
+        .interact()?;
+    if selected.is_empty() {
+        println!("imported_session_count=0");
+        return Ok(());
+    }
+
+    let mut sessions = sessions;
+    let mut selected_sessions = Vec::with_capacity(selected.len());
+    // Drain selected indices in descending order so earlier removals do not
+    // shift the indices of later selections.
+    let mut selected = selected;
+    selected.sort_unstable_by(|left, right| right.cmp(left));
+    for index in selected {
+        selected_sessions.push(sessions.remove(index));
+    }
+    selected_sessions.reverse();
+
+    let mut imported = 0;
+    for session in selected_sessions {
+        if ingest_native_session(
+            identity_args,
+            store,
+            profile,
+            session,
+            args.mission.as_deref(),
+            None,
+            args.force,
+        )? {
+            imported += 1;
+        }
+    }
+    println!("imported_session_count={imported}");
+    Ok(())
+}
+
+fn native_session_pick_label(session: &NativeSourceSession) -> String {
+    let title = session
+        .title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&session.external_session_id);
+    match &session.repo_path {
+        Some(repo_path) => format!(
+            "{title} [{}] ({})",
+            session.external_session_id,
+            repo_path.display()
+        ),
+        None => format!("{title} [{}]", session.external_session_id),
     }
 }
 
