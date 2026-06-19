@@ -538,9 +538,37 @@ Recommended duplicate freshness windows:
 - Avoid concurrent refresh storms. For the same `(command, source)` pair, coalesce requests or let one foreground request update duplicate metadata for waiting callers.
 - Keep stdout JSON and stderr diagnostics separate in logs.
 
+## Version discovery
+
+`brick version --format json` is implemented for adapter compatibility gating.
+
+Command:
+
+```bash
+brick version --format json
+```
+
+Current response boundary:
+
+```json
+{
+  "name": "brick",
+  "version": "0.1.0",
+  "metadata_db_schema_version": 5,
+  "history_contract_version": 1
+}
+```
+
+Adapter rules:
+
+- Gate on `history_contract_version`. The ORGII adapter declares the minimum contract version it can read and treats a lower value as "Brick too old for this command family".
+- `metadata_db_schema_version` is informational for diagnostics and parity logging; it does not need to match an ORGII-side value.
+- `version` is the human-facing crate version and should be recorded in duplicate-metadata `brick_binary_version` fields.
+- This command does not require a configured source or repo and is safe to call first for feature detection.
+
 ## Open questions for ORGII implementation
 
-1. Which Brick binary/version discovery command should ORGII use for compatibility gating? If none exists yet, should Brick add a machine-readable `--version --format json` or `doctor` field?
+1. ~~Which Brick binary/version discovery command should ORGII use for compatibility gating?~~ Resolved: use `brick version --format json` and gate on `history_contract_version` (currently `1`).
 2. Should ORGII pass Brick `external_session_id` or Brick `session_id` to `history chunks` and `history export` after cutover, and should Brick formally accept both?
 3. What mismatch tolerances should be source-specific for timestamps, titles, token totals, impact stats, and chunk text normalization?
 4. How long should ORGII retain duplicate metadata after each source reaches Brick-primary or Brick-only status?

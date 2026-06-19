@@ -494,16 +494,37 @@ Earlier product model / source discovery work:
 
 ## Known gaps / recommended next steps
 
+> **Status update (source metadata index buildout).** The following have since
+> landed and are covered by unit tests + live verification:
+> - Fingerprint (`mtime:size`) delta indexing in the refresh loop; unchanged
+>   sessions only touch `last_seen_at` instead of re-parsing.
+> - `source_profiles` and `source_scans` persisted on every refresh, with
+>   `{scanned, reindexed, skipped}` stats recorded per scan.
+> - `source_roots` recorded per profile; `workspace_roots` / `git_repositories`
+>   linked to sessions via the M:N join tables during refresh.
+> - `source_session_resources` upsert/list API.
+> - `brick_session_source_sessions` bridge with `brick history link` /
+>   `brick history linked` commands and core link/list APIs.
+> - Native import dedup via the bridge link with `--force` override (gap 3).
+> - `brick version --format json` for ORGII adapter compatibility gating.
+> - ORGII Stage-1 shadow-read client (`src/engines/SessionCore/sync/brick/`):
+>   typed command runner, version gating, DTO validation, parity capture.
+>
+> Remaining within these gaps: `brick source scan/configure` still does not
+> persist profiles/roots (only history/import refresh does); repo-context links
+> and org/project/mission-filtered sync are unaddressed; ORGII cutover beyond
+> Stage-1 shadow read (dual-read, Brick-primary) is future work.
+
 ### 1. Finish global metadata integration
 
 First-stage `BRICK_HOME` resolution, metadata DB schema/API, and metadata-backed native history rows are implemented, but Brick still primarily uses repo-local source profile files and provenance queues.
 
 Needed work:
 
-- Persist source profile rows and source roots from `brick source scan/configure`, not only source sessions from history/import refreshes.
-- Persist scan rows, workspace roots, repo contexts, and Brick-session links.
+- Persist source profile rows and source roots from `brick source scan/configure`, not only source sessions from history/import refreshes. (History/import refresh now persists profiles + roots; `source scan/configure` still does not.)
+- Persist scan rows, workspace roots, repo contexts, and Brick-session links. (Scan rows, workspace roots, and Brick-session links now persisted; repo contexts still pending.)
 - Decide when repo-local `.brick` is bootstrap/config only versus when it owns repo-local provenance events.
-- Model many-to-many relationships between source sessions and workspace roots/repos during actual scans.
+- Model many-to-many relationships between source sessions and workspace roots/repos during actual scans. (Done for history/import refresh; not yet for `source scan`.)
 - Sync by `org_id` / project / mission / repo context filters rather than by physical repo-local storage.
 
 ### 2. Migrate ORGII external-history subsystem into Brick
