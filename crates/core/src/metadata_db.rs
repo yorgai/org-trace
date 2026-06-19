@@ -329,15 +329,25 @@ impl MetadataDb {
         Ok(records)
     }
 
-    /// Free-text searches indexed session metadata by case-insensitive substring
-    /// over title/name (the session intent), touched files, repo path, branch, and
-    /// model. Returns whole session records, newest first; transcripts are never
-    /// loaded.
+    /// Free-text searches indexed session metadata using SQLite's built-in
+    /// **FTS5** full-text engine with a `trigram` tokenizer, ranked by `bm25()`.
+    ///
+    /// The query is tokenized on whitespace and matched AND-wise, so word order
+    /// never matters (`git status cache` finds an intent of "Cache git status
+    /// lookups"). The trigram tokenizer makes matching substring-based, so a term
+    /// like `auth` still lands on a file named `oauth.rs`. Results are ranked by
+    /// relevance with intent (title/name) weighted far above touched files, repo,
+    /// branch, and model; transcripts are never loaded.
+    ///
+    /// The FTS index is built per query over the (small) candidate set rather
+    /// than persisted, matching this DB's disposable rebuild-on-read model.
+    /// Trigram cannot index terms shorter than three characters; such terms are
+    /// verified with a plain substring check so a query like `go` still works.
     pub fn query_source_sessions_text(
         &self,
         query: &SourceSessionTextQuery,
     ) -> Result<Vec<SourceSessionRecord>> {
-        let needle = query.query.trim().to_lowercase();
+        let terms = search_terms(&query.query);
         let limit = usize::try_from(normalized_limit(query.limit)).unwrap_or(usize::MAX);
         let mut statement = self.connection.prepare(
             "SELECT source_id, external_session_id, title, name, source_path, source_uri,
@@ -351,17 +361,98 @@ impl MetadataDb {
              ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC",
         )?;
         let rows = statement.query_map(params![query.source_id], source_session_from_row)?;
-        let mut matches = Vec::new();
-        for row in rows {
-            let record = row.context("failed to read metadata source-session row")?;
-            if needle.is_empty() || session_text_matches(&record, &needle) {
-                matches.push(record);
-                if matches.len() >= limit {
-                    break;
+        let candidates: Vec<SourceSessionRecord> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read metadata source-session rows")?;
+
+        // Empty query keeps the legacy "list newest" behavior.
+        if terms.is_empty() {
+            return Ok(candidates.into_iter().take(limit).collect());
+        }
+
+        let ranked = self.rank_candidates_fts5(&candidates, &terms)?;
+        Ok(ranked.into_iter().take(limit).collect())
+    }
+
+    /// Ranks `candidates` against `terms` using an ephemeral FTS5 trigram index
+    /// plus `bm25()`. Candidate order (newest first) is preserved among equal
+    /// ranks. Terms shorter than three trigram characters cannot be indexed, so
+    /// they are enforced separately as substring filters over all fields.
+    fn rank_candidates_fts5(
+        &self,
+        candidates: &[SourceSessionRecord],
+        terms: &[String],
+    ) -> Result<Vec<SourceSessionRecord>> {
+        // Trigram cannot index terms under three chars; those are covered by the
+        // substring `survives` check below. FTS only ranks among the long terms.
+        let long_terms: Vec<&String> =
+            terms.iter().filter(|term| term.chars().count() >= 3).collect();
+
+        // Every term must still match as a substring somewhere (correctness +
+        // short-term handling); FTS only decides ranking among the survivors.
+        let survives = |record: &SourceSessionRecord| {
+            terms
+                .iter()
+                .all(|term| record_field_contains(record, term))
+        };
+
+        // All terms too short for trigram: no FTS signal, fall back to a plain
+        // substring-AND filter, preserving the newest-first candidate order.
+        if long_terms.is_empty() {
+            return Ok(candidates
+                .iter()
+                .filter(|record| survives(record))
+                .cloned()
+                .collect());
+        }
+
+        self.connection.execute_batch(
+            "DROP TABLE IF EXISTS temp.fts_session_search;
+             CREATE VIRTUAL TABLE temp.fts_session_search
+                 USING fts5(intent, files, repo, branch, model, tokenize='trigram');",
+        )?;
+        {
+            let mut insert = self.connection.prepare(
+                "INSERT INTO temp.fts_session_search(rowid, intent, files, repo, branch, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (index, record) in candidates.iter().enumerate() {
+                insert.execute(params![
+                    index as i64,
+                    intent_text(record),
+                    files_text(record),
+                    record
+                        .repo_path
+                        .as_ref()
+                        .map(|repo| repo.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    record.branch.clone().unwrap_or_default(),
+                    record.model.clone().unwrap_or_default(),
+                ])?;
+            }
+        }
+
+        let match_expr = fts5_and_expression(&long_terms);
+        // bm25 column weights: intent dominates, then files, then repo/branch/model.
+        // bm25 returns smaller (more negative) for better matches, so ascending.
+        let mut select = self.connection.prepare(
+            "SELECT rowid FROM temp.fts_session_search
+             WHERE fts_session_search MATCH ?1
+             ORDER BY bm25(fts_session_search, 10.0, 4.0, 2.0, 1.5, 1.0)",
+        )?;
+        let ordered: Vec<i64> = select
+            .query_map(params![match_expr], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut ranked = Vec::new();
+        for rowid in ordered {
+            if let Some(record) = candidates.get(rowid as usize) {
+                if survives(record) {
+                    ranked.push(record.clone());
                 }
             }
         }
-        Ok(matches)
+        Ok(ranked)
     }
 
     /// Queries source metadata rows that touched a file path.
@@ -1473,25 +1564,69 @@ fn touched_files_from_value(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether a session's searchable metadata contains a lowercased needle. Searched
-/// fields: title/name (intent), touched files, repo path, branch, and model.
-fn session_text_matches(record: &SourceSessionRecord, needle: &str) -> bool {
-    let contains = |text: &str| text.to_lowercase().contains(needle);
-    if record.title.as_deref().is_some_and(contains)
-        || record.name.as_deref().is_some_and(contains)
-        || record.branch.as_deref().is_some_and(contains)
-        || record.model.as_deref().is_some_and(contains)
+/// Tokenizes a free-text query into lowercased search terms on whitespace.
+/// Punctuation is kept inside a token (so `oauth.rs` or `commands_git` stay
+/// whole), but surrounding whitespace splits terms — this is what turns a query
+/// like `git status cache` into independent terms matched in any order.
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+/// The session intent text used as the highest-weighted FTS column: the title,
+/// plus the name when it differs.
+fn intent_text(record: &SourceSessionRecord) -> String {
+    let mut parts = Vec::new();
+    if let Some(title) = record.title.as_deref() {
+        parts.push(title.to_string());
+    }
+    if let Some(name) = record.name.as_deref() {
+        if record.title.as_deref() != Some(name) {
+            parts.push(name.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+/// The touched-file paths joined into one FTS column.
+fn files_text(record: &SourceSessionRecord) -> String {
+    touched_files_from_value(record.touched_files_json.as_ref()).join(" ")
+}
+
+/// Whether any searchable field of a session contains `needle` (lowercased
+/// substring). Used both to enforce AND correctness and to satisfy short terms
+/// that the trigram index cannot represent.
+fn record_field_contains(record: &SourceSessionRecord, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    let in_text = |text: &str| text.to_lowercase().contains(&needle);
+    if intent_text(record).to_lowercase().contains(&needle)
+        || record.branch.as_deref().is_some_and(in_text)
+        || record.model.as_deref().is_some_and(in_text)
     {
         return true;
     }
     if let Some(repo) = record.repo_path.as_ref() {
-        if repo.to_string_lossy().to_lowercase().contains(needle) {
+        if repo.to_string_lossy().to_lowercase().contains(&needle) {
             return true;
         }
     }
     touched_files_from_value(record.touched_files_json.as_ref())
         .iter()
-        .any(|file| file.to_lowercase().contains(needle))
+        .any(|file| file.to_lowercase().contains(&needle))
+}
+
+/// Builds an FTS5 MATCH expression that ANDs each term as a quoted string, so a
+/// term is treated literally (punctuation like `oauth.rs` won't be parsed as FTS
+/// syntax). Each term is double-quoted with internal quotes escaped.
+fn fts5_and_expression(terms: &[&String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn source_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSessionRecord> {
@@ -1752,6 +1887,161 @@ mod tests {
                 .expect("count source sessions"),
             1
         );
+    }
+
+    fn upsert_with(external_id: &str, title: &str, touched: serde_json::Value, offset: i64) -> SourceSessionUpsert {
+        let mut upsert = sample_upsert(title, offset);
+        upsert.external_session_id = external_id.to_string();
+        upsert.touched_files_json = Some(touched);
+        upsert
+    }
+
+    #[test]
+    fn text_search_tokenizes_and_ignores_word_order() {
+        let path = temp_home("search-tokenize").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&upsert_with(
+            "s1",
+            "Cache git status lookups in commands_git",
+            json!(["src/commands_git.rs"]),
+            0,
+        ))
+        .expect("insert s1");
+
+        // Out-of-order multi-term query still matches (was impossible with the
+        // old contiguous-substring search).
+        let hits = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "git status cache".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].external_session_id, "s1");
+    }
+
+    #[test]
+    fn text_search_requires_all_terms_and() {
+        let path = temp_home("search-and").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&upsert_with("s1", "Add OAuth login", json!(["src/auth.rs"]), 0))
+            .expect("insert s1");
+
+        // One term matches, the other does not → no result (AND semantics).
+        let none = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "oauth kubernetes".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(none.is_empty());
+
+        // A bare term matching a substring of a file still lands.
+        let by_file = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "auth".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert_eq!(by_file.len(), 1);
+    }
+
+    #[test]
+    fn text_search_ranks_intent_above_file_only_matches() {
+        let path = temp_home("search-rank").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        // s_file only touches a file named oauth.rs; s_intent has it in the intent.
+        // Make the file-only session NEWER so recency alone would rank it first;
+        // relevance must override that.
+        db.upsert_source_session(&upsert_with(
+            "s_intent",
+            "Implement OAuth login flow",
+            json!(["src/login.rs"]),
+            0,
+        ))
+        .expect("insert s_intent");
+        db.upsert_source_session(&upsert_with(
+            "s_file",
+            "Unrelated refactor",
+            json!(["src/oauth.rs"]),
+            5,
+        ))
+        .expect("insert s_file");
+
+        let hits = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "oauth".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].external_session_id, "s_intent",
+            "intent match must outrank a newer file-only match"
+        );
+    }
+
+    #[test]
+    fn text_search_empty_query_lists_all() {
+        let path = temp_home("search-empty").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&upsert_with("s1", "Anything", json!(["a.rs"]), 0))
+            .expect("insert s1");
+        let hits = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "   ".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn text_search_short_terms_use_substring_fallback() {
+        let path = temp_home("search-short").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&upsert_with("s1", "Add Go module support", json!(["go.mod"]), 0))
+            .expect("insert s1");
+        db.upsert_source_session(&upsert_with("s2", "Rust refactor", json!(["src/lib.rs"]), 1))
+            .expect("insert s2");
+
+        // "go" is shorter than a trigram; it must still match via substring.
+        let hits = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "go".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        let ids: Vec<&str> = hits.iter().map(|h| h.external_session_id.as_str()).collect();
+        assert!(ids.contains(&"s1"), "short term should match via substring: {ids:?}");
+        assert!(!ids.contains(&"s2"));
+    }
+
+    #[test]
+    fn text_search_mixed_short_and_long_terms() {
+        let path = temp_home("search-mixed").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&upsert_with("s1", "Go oauth integration", json!(["src/oauth.rs"]), 0))
+            .expect("insert s1");
+        db.upsert_source_session(&upsert_with("s2", "Go home", json!(["home.rs"]), 1))
+            .expect("insert s2");
+
+        // "go" (short, substring) AND "oauth" (long, trigram) → only s1.
+        let hits = db
+            .query_source_sessions_text(&SourceSessionTextQuery {
+                query: "go oauth".to_string(),
+                source_id: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].external_session_id, "s1");
     }
 
     #[test]

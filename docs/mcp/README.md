@@ -78,11 +78,21 @@ machine. Call before editing a file.
 
 ### `search_sessions`
 
-Free-text search over session metadata (title, intent, touched files, repo,
-branch) to find past sessions by topic.
+Full-text search over session metadata (title/intent, touched files, repo,
+branch, model) to find past sessions by topic. Backed by SQLite **FTS5** with a
+`trigram` tokenizer:
 
-- **Input**: `query` (string, required) — keywords to match against session metadata.
-- **Output**: matches newest-first, each with a transcript pointer. Result cap defaults to 10.
+- **Tokenized & order-independent** — the query is split into terms matched
+  AND-wise, so `git status cache` finds an intent of "Cache git status lookups".
+- **Substring matching** — a term like `auth` still matches a file named
+  `oauth.rs`; `commands_git` matches `src/commands_git.rs`.
+- **Relevance ranked** — `bm25()` weights intent matches far above file/repo
+  hits, so the most on-topic session sorts first regardless of recency.
+- Terms shorter than three characters fall back to a plain substring check
+  (trigram cannot index them), so a query like `go` still works.
+
+- **Input**: `query` (string, required) — one or more keywords; order does not matter.
+- **Output**: matches ranked by relevance, each with a transcript pointer. Result cap defaults to 10.
 
 ### `read_session`
 
