@@ -57,6 +57,10 @@ pub struct IdentityArgs {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Init,
+    Version {
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     Org {
         #[command(subcommand)]
         command: OrgCommand,
@@ -492,6 +496,22 @@ pub enum HistoryCommand {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
+    Link {
+        #[arg(long)]
+        brick_session: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    Linked {
+        #[arg(long)]
+        brick_session: String,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -548,6 +568,9 @@ pub struct NativeImportIngestArgs {
 
     #[arg(long)]
     pub session: Option<String>,
+
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

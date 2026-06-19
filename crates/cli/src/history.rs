@@ -34,6 +34,20 @@ const EXPORT_AVAILABILITY_METADATA_ONLY: &str = "metadata_only";
 const SOURCE_INDEX_REFRESH_LIMIT: usize = 100_000;
 const EXPORT_REFRESH_LIMIT: usize = SOURCE_INDEX_REFRESH_LIMIT;
 
+/// Version of the `brick history` adapter contract this binary implements.
+pub const HISTORY_CONTRACT_VERSION: u32 = 1;
+
+/// Prints machine-readable Brick version and schema info for adapter gating.
+pub fn print_version(format: HistoryFormatArg) -> Result<()> {
+    ensure_json(format);
+    print_json(&json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "metadata_db_schema_version": brick_core::METADATA_DB_SCHEMA_VERSION,
+        "history_contract_version": HISTORY_CONTRACT_VERSION,
+    }))
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HistorySourcesResponse {
     pub sources: Vec<HistorySourceRow>,
@@ -457,6 +471,54 @@ pub fn handle_history(
             print_json(&build_file_session_blame_response(
                 store, profiles, &path, &source, limit,
             )?)
+        }
+        HistoryCommand::Link {
+            brick_session,
+            source,
+            session_id,
+            format,
+        } => {
+            ensure_json(format);
+            let profile = read_profile(profiles, &source)?;
+            let mut metadata_db = MetadataDb::open_global()?;
+            refresh_profiles_to_metadata(
+                &mut metadata_db,
+                std::slice::from_ref(&profile),
+                EXPORT_REFRESH_LIMIT,
+            )?;
+            let source_session_id = metadata_db
+                .get_source_session_id(&profile.name, &session_id)?
+                .ok_or_else(|| {
+                    anyhow!("source session not found: {}/{}", profile.name, session_id)
+                })?;
+            metadata_db.link_brick_session_to_source_session(&brick_session, source_session_id)?;
+            print_json(&json!({
+                "brick_session_id": brick_session,
+                "source_id": profile.name,
+                "external_session_id": session_id,
+                "linked": true,
+            }))
+        }
+        HistoryCommand::Linked {
+            brick_session,
+            format,
+        } => {
+            ensure_json(format);
+            let metadata_db = MetadataDb::open_global()?;
+            let pairs = metadata_db.list_source_sessions_for_brick_session(&brick_session)?;
+            let sessions: Vec<Value> = pairs
+                .into_iter()
+                .map(|(source_id, external_session_id)| {
+                    json!({
+                        "source_id": source_id,
+                        "external_session_id": external_session_id,
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "brick_session_id": brick_session,
+                "sessions": sessions,
+            }))
         }
     }
 }
@@ -1281,8 +1343,13 @@ fn refresh_single_profile(
     limit: usize,
 ) -> Result<RefreshStats> {
     let mut stats = RefreshStats::default();
+    record_source_roots(metadata_db, profile)?;
     for session in list_source_sessions(profile, Some(limit))? {
         stats.scanned += 1;
+        let repo_path = session
+            .repo_path
+            .as_ref()
+            .map(|path| path.display().to_string());
         let upsert = source_session_upsert(profile, session);
         let existing =
             metadata_db.get_source_session(&upsert.source_id, &upsert.external_session_id)?;
@@ -1302,11 +1369,54 @@ fn refresh_single_profile(
             metadata_db.upsert_source_session(&upsert)?;
             stats.reindexed += 1;
         }
+        link_session_repo(
+            metadata_db,
+            &upsert.source_id,
+            &upsert.external_session_id,
+            repo_path.as_deref(),
+        )?;
     }
     for plan in list_source_plans(profile)? {
         metadata_db.upsert_source_plan_with_edges(&plan)?;
     }
     Ok(stats)
+}
+
+/// Records the native scan roots a profile reads from into source_roots.
+fn record_source_roots(metadata_db: &mut MetadataDb, profile: &SourceProfile) -> Result<()> {
+    let roots = [
+        profile.session_log_path.as_ref(),
+        profile.evidence_root.as_ref(),
+        profile.session_db_path.as_ref(),
+        profile.cursor_state_db_path.as_ref(),
+    ];
+    for root in roots.into_iter().flatten() {
+        let root_path = root.display().to_string();
+        metadata_db.upsert_source_root(&profile.name, Some(&root_path), None)?;
+    }
+    Ok(())
+}
+
+/// Links a session's repo path into workspace_roots + git_repositories M:N tables.
+fn link_session_repo(
+    metadata_db: &mut MetadataDb,
+    source_id: &str,
+    external_session_id: &str,
+    repo_path: Option<&str>,
+) -> Result<()> {
+    let Some(repo_path) = repo_path else {
+        return Ok(());
+    };
+    let Some(source_session_id) =
+        metadata_db.get_source_session_id(source_id, external_session_id)?
+    else {
+        return Ok(());
+    };
+    let workspace_root_id = metadata_db.upsert_workspace_root(repo_path, None)?;
+    metadata_db.link_session_workspace_root(source_session_id, workspace_root_id)?;
+    let git_repository_id = metadata_db.upsert_git_repository(Some(repo_path), None, None, None)?;
+    metadata_db.link_session_git_repository(source_session_id, git_repository_id)?;
+    Ok(())
 }
 
 fn source_profile_upsert(profile: &SourceProfile) -> SourceProfileUpsert {

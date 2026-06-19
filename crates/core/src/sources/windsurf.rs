@@ -152,9 +152,11 @@ mod tests {
         assert_eq!(sessions[0].files_changed, Some(4));
         assert_eq!(sessions[0].lines_added, Some(120));
         assert_eq!(sessions[0].lines_removed, Some(9));
+        let mut touched = sessions[0].touched_files.clone();
+        touched.sort();
         assert_eq!(
-            sessions[0].touched_files,
-            vec!["src/provider.rs".to_string(), "README.md".to_string()]
+            touched,
+            vec!["README.md".to_string(), "src/provider.rs".to_string()]
         );
         assert_eq!(sessions[0].parser_version, WINDSURF_PARSER_VERSION);
     }

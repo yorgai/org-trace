@@ -580,6 +580,17 @@ fn handle_native_import(
                     )
                 })?;
             index_native_source_sessions(profile, std::iter::once(&session))?;
+            if !args.force {
+                if let Some(existing) =
+                    find_existing_brick_session_link(profile, &session.external_session_id)?
+                {
+                    println!("skipped_already_imported=1");
+                    println!("brick_session_id={existing}");
+                    println!("external_session_id={}", session.external_session_id);
+                    println!("hint=pass --force to re-import");
+                    return Ok(());
+                }
+            }
             let requested_session_id =
                 parse_optional_id::<SessionId>(args.session.as_deref(), "session")?;
             let native_session_id = requested_session_id.unwrap_or_default();
@@ -629,6 +640,7 @@ fn handle_native_import(
             .context("failed to build native imported session.log_uploaded event")?;
             store.append_event(&started)?;
             store.append_event(&log)?;
+            record_brick_session_link(profile, &session.external_session_id, &brick_session_id)?;
             println!("imported_event_count=2");
             println!("session_id={brick_session_id}");
             println!("external_session_id={}", session.external_session_id);
@@ -648,6 +660,41 @@ fn index_native_source_sessions<'a>(
     }
     for plan in list_source_plans(profile)? {
         metadata_db.upsert_source_plan_with_edges(&plan)?;
+    }
+    Ok(())
+}
+
+/// Returns an existing Brick session id linked to this native session, if any.
+fn find_existing_brick_session_link(
+    profile: &SourceProfile,
+    external_session_id: &str,
+) -> Result<Option<String>> {
+    let metadata_db = MetadataDb::open_global()?;
+    let Some(source_session_id) =
+        metadata_db.get_source_session_id(&profile.name, external_session_id)?
+    else {
+        return Ok(None);
+    };
+    Ok(metadata_db
+        .list_brick_sessions_for_source_session(source_session_id)?
+        .into_iter()
+        .next())
+}
+
+/// Records the bridge link between a Brick session and the native source session.
+fn record_brick_session_link(
+    profile: &SourceProfile,
+    external_session_id: &str,
+    brick_session_id: &SessionId,
+) -> Result<()> {
+    let mut metadata_db = MetadataDb::open_global()?;
+    if let Some(source_session_id) =
+        metadata_db.get_source_session_id(&profile.name, external_session_id)?
+    {
+        metadata_db.link_brick_session_to_source_session(
+            &brick_session_id.to_string(),
+            source_session_id,
+        )?;
     }
     Ok(())
 }

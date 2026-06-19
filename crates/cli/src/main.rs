@@ -42,6 +42,10 @@ use sync::{handle_pull, handle_push, handle_sync};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Version { format } = &cli.command {
+        history::print_version(*format)?;
+        return Ok(());
+    }
     let work_dir = std::env::current_dir().context("failed to read current directory")?;
     let repo_root = discover_repo_root(&work_dir)?;
     let source_profiles = SourceProfileStore::new(repo_root.clone());
@@ -80,6 +84,7 @@ fn main() -> Result<()> {
             println!("Initialized Brick at {}", store.provenance_dir().display());
             init_source_discovery(&source_profiles)?;
         }
+        Command::Version { .. } => unreachable!("version handled before repo discovery"),
         Command::Org { command } => match command {
             args::OrgCommand::Show { org } => show_org(org, &store)?,
             command => handle_org(

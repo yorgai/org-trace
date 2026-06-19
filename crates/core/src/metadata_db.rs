@@ -494,6 +494,252 @@ impl MetadataDb {
             .context("failed to read metadata source-scan row")
     }
 
+    /// Returns the autoincrement row id for an existing source session.
+    pub fn get_source_session_id(
+        &self,
+        source_id: &str,
+        external_session_id: &str,
+    ) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT source_session_id FROM source_sessions
+                 WHERE source_id = ?1 AND external_session_id = ?2",
+                params![source_id, external_session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read source-session id")
+    }
+
+    /// Inserts or updates one source-root row and returns its id.
+    pub fn upsert_source_root(
+        &mut self,
+        source_id: &str,
+        root_path: Option<&str>,
+        root_uri: Option<&str>,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO source_roots (source_id, root_path, root_uri, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(source_id, root_path, root_uri) DO UPDATE SET updated_at = excluded.updated_at",
+            params![source_id, root_path, root_uri, now],
+        )?;
+        self.connection
+            .query_row(
+                "SELECT source_root_id FROM source_roots
+                 WHERE source_id = ?1 AND root_path IS ?2 AND root_uri IS ?3",
+                params![source_id, root_path, root_uri],
+                |row| row.get(0),
+            )
+            .context("failed to read source-root id after upsert")
+    }
+
+    /// Inserts or updates one workspace-root row and returns its id.
+    pub fn upsert_workspace_root(
+        &mut self,
+        root_path: &str,
+        root_uri: Option<&str>,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO workspace_roots (root_path, root_uri, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(root_path) DO UPDATE SET
+                root_uri = excluded.root_uri,
+                updated_at = excluded.updated_at",
+            params![root_path, root_uri, now],
+        )?;
+        self.connection
+            .query_row(
+                "SELECT workspace_root_id FROM workspace_roots WHERE root_path = ?1",
+                params![root_path],
+                |row| row.get(0),
+            )
+            .context("failed to read workspace-root id after upsert")
+    }
+
+    /// Inserts or updates one git-repository row and returns its id.
+    pub fn upsert_git_repository(
+        &mut self,
+        repo_path: Option<&str>,
+        repo_uri: Option<&str>,
+        remote_url: Option<&str>,
+        head_commit: Option<&str>,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO git_repositories (repo_path, repo_uri, remote_url, head_commit, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(repo_path, repo_uri) DO UPDATE SET
+                remote_url = excluded.remote_url,
+                head_commit = excluded.head_commit,
+                updated_at = excluded.updated_at",
+            params![repo_path, repo_uri, remote_url, head_commit, now],
+        )?;
+        self.connection
+            .query_row(
+                "SELECT git_repository_id FROM git_repositories
+                 WHERE repo_path IS ?1 AND repo_uri IS ?2",
+                params![repo_path, repo_uri],
+                |row| row.get(0),
+            )
+            .context("failed to read git-repository id after upsert")
+    }
+
+    /// Links a source session to a workspace root (idempotent).
+    pub fn link_session_workspace_root(
+        &mut self,
+        source_session_id: i64,
+        workspace_root_id: i64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO source_session_workspace_roots
+                (source_session_id, workspace_root_id) VALUES (?1, ?2)",
+            params![source_session_id, workspace_root_id],
+        )?;
+        Ok(())
+    }
+
+    /// Links a source session to a git repository (idempotent).
+    pub fn link_session_git_repository(
+        &mut self,
+        source_session_id: i64,
+        git_repository_id: i64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO source_session_git_repositories
+                (source_session_id, git_repository_id) VALUES (?1, ?2)",
+            params![source_session_id, git_repository_id],
+        )?;
+        Ok(())
+    }
+
+    /// Lists workspace-root paths linked to a source session.
+    pub fn list_session_workspace_roots(&self, source_session_id: i64) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT w.root_path FROM workspace_roots w
+             JOIN source_session_workspace_roots l ON l.workspace_root_id = w.workspace_root_id
+             WHERE l.source_session_id = ?1
+             ORDER BY w.root_path",
+        )?;
+        let rows = statement
+            .query_map(params![source_session_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Lists git-repository paths linked to a source session.
+    pub fn list_session_git_repositories(&self, source_session_id: i64) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT g.repo_path FROM git_repositories g
+             JOIN source_session_git_repositories l ON l.git_repository_id = g.git_repository_id
+             WHERE l.source_session_id = ?1 AND g.repo_path IS NOT NULL
+             ORDER BY g.repo_path",
+        )?;
+        let rows = statement
+            .query_map(params![source_session_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Inserts one source-session resource pointer (idempotent on kind+path).
+    pub fn upsert_source_session_resource(
+        &mut self,
+        source_session_id: i64,
+        resource_kind: &str,
+        resource_path: Option<&str>,
+        resource_uri: Option<&str>,
+        metadata_json: Option<&Value>,
+    ) -> Result<()> {
+        let metadata_json = serialize_metadata_json(metadata_json)?;
+        self.connection.execute(
+            "INSERT INTO source_session_resources
+                (source_session_id, resource_kind, resource_path, resource_uri, metadata_json)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS (
+                SELECT 1 FROM source_session_resources
+                WHERE source_session_id = ?1 AND resource_kind = ?2 AND resource_path IS ?3
+             )",
+            params![
+                source_session_id,
+                resource_kind,
+                resource_path,
+                resource_uri,
+                metadata_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lists resource kinds/paths for a source session.
+    pub fn list_source_session_resources(
+        &self,
+        source_session_id: i64,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT resource_kind, resource_path FROM source_session_resources
+             WHERE source_session_id = ?1
+             ORDER BY resource_kind, resource_path",
+        )?;
+        let rows = statement
+            .query_map(params![source_session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Links a Brick provenance session to a source session (idempotent).
+    pub fn link_brick_session_to_source_session(
+        &mut self,
+        brick_session_id: &str,
+        source_session_id: i64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT OR IGNORE INTO brick_session_source_sessions
+                (brick_session_id, source_session_id, linked_at) VALUES (?1, ?2, ?3)",
+            params![brick_session_id, source_session_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Lists `(source_id, external_session_id)` pairs linked to a Brick session.
+    pub fn list_source_sessions_for_brick_session(
+        &self,
+        brick_session_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.source_id, s.external_session_id FROM source_sessions s
+             JOIN brick_session_source_sessions b ON b.source_session_id = s.source_session_id
+             WHERE b.brick_session_id = ?1
+             ORDER BY s.source_id, s.external_session_id",
+        )?;
+        let rows = statement
+            .query_map(params![brick_session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Lists Brick session ids linked to a source session.
+    pub fn list_brick_sessions_for_source_session(
+        &self,
+        source_session_id: i64,
+    ) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT brick_session_id FROM brick_session_source_sessions
+             WHERE source_session_id = ?1
+             ORDER BY linked_at",
+        )?;
+        let rows = statement
+            .query_map(params![source_session_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Inserts or updates one source-plan row and replaces its recovered session edges.
     pub fn upsert_source_plan_with_edges(
         &mut self,
@@ -1750,5 +1996,151 @@ mod tests {
             completed.metadata_json,
             Some(json!({ "scanned": 3, "reindexed": 1, "skipped": 2 }))
         );
+    }
+
+    #[test]
+    fn links_session_to_workspace_roots_idempotently() {
+        let path = temp_home("workspace-links").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("WS session", 0))
+            .expect("insert session");
+        let session_id = db
+            .get_source_session_id(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("read id")
+            .expect("id present");
+
+        let root_a = db
+            .upsert_workspace_root("/workspace/a", None)
+            .expect("upsert root a");
+        let root_b = db
+            .upsert_workspace_root("/workspace/b", None)
+            .expect("upsert root b");
+        db.link_session_workspace_root(session_id, root_a)
+            .expect("link a");
+        db.link_session_workspace_root(session_id, root_b)
+            .expect("link b");
+        // Re-link is a no-op (idempotent), and re-upsert returns the same id.
+        db.link_session_workspace_root(session_id, root_a)
+            .expect("relink a");
+        assert_eq!(
+            db.upsert_workspace_root("/workspace/a", None)
+                .expect("re-upsert a"),
+            root_a
+        );
+
+        let roots = db
+            .list_session_workspace_roots(session_id)
+            .expect("list roots");
+        assert_eq!(roots, vec!["/workspace/a", "/workspace/b"]);
+    }
+
+    #[test]
+    fn links_session_to_git_repository() {
+        let path = temp_home("git-links").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Git session", 0))
+            .expect("insert session");
+        let session_id = db
+            .get_source_session_id(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("read id")
+            .expect("id present");
+
+        let repo_id = db
+            .upsert_git_repository(
+                Some("/workspace/repo"),
+                None,
+                Some("git@host:repo.git"),
+                None,
+            )
+            .expect("upsert repo");
+        db.link_session_git_repository(session_id, repo_id)
+            .expect("link repo");
+
+        let repos = db
+            .list_session_git_repositories(session_id)
+            .expect("list repos");
+        assert_eq!(repos, vec!["/workspace/repo"]);
+    }
+
+    #[test]
+    fn records_source_roots_and_session_resources() {
+        let path = temp_home("roots-resources").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let root_id = db
+            .upsert_source_root(TEST_SOURCE_ID, Some("/logs/source"), None)
+            .expect("upsert source root");
+        assert_eq!(
+            db.upsert_source_root(TEST_SOURCE_ID, Some("/logs/source"), None)
+                .expect("re-upsert source root"),
+            root_id
+        );
+
+        db.upsert_source_session(&sample_upsert("Res session", 0))
+            .expect("insert session");
+        let session_id = db
+            .get_source_session_id(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("read id")
+            .expect("id present");
+        db.upsert_source_session_resource(
+            session_id,
+            "plan_file",
+            Some("/plans/plan-1.md"),
+            None,
+            Some(&json!({ "kind": "cursor-plan" })),
+        )
+        .expect("insert resource");
+        // Idempotent on (kind, path).
+        db.upsert_source_session_resource(
+            session_id,
+            "plan_file",
+            Some("/plans/plan-1.md"),
+            None,
+            None,
+        )
+        .expect("re-insert resource");
+
+        let resources = db
+            .list_source_session_resources(session_id)
+            .expect("list resources");
+        assert_eq!(
+            resources,
+            vec![(
+                "plan_file".to_string(),
+                Some("/plans/plan-1.md".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn bridges_brick_session_to_source_session() {
+        let path = temp_home("brick-bridge").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Bridge session", 0))
+            .expect("insert session");
+        let session_id = db
+            .get_source_session_id(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("read id")
+            .expect("id present");
+
+        db.link_brick_session_to_source_session("brick-sess-1", session_id)
+            .expect("link bridge");
+        // Idempotent.
+        db.link_brick_session_to_source_session("brick-sess-1", session_id)
+            .expect("relink bridge");
+
+        let sources = db
+            .list_source_sessions_for_brick_session("brick-sess-1")
+            .expect("list by brick session");
+        assert_eq!(
+            sources,
+            vec![(
+                TEST_SOURCE_ID.to_string(),
+                TEST_EXTERNAL_SESSION_ID.to_string()
+            )]
+        );
+        let bricks = db
+            .list_brick_sessions_for_source_session(session_id)
+            .expect("list by source session");
+        assert_eq!(bricks, vec!["brick-sess-1".to_string()]);
     }
 }
