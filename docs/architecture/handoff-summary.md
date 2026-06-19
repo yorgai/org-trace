@@ -599,7 +599,7 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions — PARTIAL (stages A–F done)
+### 8. Server auth and repo/org permissions — DONE (stages A–G; self-hosted multi-tenant)
 
 **Stage A (scoped token table) landed.** The server auth gate is now a token
 table persisted as `tokens.json` in the data dir. Each token has a label, a
@@ -659,11 +659,20 @@ extensions (`AuthedIdentity`), and the audit log now records the verified actor
 the audit actor is guaranteed equal to the event actor, making it the
 trustworthy "who did this write" field.
 
-Still needed before real team/self-host usage:
+**Stage G (persisted repo→org projection) landed.** Org-scope resolution no
+longer rescans the event log per request. `ServerStore` maintains a repo→org map
+(`repo_org.json`) incrementally: each accepted push updates it (first org per
+repo wins) and commits it atomically (temp file + rename). It is cached in memory
+behind an `Arc<RwLock<_>>` shared across store clones (handlers and the auth
+gate), so steady-state resolution is an O(1) lookup. On a cold start the cache
+loads from the file, or rebuilds once from the log when the file is absent
+(legacy data dirs) and writes it back. Verified live: after a restart with the
+event log removed, org-scoped routes still resolve purely from the projection.
 
-- a persisted repo→org projection (the current resolver scans the event log per
-  repo-routed request when org scopes are in use; fine for MVP, worth indexing
-  if org-scoped traffic grows).
+§8 is now functionally complete for self-hosted multi-tenant use: token scopes
+(repo/org/all), read vs write, expiry, rotation, write-audit with verified actor,
+actor binding, and O(1) org resolution. Further hardening (external identity /
+OIDC, richer org hierarchy, projection compaction) is post-MVP and not blocking.
 
 ## Design cautions
 

@@ -3,24 +3,44 @@
 //! This store keeps one JSONL event log as the server source of truth. Repo
 //! scoping, pagination, and duplicate checks are all projections over that log;
 //! authorization and tenant policy remain future concerns.
+//!
+//! One derived projection is persisted alongside the log: a repo→org map
+//! (`repo_org.json`) maintained incrementally on append and cached in memory, so
+//! org-scoped authorization resolves a repo's owning org in O(1) without
+//! rescanning the event log per request.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use brick_protocol::{EventCursor, ListEventsResponse, PushEventsResponse, TraceEvent};
 use uuid::Uuid;
 
 const SERVER_EVENTS_FILE: &str = "events.jsonl";
+const REPO_ORG_FILE: &str = "repo_org.json";
 const DEFAULT_EVENT_LIMIT: usize = 100;
 const MAX_EVENT_LIMIT: usize = 1000;
 
 /// Filesystem-backed event store for the self-hosted trace server.
+///
+/// Cloning shares the same in-memory repo→org projection cache (via `Arc`), so
+/// all handlers and the auth gate that hold clones of one store observe a single
+/// consistent view.
 #[derive(Debug, Clone)]
 pub struct ServerStore {
     data_dir: PathBuf,
+    repo_org: Arc<RwLock<RepoOrgProjection>>,
+}
+
+/// In-memory cache of the persisted repo→org projection. `loaded` is `None`
+/// until first populated (lazily, from `repo_org.json` or by rebuilding from the
+/// event log), then holds the full map for the process lifetime.
+#[derive(Debug, Default)]
+struct RepoOrgProjection {
+    loaded: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +54,7 @@ impl ServerStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            repo_org: Arc::new(RwLock::new(RepoOrgProjection::default())),
         }
     }
 
@@ -142,6 +163,7 @@ impl ServerStore {
             .with_context(|| format!("failed to open server event log at {}", path.display()))?;
 
         let mut seen_in_request = BTreeSet::<Uuid>::new();
+        let mut accepted_repo_orgs: Vec<(String, String)> = Vec::new();
         for event in events {
             if existing_event_ids.contains(&event.event_id)
                 || !seen_in_request.insert(event.event_id)
@@ -152,7 +174,16 @@ impl ServerStore {
             let serialized =
                 serde_json::to_string(&event).context("failed to serialize pushed event")?;
             writeln!(file, "{serialized}").context("failed to append pushed event")?;
+            if let (Some(repo), Some(org)) = (event.repo_id.as_deref(), event.org_id.as_ref()) {
+                accepted_repo_orgs.push((repo.to_string(), org.to_string()));
+            }
             accepted_event_ids.push(event.event_id);
+        }
+
+        // Keep the persisted repo→org projection in step with the log so
+        // org-scoped authorization never has to rescan events at request time.
+        if !accepted_repo_orgs.is_empty() {
+            self.record_repo_orgs(accepted_repo_orgs)?;
         }
 
         Ok(PushEventsResponse {
@@ -161,21 +192,128 @@ impl ServerStore {
         })
     }
 
-    /// Resolves a repo's owning org id by scanning stored events for the first
-    /// event carrying both this `repo_id` and an `org_id`. Returns `None` when
-    /// no stored event ties the repo to an org. Best-effort: an unreadable log
-    /// yields `None` rather than an error, since this feeds an auth decision
-    /// that must stay deny-by-default.
+    /// Resolves a repo's owning org id from the persisted repo→org projection.
+    ///
+    /// The projection is loaded once (from `repo_org.json`, or rebuilt from the
+    /// event log if the file is missing) and cached for the process lifetime, so
+    /// steady-state resolution is an O(1) in-memory lookup. Returns `None` when
+    /// no stored event ties the repo to an org. Best-effort: any I/O error
+    /// yields `None` rather than failing, since this feeds an auth decision that
+    /// must stay deny-by-default.
     pub fn resolve_repo_org(&self, repo_id: &str) -> Option<String> {
-        let events = self.read_sequenced_events().ok()?;
-        events.into_iter().find_map(|entry| {
-            let event = entry.event;
-            if event.repo_id.as_deref() == Some(repo_id) {
-                event.org_id.map(|org| org.to_string())
-            } else {
-                None
+        // Fast path: cache already populated.
+        if let Ok(guard) = self.repo_org.read() {
+            if let Some(map) = guard.loaded.as_ref() {
+                return map.get(repo_id).cloned();
             }
-        })
+        }
+        // Slow path: populate the cache once, then read from it.
+        self.ensure_repo_org_loaded().ok()?;
+        let guard = self.repo_org.read().ok()?;
+        guard.loaded.as_ref()?.get(repo_id).cloned()
+    }
+
+    /// Populates the in-memory repo→org cache if it has not been loaded yet,
+    /// preferring the persisted file and falling back to rebuilding from the log
+    /// (which also writes the file so subsequent starts are cheap).
+    fn ensure_repo_org_loaded(&self) -> Result<()> {
+        {
+            let guard = self
+                .repo_org
+                .read()
+                .map_err(|_| anyhow!("repo→org cache lock poisoned"))?;
+            if guard.loaded.is_some() {
+                return Ok(());
+            }
+        }
+        let map = match self.load_repo_org_file()? {
+            Some(map) => map,
+            None => {
+                let rebuilt = self.rebuild_repo_org_from_log()?;
+                self.write_repo_org_file(&rebuilt)?;
+                rebuilt
+            }
+        };
+        let mut guard = self
+            .repo_org
+            .write()
+            .map_err(|_| anyhow!("repo→org cache lock poisoned"))?;
+        // Another thread may have loaded it while we read the disk; only set if
+        // still empty so we don't clobber a freshly-recorded entry.
+        if guard.loaded.is_none() {
+            guard.loaded = Some(map);
+        }
+        Ok(())
+    }
+
+    /// Records repo→org bindings for newly accepted events into both the cache
+    /// (if loaded) and the persisted file. First binding for a repo wins, mirror
+    /// of the historical "first event ties the repo to an org" semantics.
+    fn record_repo_orgs(&self, bindings: Vec<(String, String)>) -> Result<()> {
+        self.ensure_repo_org_loaded()?;
+        let mut guard = self
+            .repo_org
+            .write()
+            .map_err(|_| anyhow!("repo→org cache lock poisoned"))?;
+        let map = guard.loaded.get_or_insert_with(BTreeMap::new);
+        let mut changed = false;
+        for (repo, org) in bindings {
+            map.entry(repo).or_insert_with(|| {
+                changed = true;
+                org
+            });
+        }
+        if changed {
+            self.write_repo_org_file(map)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the persisted repo→org file, returning `None` when it is absent so
+    /// the caller can rebuild from the log.
+    fn load_repo_org_file(&self) -> Result<Option<BTreeMap<String, String>>> {
+        let path = self.repo_org_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read repo→org map at {}", path.display()))?;
+        if contents.trim().is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let map = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse repo→org map at {}", path.display()))?;
+        Ok(Some(map))
+    }
+
+    /// Writes the repo→org file atomically (temp file + rename) so a crash
+    /// mid-write cannot leave a truncated map.
+    fn write_repo_org_file(&self, map: &BTreeMap<String, String>) -> Result<()> {
+        self.init()?;
+        let path = self.repo_org_path();
+        let tmp = path.with_extension("json.tmp");
+        let serialized =
+            serde_json::to_string_pretty(map).context("failed to serialize repo→org map")?;
+        fs::write(&tmp, serialized)
+            .with_context(|| format!("failed to write repo→org map at {}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to commit repo→org map at {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Rebuilds the repo→org map from the full event log (first org per repo
+    /// wins), used once when no persisted file exists yet.
+    fn rebuild_repo_org_from_log(&self) -> Result<BTreeMap<String, String>> {
+        let mut map = BTreeMap::new();
+        for entry in self.read_sequenced_events()? {
+            if let (Some(repo), Some(org)) =
+                (entry.event.repo_id.as_deref(), entry.event.org_id.as_ref())
+            {
+                map.entry(repo.to_string())
+                    .or_insert_with(|| org.to_string());
+            }
+        }
+        Ok(map)
     }
 
     fn read_sequenced_events(&self) -> Result<Vec<SequencedEvent>> {
@@ -207,6 +345,10 @@ impl ServerStore {
 
     fn events_path(&self) -> PathBuf {
         self.data_dir.join(SERVER_EVENTS_FILE)
+    }
+
+    fn repo_org_path(&self) -> PathBuf {
+        self.data_dir.join(REPO_ORG_FILE)
     }
 }
 
@@ -341,6 +483,77 @@ mod tests {
         assert_eq!(store.resolve_repo_org("repo-a"), expected);
         assert_eq!(store.resolve_repo_org("repo-b"), None);
         assert_eq!(store.resolve_repo_org("repo-missing"), None);
+    }
+
+    #[test]
+    fn repo_org_projection_persists_and_reloads_without_rescanning_log() {
+        use brick_protocol::OrgId;
+        let dir = temp_data_dir("repo-org-persist");
+        let store = ServerStore::new(&dir);
+        let mut tagged = event("tagged", Some("repo-a"));
+        let org = OrgId::new();
+        tagged.org_id = Some(org.clone());
+        store.append_events(&[tagged]).expect("append");
+
+        // The projection is written to disk on append.
+        assert!(dir.join(REPO_ORG_FILE).exists());
+
+        // A brand-new store handle (cold process restart) loads the persisted
+        // file. Delete the event log first to prove resolution does not rescan
+        // events — it must answer purely from the persisted projection.
+        std::fs::remove_file(dir.join(SERVER_EVENTS_FILE)).expect("remove log");
+        let reopened = ServerStore::new(&dir);
+        assert_eq!(reopened.resolve_repo_org("repo-a"), Some(org.to_string()));
+    }
+
+    #[test]
+    fn repo_org_projection_rebuilds_from_log_when_file_absent() {
+        use brick_protocol::OrgId;
+        let dir = temp_data_dir("repo-org-rebuild");
+        // Seed an event log directly, with no projection file (legacy data dir).
+        let store = ServerStore::new(&dir);
+        let mut tagged = event("tagged", Some("repo-a"));
+        let org = OrgId::new();
+        tagged.org_id = Some(org.clone());
+        store.append_events(&[tagged]).expect("append");
+        std::fs::remove_file(dir.join(REPO_ORG_FILE)).expect("remove projection");
+
+        // A fresh handle with only the log present rebuilds the projection and
+        // writes it back so later starts are cheap.
+        let reopened = ServerStore::new(&dir);
+        assert_eq!(reopened.resolve_repo_org("repo-a"), Some(org.to_string()));
+        assert!(dir.join(REPO_ORG_FILE).exists());
+    }
+
+    #[test]
+    fn repo_org_projection_keeps_first_org_per_repo() {
+        use brick_protocol::OrgId;
+        let store = ServerStore::new(temp_data_dir("repo-org-first-wins"));
+        let mut first = event("first", Some("repo-a"));
+        let first_org = OrgId::new();
+        first.org_id = Some(first_org.clone());
+        let mut second = event("second", Some("repo-a"));
+        second.org_id = Some(OrgId::new());
+        store.append_events(&[first]).expect("append first");
+        store.append_events(&[second]).expect("append second");
+
+        assert_eq!(
+            store.resolve_repo_org("repo-a"),
+            Some(first_org.to_string())
+        );
+    }
+
+    #[test]
+    fn cloned_store_shares_repo_org_cache() {
+        use brick_protocol::OrgId;
+        let store = ServerStore::new(temp_data_dir("repo-org-clone"));
+        let clone = store.clone();
+        let mut tagged = event("tagged", Some("repo-a"));
+        let org = OrgId::new();
+        tagged.org_id = Some(org.clone());
+        // Append through one handle; the clone observes it via the shared cache.
+        store.append_events(&[tagged]).expect("append");
+        assert_eq!(clone.resolve_repo_org("repo-a"), Some(org.to_string()));
     }
 
     #[test]
