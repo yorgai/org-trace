@@ -587,7 +587,7 @@ pub enum HistoryExportFormatArg {
 }
 
 /// Which agent memory file(s) to inject Brick awareness into.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 pub enum AgentTargetArg {
     /// `CLAUDE.md` (Claude Code).
@@ -598,6 +598,12 @@ pub enum AgentTargetArg {
     Gemini,
     /// Cursor — MCP-server registration only (no separate memory file).
     Cursor,
+    /// ORGII — MCP-server registration only.
+    Orgii,
+    /// Windsurf — MCP-server registration only.
+    Windsurf,
+    /// VS Code (Copilot) — MCP-server registration only.
+    Vscode,
     /// Every known target.
     All,
 }

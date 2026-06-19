@@ -224,56 +224,143 @@ fn hook_outcome(path: String, action: String) -> AgentOutcome {
 }
 
 /// One MCP config file Brick can register `brick mcp-serve` into, with the
-/// pseudo-target label used in reports.
+/// pseudo-target label used in reports and the config format/schema it uses.
 struct McpConfigTarget {
     label: &'static str,
     path: PathBuf,
+    format: mcp_config::Format,
 }
 
 /// Resolves the MCP config files to act on for the selected target + scope.
 ///
-/// Claude Code reads MCP servers from `~/.claude.json` (global) or a project
-/// `.mcp.json` (local); Cursor reads from `~/.cursor/mcp.json` (global or local).
-/// Codex/Gemini have no standard MCP-config story here, so they are skipped.
-/// `all` registers both Claude and Cursor; `cursor` targets only Cursor.
+/// MCP registration spans more clients than the markdown-memory targets because
+/// many MCP-capable tools have no native memory file. `all` registers every
+/// known client (global scope only — most use a single per-user config). The
+/// discrete `cursor`/`vscode`/`windsurf`/`codex`/`orgii` targets act on just one.
+///
+/// Formats: Claude, Cursor, ORGII, Windsurf, Claude Desktop use the `mcpServers`
+/// JSON family; VS Code uses a `servers`-keyed JSON; Codex uses `config.toml`.
 fn mcp_config_targets(args: &AgentTargetArgs) -> Vec<McpConfigTarget> {
+    use mcp_config::Format;
     let is_all = matches!(args.target, AgentTargetArg::All);
-    let want_claude = is_all || matches!(args.target, AgentTargetArg::Claude);
-    let want_cursor = is_all || matches!(args.target, AgentTargetArg::Cursor);
+    let want = |t: AgentTargetArg| is_all || args.target == t;
     let mut targets = Vec::new();
 
-    if want_claude {
-        if args.global {
-            if let Some(home) = home_dir() {
+    // Claude Code: project `.mcp.json` (local) or `~/.claude.json` (global).
+    if want(AgentTargetArg::Claude) {
+        if !args.global {
+            if let Some(base) = local_base(args) {
                 targets.push(McpConfigTarget {
                     label: "claude_mcp",
-                    path: home.join(".claude.json"),
+                    path: base.join(".mcp.json"),
+                    format: Format::JsonMcpServers,
                 });
             }
-        } else if let Some(base) = local_base(args) {
+        } else if let Some(home) = home_dir() {
             targets.push(McpConfigTarget {
                 label: "claude_mcp",
-                path: base.join(".mcp.json"),
+                path: home.join(".claude.json"),
+                format: Format::JsonMcpServers,
             });
         }
     }
 
-    if want_cursor {
-        if args.global {
-            if let Some(home) = home_dir() {
-                targets.push(McpConfigTarget {
-                    label: "cursor_mcp",
-                    path: home.join(".cursor").join("mcp.json"),
-                });
-            }
-        } else if let Some(base) = local_base(args) {
+    // Cursor: `.cursor/mcp.json` (local or global).
+    if want(AgentTargetArg::Cursor) {
+        let base = if args.global {
+            home_dir()
+        } else {
+            local_base(args)
+        };
+        if let Some(base) = base {
             targets.push(McpConfigTarget {
                 label: "cursor_mcp",
                 path: base.join(".cursor").join("mcp.json"),
+                format: Format::JsonMcpServers,
             });
         }
     }
+
+    // The remaining clients are global-only (single per-user config); skip them
+    // for local-scope installs.
+    if !args.global {
+        return targets;
+    }
+    let Some(home) = home_dir() else {
+        return targets;
+    };
+
+    // ORGII: ~/.orgii/mcp-servers.json
+    if want(AgentTargetArg::Orgii) {
+        targets.push(McpConfigTarget {
+            label: "orgii_mcp",
+            path: home.join(".orgii").join("mcp-servers.json"),
+            format: Format::JsonMcpServers,
+        });
+    }
+
+    // Windsurf: ~/.codeium/windsurf/mcp_config.json
+    if want(AgentTargetArg::Windsurf) {
+        targets.push(McpConfigTarget {
+            label: "windsurf_mcp",
+            path: home
+                .join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+            format: Format::JsonMcpServers,
+        });
+    }
+
+    // VS Code (Copilot): per-user mcp.json, `servers` root key.
+    if want(AgentTargetArg::Vscode) {
+        if let Some(path) = vscode_user_mcp_path(&home) {
+            targets.push(McpConfigTarget {
+                label: "vscode_mcp",
+                path,
+                format: Format::JsonServers,
+            });
+        }
+    }
+
+    // Codex: ~/.codex/config.toml, [mcp_servers.<name>] tables.
+    if want(AgentTargetArg::Codex) {
+        targets.push(McpConfigTarget {
+            label: "codex_mcp",
+            path: home.join(".codex").join("config.toml"),
+            format: Format::CodexToml,
+        });
+    }
+
     targets
+}
+
+/// Per-user VS Code MCP config path, which is OS-specific.
+fn vscode_user_mcp_path(home: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            home.join("Library")
+                .join("Application Support")
+                .join("Code")
+                .join("User")
+                .join("mcp.json"),
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|base| base.join("Code").join("User").join("mcp.json"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Some(
+            home.join(".config")
+                .join("Code")
+                .join("User")
+                .join("mcp.json"),
+        )
+    }
 }
 
 /// Resolves the local working directory base for config files.
@@ -299,14 +386,13 @@ fn mcp_config_outcomes(args: &AgentTargetArgs, op: &HookOp) -> Vec<AgentOutcome>
             let path_label = target.path.display().to_string();
             let action = match (&brick_bin, op) {
                 (Ok(bin), HookOp::Install { force }) => {
-                    mcp_config::install(&target.path, bin, *force).map(|a| a.as_str().to_string())
+                    mcp_config::install(&target.path, bin, target.format, *force)
+                        .map(|a| a.as_str().to_string())
                 }
-                (Ok(bin), HookOp::Status) => {
-                    mcp_config::status(&target.path, bin).map(|a| a.as_str().to_string())
-                }
-                (_, HookOp::Uninstall) => {
-                    mcp_config::uninstall(&target.path).map(|a| a.as_str().to_string())
-                }
+                (Ok(bin), HookOp::Status) => mcp_config::status(&target.path, bin, target.format)
+                    .map(|a| a.as_str().to_string()),
+                (_, HookOp::Uninstall) => mcp_config::uninstall(&target.path, target.format)
+                    .map(|a| a.as_str().to_string()),
                 (Err(error), _) => Err(anyhow::anyhow!("{error}")),
             };
             AgentOutcome {
@@ -335,10 +421,13 @@ fn resolve_targets(args: &AgentTargetArgs) -> Result<(Vec<MemoryFile>, Vec<Agent
             AgentTargetArg::Codex,
             AgentTargetArg::Gemini,
         ],
-        // Cursor is MCP-only — it has no markdown memory file, so it never
-        // contributes a `MemoryFile`; its registration is handled separately
+        // MCP-only targets have no markdown memory file, so they never
+        // contribute a `MemoryFile`; their registration is handled separately
         // by `mcp_config_outcomes`.
-        AgentTargetArg::Cursor => vec![],
+        AgentTargetArg::Cursor
+        | AgentTargetArg::Orgii
+        | AgentTargetArg::Windsurf
+        | AgentTargetArg::Vscode => vec![],
         single => vec![single],
     };
 
@@ -382,7 +471,10 @@ fn resolve_path(
         AgentTargetArg::Claude => home.join(".claude").join(filename),
         AgentTargetArg::Codex => home.join(".codex").join(filename),
         AgentTargetArg::Gemini => home.join(".gemini").join(filename),
-        AgentTargetArg::Cursor => unreachable!("cursor has no memory file (MCP-only)"),
+        AgentTargetArg::Cursor
+        | AgentTargetArg::Orgii
+        | AgentTargetArg::Windsurf
+        | AgentTargetArg::Vscode => unreachable!("MCP-only target has no memory file"),
         AgentTargetArg::All => unreachable!("`all` is expanded before path resolution"),
     };
     Ok(Some(path))
@@ -400,7 +492,10 @@ fn target_filename(target: AgentTargetArg) -> &'static str {
         AgentTargetArg::Claude => "CLAUDE.md",
         AgentTargetArg::Codex => "AGENTS.md",
         AgentTargetArg::Gemini => "GEMINI.md",
-        AgentTargetArg::Cursor => unreachable!("cursor has no memory file (MCP-only)"),
+        AgentTargetArg::Cursor
+        | AgentTargetArg::Orgii
+        | AgentTargetArg::Windsurf
+        | AgentTargetArg::Vscode => unreachable!("MCP-only target has no memory file"),
         AgentTargetArg::All => unreachable!("`all` is expanded before filename resolution"),
     }
 }
@@ -411,6 +506,9 @@ fn target_label(target: AgentTargetArg) -> &'static str {
         AgentTargetArg::Codex => "codex",
         AgentTargetArg::Gemini => "gemini",
         AgentTargetArg::Cursor => "cursor",
+        AgentTargetArg::Orgii => "orgii",
+        AgentTargetArg::Windsurf => "windsurf",
+        AgentTargetArg::Vscode => "vscode",
         AgentTargetArg::All => "all",
     }
 }
