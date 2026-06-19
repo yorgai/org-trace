@@ -1,0 +1,103 @@
+# Cross-compiles the `brick` CLI for every supported platform and publishes the
+# binaries (plus .sha256 sidecars) to the GitHub Release for a pushed `v*` tag.
+# The asset names match exactly what npm/scripts/postinstall.js downloads:
+# `brick-<rust-target-triple>[.exe]`.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aarch64 Linux needs a cross linker; the other targets build natively.
+      - name: Install aarch64 Linux cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          {
+            echo '[target.aarch64-unknown-linux-gnu]'
+            echo 'linker = "aarch64-linux-gnu-gcc"'
+          } >> .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --locked -p brick --target ${{ matrix.target }}
+
+      - name: Package asset (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          asset="brick-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/brick" "$asset"
+          shasum -a 256 "$asset" | awk '{print $1}' > "$asset.sha256"
+
+      - name: Package asset (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          asset="brick-${{ matrix.target }}.exe"
+          cp "target/${{ matrix.target }}/release/brick.exe" "$asset"
+          certutil -hashfile "$asset" SHA256 | sed -n '2p' | tr -d ' \r' > "$asset.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            brick-${{ matrix.target }}*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    name: publish npm package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify package version matches tag
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./npm/package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "Tag v$tag does not match npm package version $pkg" >&2
+            exit 1
+          fi
+      - name: Publish to npm
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

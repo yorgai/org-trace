@@ -1,0 +1,35 @@
+{
+  "name": "@yorgai/brick",
+  "version": "0.1.0",
+  "description": "Brick — cross-tool AI coding session memory. Recall who changed a file and why across Claude Code, Cursor, Codex, and more.",
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "mcp",
+    "claude",
+    "cursor",
+    "codex",
+    "memory",
+    "provenance"
+  ],
+  "homepage": "https://github.com/yorgai/Brick-Vault",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yorgai/Brick-Vault.git"
+  },
+  "license": "AGPL-3.0-or-later",
+  "bin": {
+    "brick": "bin/brick.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/brick.js",
+    "scripts/postinstall.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
