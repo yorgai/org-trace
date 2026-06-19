@@ -768,6 +768,29 @@ codex, claude, orgii, and gemini. The blame query's repo-path relaxation +
 or relative path. Parser versions fold into the source fingerprint, so each parser
 upgrade auto-reindexes without a manual command.
 
+### `brick memory recall` — one-call agent recall — DONE
+
+`crates/cli/src/memory.rs` adds `brick memory recall --path <file>`, the single
+command the agent-awareness block now points at (TEMPLATE_VERSION bumped to 2).
+It reuses `build_file_session_blame_response` (so it aggregates across every
+source) and enriches each blame row by joining `(source_id, external_session_id)`
+back to the metadata DB for the session title — the *intent*/"why". Output
+(`memory-recall-v1`):
+
+- `summary` — one natural-language line ("N prior sessions touched <file> (via
+  <tools>). Most recent: \"<intent>\".") for direct agent consumption.
+- `sessions[]` — per prior session: source, intent, change size
+  (files/lines), confidence, and a ready-to-run `recall_chunks_hint`
+  (`brick history chunks …`) for the full transcript on demand.
+- `status` is `ok` / `empty` / `error`, mirroring blame.
+
+Verified live: recall returns real intent across codex (`sample_sales.csv`),
+claude (`blame_target.py`), orgii (`index.tsx`, 5 sessions), and gemini
+(`handler.py`); a never-touched path returns `status: empty` with a friendly
+summary. Wiring note: `Command::Memory` is exempted from global
+`selected_profile` resolution in `main.rs` (like `History`) so `--source all`
+works.
+
 ## Design cautions
 
 - Treat ORGII external-history code as a whole subsystem: scan, parse, metadata indexing, source-specific loading/windowing, chunk load, recent paths, impact stats, backfill, and diagnostics move together into Brick over time.

@@ -105,6 +105,10 @@ pub enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
@@ -524,11 +528,20 @@ pub enum HistoryFormatArg {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub enum HistoryExportFormatArg {
-    Json,
-    Csv,
+/// `brick memory <subcommand>` — agent-facing recall over indexed history.
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// Summarize who changed a file across past sessions and why.
+    Recall {
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -536,6 +549,13 @@ pub enum HistoryExportFormatArg {
 pub enum HistoryExportSchemaArg {
     AuditV1,
     SourceMetadataV1,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum HistoryExportFormatArg {
+    Json,
+    Csv,
 }
 
 /// Which agent memory file(s) to inject Brick awareness into.

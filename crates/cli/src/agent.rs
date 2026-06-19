@@ -19,7 +19,7 @@ use crate::args::{
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 1;
+const TEMPLATE_VERSION: u32 = 2;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -41,14 +41,16 @@ machine. Use it to recall prior decisions instead of rediscovering them.
 
 ### Workflow
 
-- Before editing a file, recall who touched it and why:
-  `brick history file-session-blame --path <file> --format json`
+- Before editing a file, recall who changed it and why in one call:
+  `brick memory recall --path <file> --format json`
+  This returns a one-line summary plus per-session intent, change size, and a
+  `recall_chunks_hint` command for the full transcript when you need detail.
 - For broader project memory, list sources then drill in:
   `brick history sources --format json`
   `brick history sessions --source <id> --format json`
   `brick history chunks --source <id> --session-id <sid> --format json`
 
-All `brick history` commands support `--format json` for machine parsing.";
+All `brick memory` and `brick history` commands support `--format json`.";
 
 /// One memory file to act on, resolved from a target + scope.
 #[derive(Debug, Clone)]
@@ -392,7 +394,7 @@ mod tests {
         let content = std::fs::read_to_string(&file.path).expect("read");
         assert_eq!(content.matches(BLOCK_START_PREFIX).count(), 1);
         assert_eq!(content.matches(BLOCK_END).count(), 1);
-        assert!(content.contains("brick history file-session-blame"));
+        assert!(content.contains("brick memory recall"));
     }
 
     #[test]

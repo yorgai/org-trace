@@ -523,7 +523,7 @@ pub fn handle_history(
     }
 }
 
-fn build_file_session_blame_response(
+pub(crate) fn build_file_session_blame_response(
     store: &LocalStore,
     profiles: &SourceProfileStore,
     file_path: &str,
@@ -1656,12 +1656,12 @@ fn read_profile(profiles: &SourceProfileStore, source: &str) -> Result<SourcePro
         .ok_or_else(|| anyhow!("source profile not found: {source}"))
 }
 
-fn print_json<T: Serialize>(value: &T) -> Result<()> {
+pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string(value)?);
     Ok(())
 }
 
-fn ensure_json(format: HistoryFormatArg) {
+pub(crate) fn ensure_json(format: HistoryFormatArg) {
     match format {
         HistoryFormatArg::Json => {}
     }
