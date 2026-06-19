@@ -1,5 +1,15 @@
 import { useMemo, useState } from 'react'
 import { metadataExportFilename, type ExportFormat } from './exportFilename.ts'
+import {
+  activeAnnouncements,
+  liveHistoryUrl,
+  liveScopeLabel,
+  relativeAge,
+  type Announcement,
+  type AnnouncementsResponse,
+  type LiveResponse,
+  type LiveSession,
+} from './liveView.ts'
 import './App.css'
 
 type RequestState<T> = {
@@ -96,6 +106,8 @@ function App() {
   const [sessionsState, setSessionsState] = useState<RequestState<HistorySessionsResponse>>({ loading: false, data: null, error: null })
   const [exportState, setExportState] = useState<RequestState<string>>({ loading: false, data: null, error: null })
   const [lastExportUrl, setLastExportUrl] = useState<string | null>(null)
+  const [liveState, setLiveState] = useState<RequestState<LiveResponse>>({ loading: false, data: null, error: null })
+  const [announcementsState, setAnnouncementsState] = useState<RequestState<AnnouncementsResponse>>({ loading: false, data: null, error: null })
 
   const baseUrl = normalizeBaseUrl(serverUrl)
   const sources = sourcesState.data?.sources ?? []
@@ -224,6 +236,26 @@ function App() {
       setExportState({ loading: false, data: exportFormat === 'json' ? prettyJson(text) : text, error: null })
     } catch (error) {
       setExportState({ loading: false, data: null, error: errorMessage(error) })
+    }
+  }
+
+  async function loadLive() {
+    setLiveState({ loading: true, data: null, error: null })
+    try {
+      const data = await fetchJson<LiveResponse>(liveHistoryUrl(apiPrefix(baseUrl), '/live?source=all&window_secs=120'))
+      setLiveState({ loading: false, data, error: null })
+    } catch (error) {
+      setLiveState({ loading: false, data: null, error: errorMessage(error) })
+    }
+  }
+
+  async function loadAnnouncements() {
+    setAnnouncementsState({ loading: true, data: null, error: null })
+    try {
+      const data = await fetchJson<AnnouncementsResponse>(liveHistoryUrl(apiPrefix(baseUrl), '/announcements'))
+      setAnnouncementsState({ loading: false, data, error: null })
+    } catch (error) {
+      setAnnouncementsState({ loading: false, data: null, error: errorMessage(error) })
     }
   }
 
@@ -358,7 +390,79 @@ function App() {
           {exportState.data ? <pre className="export-output">{exportState.data}</pre> : null}
         </section>
       </section>
+
+      <section className="panel live-panel">
+        <div className="panel-heading horizontal compact">
+          <div>
+            <p className="eyebrow">Cross-session awareness</p>
+            <h2>Live sessions &amp; announcements</h2>
+            <p>Who is running right now across every tool, and who has claimed which files.</p>
+          </div>
+          <div className="primary-actions">
+            <button className="secondary-button" type="button" disabled={liveState.loading} onClick={() => void loadLive()}>
+              {liveState.loading ? 'Scanning…' : 'Scan live'}
+            </button>
+            <button className="secondary-button" type="button" disabled={announcementsState.loading} onClick={() => void loadAnnouncements()}>
+              {announcementsState.loading ? 'Loading…' : 'Load claims'}
+            </button>
+          </div>
+        </div>
+        {liveState.error ? <div className="error-box">{liveState.error}</div> : null}
+        {announcementsState.error ? <div className="error-box">{announcementsState.error}</div> : null}
+        <div className="grid live-grid">
+          <LiveSessionsList state={liveState} />
+          <AnnouncementsList state={announcementsState} />
+        </div>
+      </section>
     </main>
+  )
+}
+
+function LiveSessionsList({ state }: { state: RequestState<LiveResponse> }) {
+  const sessions = state.data?.sessions ?? []
+  return (
+    <div className="live-column" data-testid="live-sessions">
+      <h3>Live now {state.data ? `(${state.data.count})` : ''}</h3>
+      {state.data && sessions.length === 0 ? <div className="empty-state">No active sessions in the window.</div> : null}
+      {sessions.map((session) => (
+        <LiveSessionRow key={`${session.source_id}:${session.external_session_id}`} session={session} />
+      ))}
+    </div>
+  )
+}
+
+function LiveSessionRow({ session }: { session: LiveSession }) {
+  return (
+    <div className="live-card">
+      <strong>{session.title || session.external_session_id}</strong>
+      <span className="live-meta">
+        {session.app_id} · {liveScopeLabel(session)} · {relativeAge(session.last_activity)}
+      </span>
+      {session.touched_files.length > 0 ? <small>{session.touched_files.length} file(s) touched</small> : null}
+    </div>
+  )
+}
+
+function AnnouncementsList({ state }: { state: RequestState<AnnouncementsResponse> }) {
+  const claims = activeAnnouncements(state.data?.announcements ?? [])
+  return (
+    <div className="live-column" data-testid="announcements">
+      <h3>Active claims {state.data ? `(${claims.length})` : ''}</h3>
+      {state.data && claims.length === 0 ? <div className="empty-state">No active claims.</div> : null}
+      {claims.map((claim) => (
+        <AnnouncementRow key={claim.id} claim={claim} />
+      ))}
+    </div>
+  )
+}
+
+function AnnouncementRow({ claim }: { claim: Announcement }) {
+  return (
+    <div className="live-card claim-card">
+      <strong>{claim.scope}</strong>
+      <span className="live-meta">{claim.source_id} · {claim.session_id}</span>
+      <p>{claim.message}</p>
+    </div>
   )
 }
 

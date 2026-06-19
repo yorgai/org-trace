@@ -44,9 +44,11 @@ pub fn list_source_sessions(
 /// Fills the transient `liveness` and `last_activity` of each session in place.
 fn fill_liveness(sessions: &mut [NativeSourceSession]) {
     for session in sessions.iter_mut() {
-        session.liveness =
-            probe_liveness(&session.path, &session.source_app_id, session.modified_at);
-        session.last_activity = session.session_updated_at.or(session.modified_at);
+        // Gate on the session's own activity time, not the (possibly shared)
+        // file mtime — SQLite sources keep many sessions in one `.db`.
+        let activity = session.session_updated_at.or(session.modified_at);
+        session.liveness = probe_liveness(&session.path, &session.source_app_id, activity);
+        session.last_activity = activity;
     }
 }
 

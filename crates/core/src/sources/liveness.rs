@@ -47,26 +47,34 @@ pub fn within_active_window(modified_at: Option<SystemTime>) -> bool {
     }
 }
 
-/// Probes liveness for a single session file given its source app id and mtime.
+/// Probes liveness for a single session given its source app id and the
+/// session's own activity instant.
+///
+/// `activity_at` must be the *per-session* last-activity time, not a shared file
+/// mtime: SQLite-backed sources (orgii, cursor, …) store every session in one
+/// `.db`, so its mtime moves whenever *any* session writes. Passing each
+/// session's `session_updated_at` keeps one busy session from marking all its
+/// siblings active. For per-file JSONL sources the two coincide.
 ///
 /// `source_app_id` selects the turn-signal parser; unknown sources fall back to
-/// pure mtime recency. Files outside the active window short-circuit to `Idle`
+/// pure recency. Sessions outside the active window short-circuit to `Idle`
 /// without any read.
 pub fn probe_liveness(
     path: &Path,
     source_app_id: &str,
-    modified_at: Option<SystemTime>,
+    activity_at: Option<SystemTime>,
 ) -> Liveness {
-    if !within_active_window(modified_at) {
+    if !within_active_window(activity_at) {
         return Liveness::Idle;
     }
 
-    // Within the window: consult turn signals for JSONL tools, else trust mtime.
+    // Within the window: consult turn signals for JSONL tools, else trust the
+    // per-session activity time we already gated on.
     match source_app_id {
         "codex_app" => probe_codex(path).unwrap_or(Liveness::Active),
         "claude_code" => probe_claude(path).unwrap_or(Liveness::Active),
-        // SQLite / unknown sources have no per-turn markers; recent mtime is the
-        // only evidence we have, and we already know it is within the window.
+        // SQLite / unknown sources have no per-turn markers; a recent per-session
+        // activity time is the only evidence, and we already know it is in-window.
         _ => Liveness::Active,
     }
 }

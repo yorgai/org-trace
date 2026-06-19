@@ -416,9 +416,10 @@ mod tests {
     use super::*;
 
     fn store() -> AnnouncementStore {
+        // uuid (not just a timestamp) so parallel tests never share a DB file.
         let path = std::env::temp_dir().join(format!(
             "brick-ann-{}.sqlite",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            uuid::Uuid::new_v4()
         ));
         AnnouncementStore::open_path(path).expect("open store")
     }

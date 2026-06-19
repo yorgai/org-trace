@@ -371,4 +371,44 @@ button {
   .export-panel {
     min-height: auto;
   }
+
+  .live-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.live-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.live-column h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+
+.live-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #2a2a34);
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+
+.live-card .live-meta {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+.live-card.claim-card {
+  border-left: 3px solid #e0a23b;
+}
+
+.live-card.claim-card p {
+  margin: 4px 0 0;
+  font-size: 0.85rem;
 }
