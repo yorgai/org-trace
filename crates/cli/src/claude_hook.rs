@@ -47,14 +47,18 @@ impl HookAction {
 }
 
 /// The Claude `settings.json` path for a scope: `<dir>/.claude/settings.json`
-/// locally, or `~/.claude/settings.json` globally. Returns `None` when a global
-/// home cannot be resolved.
+/// locally (falling back to the current directory when `dir` is `None`, matching
+/// the markdown block's resolution), or `~/.claude/settings.json` globally.
+/// Returns `None` when the relevant base cannot be resolved.
 pub fn settings_path(global: bool, dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     if global {
-        home.map(|home| home.join(".claude").join("settings.json"))
-    } else {
-        dir.map(|dir| dir.join(".claude").join("settings.json"))
+        return home.map(|home| home.join(".claude").join("settings.json"));
     }
+    let base = match dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    Some(base.join(".claude").join("settings.json"))
 }
 
 /// The exact command string the hook runs, embedding the current `brick` binary
@@ -354,5 +358,25 @@ mod tests {
     fn uninstall_absent_when_no_file() {
         let path = temp_settings("uninstall-absent");
         assert_eq!(uninstall(&path).unwrap(), HookAction::Absent);
+    }
+
+    #[test]
+    fn settings_path_local_falls_back_to_cwd() {
+        // Local scope with no explicit dir must resolve under the current dir,
+        // matching the markdown block, not return None (which would wrongly skip
+        // the hook as `no_known_global_path`).
+        let resolved = settings_path(false, None, None).expect("local path resolves without dir");
+        assert!(resolved.ends_with(".claude/settings.json"));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn settings_path_global_needs_home() {
+        assert!(settings_path(true, None, None).is_none());
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            settings_path(true, None, Some(&home)).unwrap(),
+            PathBuf::from("/home/u/.claude/settings.json")
+        );
     }
 }
