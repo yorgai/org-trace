@@ -12,6 +12,7 @@ chrono.workspace = true
 clap.workspace = true
 brick-core = { path = "../core" }
 brick-protocol = { path = "../protocol" }
+brick-sync = { path = "../sync" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

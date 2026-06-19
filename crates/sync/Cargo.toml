@@ -1,0 +1,21 @@
+[package]
+name = "brick-sync"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+# Proprietary cross-server sync client. Kept out of the default open-source
+# build: `brick` only pulls this in under `--features sync`. The directory can
+# be excluded from the public repository (git submodule / private overlay)
+# without breaking the default build.
+
+[dependencies]
+anyhow.workspace = true
+brick-core = { path = "../core" }
+brick-protocol = { path = "../protocol" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+ureq = { version = "3.3.0", features = ["json"] }

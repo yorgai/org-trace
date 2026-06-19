@@ -4,7 +4,14 @@ members = [
     "crates/core",
     "crates/importers",
     "crates/protocol",
+    # Proprietary crates. They are workspace members so they share lockfile and
+    # `workspace.package` inheritance, but they are NOT in the open-source build
+    # surface: the default `brick` binary excludes `brick-sync` (gated behind
+    # `--features sync`), and `brick-server` is only built explicitly with
+    # `cargo build -p brick-server`. When cutting the public repo, move these two
+    # directories into a private submodule/overlay and drop them from this list.
     "crates/server",
+    "crates/sync",
 ]
 resolver = "2"
 

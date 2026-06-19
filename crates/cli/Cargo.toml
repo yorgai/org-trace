@@ -11,9 +11,17 @@ clap.workspace = true
 brick-core = { path = "../core" }
 brick-importers = { path = "../importers" }
 brick-protocol = { path = "../protocol" }
+brick-sync = { path = "../sync", optional = true }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
-ureq = { version = "3.3.0", features = ["json"] }
 dialoguer = "0.12.0"
+
+[features]
+# Proprietary cross-server sync. Off by default so the open-source `brick`
+# binary ships without any remote-sync command or client. Enable for private
+# builds: `cargo build -p brick --features sync`.
+default = []
+sync = ["dep:brick-sync"]
+

@@ -417,10 +417,7 @@ mod tests {
 
     fn store() -> AnnouncementStore {
         // uuid (not just a timestamp) so parallel tests never share a DB file.
-        let path = std::env::temp_dir().join(format!(
-            "brick-ann-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let path = std::env::temp_dir().join(format!("brick-ann-{}.sqlite", uuid::Uuid::new_v4()));
         AnnouncementStore::open_path(path).expect("open store")
     }
 

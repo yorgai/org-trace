@@ -9,12 +9,10 @@ mod actor;
 mod events;
 mod ids;
 mod payloads;
-mod sync;
 mod trace_event;
 
 pub use actor::*;
 pub use events::*;
 pub use ids::*;
 pub use payloads::*;
-pub use sync::*;
 pub use trace_event::*;

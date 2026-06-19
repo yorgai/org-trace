@@ -10,11 +10,36 @@ Brick is at an MVP phase for local-first trace capture plus unauthenticated self
 
 ## Packages
 
-- `brick`: standalone CLI client
-- `brick-server`: self-hosted provenance remote
-- `brick-protocol`: shared event schema and sync types
-- `brick-core`: local storage, indexing, repo context, and sync primitives
+Open-source crates (the default `cargo build`):
+
+- `brick`: standalone CLI client (also an MCP server via `brick mcp-serve`)
+- `brick-protocol`: shared provenance event schema
+- `brick-core`: local storage, indexing, repo context, and announcements
 - `brick-importers`: explicit-file importers for agent transcripts and CI summaries
+
+Proprietary crates (excluded from the default build; see "Build surface" below):
+
+- `brick-sync`: cross-server sync client + wire protocol — compiled only with `--features sync`
+- `brick-server`: self-hosted provenance remote — built only with `cargo build -p brick-server`
+
+## Build surface (open-source vs proprietary)
+
+Cross-server sync is proprietary and stays out of the open-source build. The
+default build produces a `brick` binary with **no** sync command and no
+dependency on `brick-sync`:
+
+```bash
+cargo build                       # open-source: no sync, no server
+cargo build -p brick              # the open-source CLI binary
+cargo build -p brick --features sync   # private: adds the `brick sync` command
+cargo build -p brick-server       # private: the self-hosted remote
+```
+
+`brick mcp-serve` (the MCP server surface) is fully open-source and exposes
+memory, planning, work-item management, and coordination tools to any
+MCP-capable agent — none of it depends on sync. The `crates/sync` and
+`crates/server` directories can be moved into a private submodule/overlay and
+dropped from the workspace `members` list without affecting the open build.
 
 ## MVP walkthrough
 
@@ -144,6 +169,25 @@ re-running `install` is idempotent and rolls the block forward when the template
 version changes. `brick init` offers to run this for the current repo. `brick
 metadata` and `brick history` commands emit `--format json` so agents can parse
 them directly.
+
+## MCP capability kit
+
+`brick mcp-serve` runs Brick as an MCP server over stdio, turning one install
+into a shared work surface any MCP-capable agent (Claude Code, Cursor, ORGII, …)
+can call. `brick agent install` registers it automatically. The tools group into
+three capabilities:
+
+- **Memory** — `explore_memory`, `recall_file`, `search_sessions`, `read_session`.
+- **Planning & work-item management** — `current_context`, `list_missions`,
+  `show_mission`, `manage_mission` (create/update a goal), `record_artifact`
+  (log a deliverable), `attach_evidence` (back it with files).
+- **Coordination & awareness** — `announce_work` and `list_announcements` (the
+  cross-session bulletin board), `live_sessions` (who's running now). `recall_file`
+  also surfaces active claims on the file you ask about.
+
+A natural agent flow: `current_context` → `list_missions` → `manage_mission`
+(create) → do the work → `record_artifact` → `attach_evidence` → `announce_work`.
+All of this is open-source and independent of the proprietary sync layer.
 
 ## Local storage model
 

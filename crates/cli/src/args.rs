@@ -116,6 +116,7 @@ pub enum Command {
         #[command(subcommand)]
         command: MetadataCommand,
     },
+    #[cfg(feature = "sync")]
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
@@ -361,6 +362,7 @@ pub enum ContextCommand {
     Show,
 }
 
+#[cfg(feature = "sync")]
 #[derive(Debug, Subcommand)]
 pub enum SyncCommand {
     Run(SyncArgs),
@@ -368,6 +370,7 @@ pub enum SyncCommand {
     Pull(SyncArgs),
 }
 
+#[cfg(feature = "sync")]
 #[derive(Debug, Args)]
 pub struct SyncArgs {
     #[arg(long)]

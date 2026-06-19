@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
-use brick_protocol::{EventCursor, ListEventsResponse, PushEventsResponse, TraceEvent};
+use brick_protocol::TraceEvent;
+use brick_sync::wire::{EventCursor, ListEventsResponse, PushEventsResponse};
 use uuid::Uuid;
 
 const SERVER_EVENTS_FILE: &str = "events.jsonl";

@@ -1,14 +1,23 @@
-//! CLI sync command handlers.
+//! Proprietary cross-server sync for Brick.
+//!
+//! This crate holds everything about talking to a remote trace server: the wire
+//! message types and the push/pull/sync command handlers. It is intentionally
+//! NOT part of the default open-source build — `brick` depends on it only under
+//! the `sync` feature, and the open-source `brick-protocol` crate carries no
+//! sync types. Keeping all of this here lets the directory be excised from the
+//! public repository without touching the open build.
 //!
 //! Push is intentionally non-draining: local JSONL queue files remain the source
 //! of truth after a successful remote append. Pull stores remote events in a
 //! separate inbound log and deduplicates by event ID before writing.
 
+pub mod wire;
+
 use anyhow::{Context, Result};
 use brick_core::LocalStore;
-use brick_protocol::{
-    EventCursor, ListEventsResponse, PushEventsRequest, PushEventsResponse, TraceEvent,
-};
+use brick_protocol::TraceEvent;
+
+pub use wire::{EventCursor, ListEventsResponse, PushEventsRequest, PushEventsResponse};
 
 const DEFAULT_REMOTE: &str = "http://127.0.0.1:7821";
 const PULL_PAGE_LIMIT: usize = 500;

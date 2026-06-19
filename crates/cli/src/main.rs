@@ -29,11 +29,10 @@ mod mcp_config;
 mod metadata;
 mod output;
 mod source;
-mod sync;
 
 use agent::handle_agent;
 use announce::handle_announce;
-use args::{Cli, Command, EvidenceCommand, MaintenanceCommand, SessionCommand, SyncCommand};
+use args::{Cli, Command, EvidenceCommand, MaintenanceCommand, SessionCommand};
 use commands::{
     handle_artifact, handle_evidence, handle_import, handle_mission, handle_org, handle_project,
     handle_session,
@@ -47,7 +46,11 @@ use inspect::{
 use metadata::handle_metadata;
 use output::{print_log, print_status};
 use source::handle_source;
-use sync::{handle_pull, handle_push, handle_sync};
+
+#[cfg(feature = "sync")]
+use args::SyncCommand;
+#[cfg(feature = "sync")]
+use brick_sync::{handle_pull, handle_push, handle_sync};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -198,6 +201,7 @@ fn main() -> Result<()> {
             cli.source.as_deref(),
             cli.identity.session.as_deref(),
         )?,
+        #[cfg(feature = "sync")]
         Command::Sync { command } => match command {
             SyncCommand::Run(args) => handle_sync(&store, args.dry_run, args.remote, args.repo_id)?,
             SyncCommand::Push(args) => {

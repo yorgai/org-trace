@@ -16,8 +16,8 @@ use anyhow::Result;
 use brick_core::{AnnouncementStore, LocalStore, NewAnnouncement, SourceProfileStore};
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
-    ArtifactKind, FileRefId, MissionCreatedPayload, MissionId, MissionStatus, MissionUpdatedPayload,
-    ProjectId, SessionId, TraceEvent,
+    ArtifactKind, FileRefId, MissionCreatedPayload, MissionId, MissionStatus,
+    MissionUpdatedPayload, ProjectId, SessionId, TraceEvent,
 };
 use chrono::Duration;
 use serde_json::{json, Value};
@@ -592,7 +592,7 @@ fn handle_tool_call(
                     "artifacts": index.artifacts.len(),
                 },
                 "note": "Use list_missions to see in-flight work, manage_mission to \
-    open or update a goal, and record_artifact to log deliverables."
+            open or update a goal, and record_artifact to log deliverables."
             })
         }
         "list_missions" => {
@@ -619,7 +619,7 @@ fn handle_tool_call(
                 })
                 .collect();
             // Newest activity first so "what's in flight" surfaces at the top.
-            missions.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
+            missions.sort_by_key(|mission| std::cmp::Reverse(mission.last_event_at));
             missions.truncate(limit);
             json!({ "count": missions.len(), "missions": missions })
         }
@@ -649,7 +649,9 @@ fn handle_tool_call(
                             project_id,
                             title,
                             description: opt_str_arg(&args, "description"),
-                            status: mission_status_from_str(args.get("status").and_then(Value::as_str))?,
+                            status: mission_status_from_str(
+                                args.get("status").and_then(Value::as_str),
+                            )?,
                             repo_context_id: None,
                         },
                     )?;
@@ -658,7 +660,7 @@ fn handle_tool_call(
                         "created": true,
                         "mission_id": mission_id.to_string(),
                         "note": "Mission opened. Record deliverables against it with \
-    record_artifact, and update its status with manage_mission action='update'."
+                    record_artifact, and update its status with manage_mission action='update'."
                     })
                 }
                 "update" => {
@@ -678,7 +680,11 @@ fn handle_tool_call(
                         Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
                         _ => None,
                     };
-                    if project_id.is_none() && title.is_none() && description.is_none() && status.is_none() {
+                    if project_id.is_none()
+                        && title.is_none()
+                        && description.is_none()
+                        && status.is_none()
+                    {
                         return Err(anyhow::anyhow!(
                             "manage_mission update needs at least one of project, title, description, or status"
                         ));

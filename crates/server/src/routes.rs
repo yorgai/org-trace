@@ -14,7 +14,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use brick_protocol::{ListEventsResponse, PushEventsRequest, PushEventsResponse, TraceEvent};
+use brick_protocol::TraceEvent;
+use brick_sync::wire::{ListEventsResponse, PushEventsRequest, PushEventsResponse};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Command;
@@ -384,8 +385,17 @@ async fn local_history_announcements(
     State(state): State<AppState>,
     Query(query): Query<AnnouncementsQuery>,
 ) -> std::result::Result<Json<Value>, (StatusCode, String)> {
-    let mut args = vec!["list".to_string(), "--format".to_string(), "json".to_string()];
-    if let Some(path) = query.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    let mut args = vec![
+        "list".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    if let Some(path) = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         args.push("--path".to_string());
         args.push(path.to_string());
     }

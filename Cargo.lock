@@ -180,13 +180,13 @@ dependencies = [
  "brick-core",
  "brick-importers",
  "brick-protocol",
+ "brick-sync",
  "chrono",
  "clap",
  "dialoguer",
  "serde",
  "serde_json",
  "toml_edit",
- "ureq",
 ]
 
 [[package]]
@@ -235,6 +235,7 @@ dependencies = [
  "axum",
  "brick-core",
  "brick-protocol",
+ "brick-sync",
  "chrono",
  "clap",
  "serde",
@@ -242,6 +243,20 @@ dependencies = [
  "sha2",
  "tokio",
  "tower",
+ "uuid",
+]
+
+[[package]]
+name = "brick-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brick-core",
+ "brick-protocol",
+ "chrono",
+ "serde",
+ "serde_json",
+ "ureq",
  "uuid",
 ]
 

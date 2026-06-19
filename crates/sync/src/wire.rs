@@ -1,13 +1,15 @@
-//! Sync protocol messages shared by CLI and self-hosted server.
+//! Sync protocol messages exchanged with a remote trace server.
 //!
 //! These types describe event transfer without committing to auth, queue
 //! draining, or conflict resolution. The server accepts append-only events and
 //! reports duplicates by event ID so clients can retry safely.
+//!
+//! These live in the proprietary `brick-sync` crate (not open-source
+//! `brick-protocol`) so the public build carries no notion of cross-server sync.
 
+use brick_protocol::TraceEvent;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-use crate::TraceEvent;
 
 /// Stable server-side event cursor used for paginated sync.
 ///
@@ -77,7 +79,9 @@ impl ListEventsResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ActorRef, ActorType, MissionCreatedPayload, MissionId, MissionStatus, ProjectId};
+    use brick_protocol::{
+        ActorRef, ActorType, MissionCreatedPayload, MissionId, MissionStatus, ProjectId,
+    };
 
     use super::*;
 
