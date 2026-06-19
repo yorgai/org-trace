@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -69,6 +70,10 @@ pub struct TokenRecord {
     pub token_sha256: String,
     pub scopes: Vec<Scope>,
     pub access: Access,
+    /// Optional expiry. `None` means the token never expires. Defaults to
+    /// `None` so token tables written before expiry support still load.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl TokenRecord {
@@ -76,6 +81,11 @@ impl TokenRecord {
     fn authorizes(&self, target: &ResourceTarget, required: Access) -> bool {
         self.access.permits(required)
             && self.scopes.iter().any(|scope| scope_matches(scope, target))
+    }
+
+    /// Whether this token is expired as of `now`.
+    fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        matches!(self.expires_at, Some(expiry) if now >= expiry)
     }
 }
 
@@ -180,15 +190,30 @@ impl TokenStore {
 
     /// Authorizes a request: returns the matching record's label on success.
     ///
-    /// Returns `Err` describing why the request is denied (unknown token vs
-    /// insufficient scope/access) so the route layer can map it to 401 vs 403.
+    /// Returns `Err` describing why the request is denied so the route layer can
+    /// map it to the right status: unknown or expired token → 401, valid token
+    /// lacking scope/access → 403.
     pub fn authorize(
         &self,
         plaintext: &str,
         target: &ResourceTarget,
         required: Access,
     ) -> Result<String, AuthDenial> {
+        self.authorize_at(plaintext, target, required, Utc::now())
+    }
+
+    /// Authorization with an explicit clock, for deterministic tests.
+    pub fn authorize_at(
+        &self,
+        plaintext: &str,
+        target: &ResourceTarget,
+        required: Access,
+        now: DateTime<Utc>,
+    ) -> Result<String, AuthDenial> {
         let record = self.lookup(plaintext).ok_or(AuthDenial::UnknownToken)?;
+        if record.is_expired(now) {
+            return Err(AuthDenial::Expired);
+        }
         if record.authorizes(target, required) {
             Ok(record.label.clone())
         } else {
@@ -202,12 +227,76 @@ impl TokenStore {
 pub enum AuthDenial {
     /// No token matched — the caller is unauthenticated (401).
     UnknownToken,
+    /// Token matched but has passed its expiry (401).
+    Expired,
     /// Token is valid but lacks scope/access for this resource (403).
     Forbidden,
 }
 
 fn tokens_path(data_dir: &Path) -> PathBuf {
     data_dir.join(TOKENS_FILE)
+}
+
+const AUDIT_FILE: &str = "audit.jsonl";
+
+/// One append-only audit record for an authorized write request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub at: DateTime<Utc>,
+    /// Label of the token that authorized the request.
+    pub token_label: String,
+    pub method: String,
+    pub path: String,
+}
+
+/// Append-only audit log for authorized writes, stored as `audit.jsonl` in the
+/// server data dir. Reads are not audited (high volume, low value); only
+/// mutating requests that passed the auth gate are recorded.
+#[derive(Debug, Clone)]
+pub struct AuditLog {
+    path: PathBuf,
+}
+
+impl AuditLog {
+    /// Creates an audit log handle rooted at `data_dir`.
+    pub fn new(data_dir: &Path) -> Self {
+        Self {
+            path: data_dir.join(AUDIT_FILE),
+        }
+    }
+
+    /// Appends one audit entry. Best-effort: on I/O error the entry is dropped
+    /// rather than failing the request it describes.
+    pub fn record(&self, entry: &AuditEntry) {
+        use std::io::Write;
+        let Ok(serialized) = serde_json::to_string(entry) else {
+            return;
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(file, "{serialized}");
+        }
+    }
+
+    /// Reads all audit entries, oldest first. Skips blank/corrupt lines.
+    pub fn read_all(&self) -> Result<Vec<AuditEntry>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = fs::read_to_string(&self.path)
+            .with_context(|| format!("failed to read audit log at {}", self.path.display()))?;
+        Ok(contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<AuditEntry>(line).ok())
+            .collect())
+    }
 }
 
 /// Parses a `--scope` CLI value into a `Scope`.
@@ -289,6 +378,7 @@ pub fn single_token_store(plaintext: &str) -> TokenStore {
         token_sha256: hash_token(plaintext),
         scopes: vec![Scope::All],
         access: Access::Write,
+        expires_at: None,
     });
     store
 }
@@ -309,7 +399,11 @@ pub fn scope_summary(store: &TokenStore) -> BTreeMap<String, String> {
                 Access::Read => "read",
                 Access::Write => "write",
             };
-            (token.label.clone(), format!("{access} [{scopes}]"))
+            let expiry = match token.expires_at {
+                Some(at) => format!(" expires={}", at.to_rfc3339()),
+                None => String::new(),
+            };
+            (token.label.clone(), format!("{access} [{scopes}]{expiry}"))
         })
         .collect()
 }
@@ -334,6 +428,7 @@ mod tests {
             token_sha256: hash_token("secret"),
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Write,
+            expires_at: None,
         });
 
         let target = ResourceTarget::Repo("repo-a".to_string());
@@ -355,6 +450,7 @@ mod tests {
             token_sha256: hash_token("secret"),
             scopes: vec![Scope::All],
             access: Access::Read,
+            expires_at: None,
         });
         let target = ResourceTarget::Repo("repo-a".to_string());
         assert_eq!(
@@ -377,6 +473,7 @@ mod tests {
             token_sha256: hash_token("secret"),
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Write,
+            expires_at: None,
         });
 
         assert_eq!(
@@ -424,6 +521,45 @@ mod tests {
     }
 
     #[test]
+    fn expired_token_is_denied_before_scope_check() {
+        let mut store = TokenStore::default();
+        let issued = Utc::now();
+        store.add(TokenRecord {
+            label: "temp".to_string(),
+            token_sha256: hash_token("secret"),
+            scopes: vec![Scope::All],
+            access: Access::Write,
+            expires_at: Some(issued + chrono::Duration::days(1)),
+        });
+
+        // Valid before expiry.
+        assert!(store
+            .authorize_at("secret", &ResourceTarget::Global, Access::Read, issued)
+            .is_ok());
+        // Denied at/after expiry, and reported as Expired (→ 401), not Forbidden.
+        assert_eq!(
+            store
+                .authorize_at(
+                    "secret",
+                    &ResourceTarget::Global,
+                    Access::Read,
+                    issued + chrono::Duration::days(2)
+                )
+                .unwrap_err(),
+            AuthDenial::Expired
+        );
+    }
+
+    #[test]
+    fn token_without_expiry_never_expires() {
+        let store = single_token_store("admin");
+        let far_future = Utc::now() + chrono::Duration::days(36500);
+        assert!(store
+            .authorize_at("admin", &ResourceTarget::Global, Access::Read, far_future)
+            .is_ok());
+    }
+
+    #[test]
     fn parse_scope_accepts_known_forms() {
         assert_eq!(parse_scope("*").unwrap(), Scope::All);
         assert_eq!(parse_scope("all").unwrap(), Scope::All);
@@ -467,6 +603,7 @@ mod tests {
             token_sha256: hash_token("secret"),
             scopes: vec![Scope::Repo("repo-a".to_string())],
             access: Access::Read,
+            expires_at: None,
         });
         store.save(&dir).expect("save tokens");
         let loaded = TokenStore::load(&dir).expect("load tokens");

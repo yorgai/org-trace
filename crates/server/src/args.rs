@@ -57,6 +57,9 @@ pub enum Command {
         /// Grant write access (read + write). Omit for read-only.
         #[arg(long)]
         write: bool,
+        /// Expire the token this many days after issuance. Omit for no expiry.
+        #[arg(long)]
+        expires_in_days: Option<u32>,
     },
     /// List issued tokens (labels + scope/access summary; never plaintext).
     ListTokens {
@@ -69,5 +72,13 @@ pub enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         label: String,
+    },
+    /// Print the write-audit log (one JSON line per authorized write).
+    Audit {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        /// Only show the most recent N entries.
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }

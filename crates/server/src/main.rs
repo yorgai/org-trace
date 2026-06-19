@@ -52,9 +52,11 @@ async fn main() -> Result<()> {
             label,
             scopes,
             write,
-        } => create_token(&data_dir, label, scopes, write)?,
+            expires_in_days,
+        } => create_token(&data_dir, label, scopes, write, expires_in_days)?,
         Command::ListTokens { data_dir } => list_tokens(&data_dir)?,
         Command::RevokeToken { data_dir, label } => revoke_token(&data_dir, &label)?,
+        Command::Audit { data_dir, limit } => show_audit(&data_dir, limit)?,
     }
 
     Ok(())
@@ -77,12 +79,13 @@ fn resolve_serve_auth(
             token_sha256: hash_token(&plaintext),
             scopes: vec![Scope::All],
             access: Access::Write,
+            expires_at: None,
         });
     }
     if tokens.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(AuthConfig::new(tokens)))
+        Ok(Some(AuthConfig::new(tokens, auth::AuditLog::new(data_dir))))
     }
 }
 
@@ -91,6 +94,7 @@ fn create_token(
     label: String,
     scopes: Vec<String>,
     write: bool,
+    expires_in_days: Option<u32>,
 ) -> Result<()> {
     let mut store = TokenStore::load(data_dir)?;
     if store.labels().iter().any(|existing| *existing == label) {
@@ -104,16 +108,22 @@ fn create_token(
             .map(|scope| parse_scope(scope))
             .collect::<Result<Vec<_>>>()?
     };
+    let expires_at =
+        expires_in_days.map(|days| chrono::Utc::now() + chrono::Duration::days(i64::from(days)));
     let plaintext = generate_token();
     store.add(TokenRecord {
         label: label.clone(),
         token_sha256: hash_token(&plaintext),
         scopes: parsed_scopes,
         access: if write { Access::Write } else { Access::Read },
+        expires_at,
     });
     store.save(data_dir)?;
     println!("token_label={label}");
     println!("access={}", if write { "write" } else { "read" });
+    if let Some(expiry) = expires_at {
+        println!("expires_at={}", expiry.to_rfc3339());
+    }
     // Plaintext is shown once and never persisted.
     println!("token={plaintext}");
     Ok(())
@@ -135,6 +145,26 @@ fn revoke_token(data_dir: &std::path::Path, label: &str) -> Result<()> {
         println!("revoked={label}");
     } else {
         println!("not_found={label}");
+    }
+    Ok(())
+}
+
+fn show_audit(data_dir: &std::path::Path, limit: Option<usize>) -> Result<()> {
+    let log = auth::AuditLog::new(data_dir);
+    let entries = log.read_all()?;
+    let start = match limit {
+        Some(limit) if limit < entries.len() => entries.len() - limit,
+        _ => 0,
+    };
+    println!("audit_count={}", entries.len() - start);
+    for entry in &entries[start..] {
+        println!(
+            "{} {} {} {}",
+            entry.at.to_rfc3339(),
+            entry.token_label,
+            entry.method,
+            entry.path
+        );
     }
     Ok(())
 }
@@ -174,6 +204,7 @@ mod tests {
             "ci".to_string(),
             vec!["repo:repo-a".to_string()],
             true,
+            None,
         )
         .expect("create");
         let store = TokenStore::load(&dir).expect("load");
@@ -191,8 +222,8 @@ mod tests {
             "brick-token-dup-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        create_token(&dir, "ci".to_string(), vec![], false).expect("create");
-        assert!(create_token(&dir, "ci".to_string(), vec![], false).is_err());
+        create_token(&dir, "ci".to_string(), vec![], false, None).expect("create");
+        assert!(create_token(&dir, "ci".to_string(), vec![], false, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

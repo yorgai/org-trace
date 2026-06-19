@@ -599,7 +599,7 @@ which also powers `ingest` and records the brick-session bridge link + dedup).
 In non-interactive contexts it prints the session count and ingest guidance
 instead of blocking.
 
-### 8. Server auth and repo/org permissions — PARTIAL (stage A done)
+### 8. Server auth and repo/org permissions — PARTIAL (stages A–C done)
 
 **Stage A (scoped token table) landed.** The server auth gate is now a token
 table persisted as `tokens.json` in the data dir. Each token has a label, a
@@ -621,13 +621,24 @@ write).
   to repo-a 200, cross-repo/global/write all 403, admin global+write pass, bogus
   token 401).
 
+**Stage B (token expiry) landed.** `TokenRecord` carries an optional
+`expires_at`; `create-token --expires-in-days <n>` sets it, `list-tokens` shows
+it, and the auth gate returns 401 (`AuthDenial::Expired`) once a token is past
+its expiry. Tokens without an expiry never expire; the field is `#[serde(default)]`
+so older token tables still load.
+
+**Stage C (write audit log) landed.** Every authorized *write* (non-GET/HEAD/OPTIONS)
+appends a record to `audit.jsonl` in the data dir — `{at, token_label, method,
+path}`. Reads are not audited. View with `brick-server audit [--limit N]`.
+Recording is best-effort (an I/O failure drops the entry, never the request).
+
 Still needed before real team/self-host usage:
 
 - org-scope resolution: `org:<id>` scopes are stored and parsed but do not yet
   grant repo routes, because per-repo→org mapping is not resolved at the gate.
-- token expiry / rotation.
-- audit events for sync identity (which token/actor did which write).
-- bind auth identity to the `ActorRef` recorded on pushed events.
+- token rotation (revoke + reissue is supported; in-place rotation is not).
+- bind auth identity to the `ActorRef` recorded on pushed events (audit currently
+  records the token label, not the event actor).
 
 ## Design cautions
 

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Command;
 
-use crate::auth::{self, TokenStore};
+use crate::auth::{self, AuditLog, TokenStore};
 use crate::index::{
     query_server_sessions, rebuild_server_index, server_index_status, ServerIndexStatus,
     ServerSessionQuery, ServerSessionsResponse,
@@ -39,12 +39,14 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct AuthConfig {
     tokens: Arc<TokenStore>,
+    audit: Arc<AuditLog>,
 }
 
 impl AuthConfig {
-    pub fn new(tokens: TokenStore) -> Self {
+    pub fn new(tokens: TokenStore, audit: AuditLog) -> Self {
         Self {
             tokens: Arc::new(tokens),
+            audit: Arc::new(audit),
         }
     }
 }
@@ -164,8 +166,18 @@ async fn require_bearer_token(
     let target = auth::resource_target_for_path(request.uri().path());
     let required = auth::required_access(request.method());
     match auth.tokens.authorize(token, &target, required) {
-        Ok(_label) => next.run(request).await,
-        Err(auth::AuthDenial::UnknownToken) => unauthorized(),
+        Ok(label) => {
+            if required == auth::Access::Write {
+                auth.audit.record(&auth::AuditEntry {
+                    at: chrono::Utc::now(),
+                    token_label: label,
+                    method: request.method().to_string(),
+                    path: request.uri().path().to_string(),
+                });
+            }
+            next.run(request).await
+        }
+        Err(auth::AuthDenial::UnknownToken | auth::AuthDenial::Expired) => unauthorized(),
         Err(auth::AuthDenial::Forbidden) => forbidden(),
     }
 }
@@ -763,11 +775,15 @@ mod tests {
 
     #[tokio::test]
     async fn auth_token_gates_protected_routes_but_not_health() {
+        let audit_dir = temp_data_dir("auth-audit");
         let store = ServerStore::new(temp_data_dir("auth"));
         let app = build_router(
             store,
             None,
-            Some(AuthConfig::new(crate::auth::single_token_store("s3cret"))),
+            Some(AuthConfig::new(
+                crate::auth::single_token_store("s3cret"),
+                crate::auth::AuditLog::new(&audit_dir),
+            )),
         );
 
         // /health stays open without a token.
