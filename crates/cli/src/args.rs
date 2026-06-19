@@ -542,6 +542,17 @@ pub enum MemoryCommand {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
+    /// Find past sessions related to a free-text query (title/intent, files, repo).
+    Query {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

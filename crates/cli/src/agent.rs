@@ -19,7 +19,7 @@ use crate::args::{
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 2;
+const TEMPLATE_VERSION: u32 = 3;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -45,6 +45,10 @@ machine. Use it to recall prior decisions instead of rediscovering them.
   `brick memory recall --path <file> --format json`
   This returns a one-line summary plus per-session intent, change size, and a
   `recall_chunks_hint` command for the full transcript when you need detail.
+- To find past sessions by topic (not a specific file), search the index:
+  `brick memory query --query \"<keywords>\" --format json`
+  Matches session intent, touched files, repo, and branch; each hit includes a
+  `recall_chunks_hint` for the full transcript.
 - For broader project memory, list sources then drill in:
   `brick history sources --format json`
   `brick history sessions --source <id> --format json`

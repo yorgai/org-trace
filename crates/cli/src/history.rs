@@ -1282,7 +1282,7 @@ fn source_row(profile: SourceProfile, selected: Option<&str>) -> HistorySourceRo
 
 /// Aggregate counters describing a metadata refresh pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct RefreshStats {
+pub(crate) struct RefreshStats {
     scanned: usize,
     reindexed: usize,
     skipped: usize,
@@ -1303,7 +1303,7 @@ fn eprint_refresh_stats(source_id: &str, stats: RefreshStats) {
     );
 }
 
-fn refresh_profiles_to_metadata(
+pub(crate) fn refresh_profiles_to_metadata(
     metadata_db: &mut MetadataDb,
     profiles: &[SourceProfile],
     limit: usize,
@@ -1650,7 +1650,7 @@ fn total_tokens(input_tokens: Option<u64>, output_tokens: Option<u64>) -> Option
     }
 }
 
-fn read_profile(profiles: &SourceProfileStore, source: &str) -> Result<SourceProfile> {
+pub(crate) fn read_profile(profiles: &SourceProfileStore, source: &str) -> Result<SourceProfile> {
     profiles
         .read_profile(source)?
         .ok_or_else(|| anyhow!("source profile not found: {source}"))

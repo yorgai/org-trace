@@ -791,6 +791,28 @@ summary. Wiring note: `Command::Memory` is exempted from global
 `selected_profile` resolution in `main.rs` (like `History`) so `--source all`
 works.
 
+### `brick memory query` — free-text session search — DONE
+
+`brick memory query --query "<keywords>"` finds past sessions by topic when you
+don't have a specific file in hand. `metadata_db.query_source_sessions_text`
+(new) does case-insensitive substring matching over the *already-indexed*
+session metadata — title/name (intent), touched files, repo path, branch, and
+model — so it is instant and never loads a transcript. Output
+(`memory-query-v1`): a one-line `summary` plus `matches[]` (source, intent,
+repo/branch, change size, touched files, and a `recall_chunks_hint`). `status`
+is `ok` / `empty` / `error`.
+
+This was deliberately scoped to *metadata* search, not full-text: the chat
+content lives in source files (loaded on demand as chunks) and there is no FTS
+index. Metadata search reuses the existing index, keeps the JSON small, and lets
+an agent triage hits then drill into one session's chunks. A future FTS5 layer
+over chunk text is the natural next step if content search is needed.
+
+Verified live: `--query csv` → codex session (intent = the user's prompt),
+`--query diff` → 5 orgii sessions ("Investigate Mismatched Diff Output" …),
+`--query nonexistent` → `status: empty`. Agent block (TEMPLATE_VERSION 3) now
+documents both `recall` and `query`.
+
 ## Design cautions
 
 - Treat ORGII external-history code as a whole subsystem: scan, parse, metadata indexing, source-specific loading/windowing, chunk load, recent paths, impact stats, backfill, and diagnostics move together into Brick over time.

@@ -102,6 +102,16 @@ pub struct SourceSessionListQuery {
     pub offset: usize,
 }
 
+/// Free-text search over indexed session metadata (title/intent, touched files,
+/// repo, branch, model). Matching is case-insensitive substring; it never loads
+/// transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSessionTextQuery {
+    pub query: String,
+    pub source_id: Option<String>,
+    pub limit: usize,
+}
+
 /// Input for inserting or updating a source-profile row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceProfileUpsert {
@@ -319,8 +329,42 @@ impl MetadataDb {
         Ok(records)
     }
 
+    /// Free-text searches indexed session metadata by case-insensitive substring
+    /// over title/name (the session intent), touched files, repo path, branch, and
+    /// model. Returns whole session records, newest first; transcripts are never
+    /// loaded.
+    pub fn query_source_sessions_text(
+        &self,
+        query: &SourceSessionTextQuery,
+    ) -> Result<Vec<SourceSessionRecord>> {
+        let needle = query.query.trim().to_lowercase();
+        let limit = usize::try_from(normalized_limit(query.limit)).unwrap_or(usize::MAX);
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, external_session_id, title, name, source_path, source_uri,
+                    source_mtime, source_size, source_fingerprint, parser_version,
+                    session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                    files_changed, lines_added, lines_removed, touched_files_json, listable,
+                    discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             FROM source_sessions
+             WHERE (?1 IS NULL OR source_id = ?1)
+               AND listable = 1
+             ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC",
+        )?;
+        let rows = statement.query_map(params![query.source_id], source_session_from_row)?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let record = row.context("failed to read metadata source-session row")?;
+            if needle.is_empty() || session_text_matches(&record, &needle) {
+                matches.push(record);
+                if matches.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     /// Queries source metadata rows that touched a file path.
-    ///
     /// `repo_path` is a *ranking preference*, not a hard filter: matches whose
     /// session repo equals it are ordered first, but sessions from other repos
     /// still match so blame works regardless of the caller's CWD. Path matching
@@ -1413,6 +1457,27 @@ fn touched_files_from_value(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether a session's searchable metadata contains a lowercased needle. Searched
+/// fields: title/name (intent), touched files, repo path, branch, and model.
+fn session_text_matches(record: &SourceSessionRecord, needle: &str) -> bool {
+    let contains = |text: &str| text.to_lowercase().contains(needle);
+    if record.title.as_deref().is_some_and(contains)
+        || record.name.as_deref().is_some_and(contains)
+        || record.branch.as_deref().is_some_and(contains)
+        || record.model.as_deref().is_some_and(contains)
+    {
+        return true;
+    }
+    if let Some(repo) = record.repo_path.as_ref() {
+        if repo.to_string_lossy().to_lowercase().contains(needle) {
+            return true;
+        }
+    }
+    touched_files_from_value(record.touched_files_json.as_ref())
+        .iter()
+        .any(|file| file.to_lowercase().contains(needle))
 }
 
 fn source_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSessionRecord> {
