@@ -362,18 +362,24 @@ fn runtime_diff_blame_rows(
          JOIN diffs ON diffs.diff_id = diff_files.diff_id
          LEFT JOIN sessions ON sessions.session_id = diffs.session_id
          LEFT JOIN events ON events.event_id = diffs.diff_id
-         WHERE diff_files.path = ?1 OR diff_files.old_path = ?1
+         WHERE diff_files.path = ?1
+            OR diff_files.old_path = ?1
+            OR diff_files.path LIKE ?2 ESCAPE '\\'
+            OR diff_files.old_path LIKE ?2 ESCAPE '\\'
          ORDER BY diffs.captured_at DESC, diffs.diff_id ASC
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![file_path, limit], |row| {
+    let folder_pattern = folder_like_pattern(file_path);
+    let rows = statement.query_map(params![file_path, folder_pattern, limit], |row| {
         let additions: Option<i64> = row.get(6)?;
         let deletions: Option<i64> = row.get(7)?;
         let file_count: i64 = row.get(8)?;
         let path_value: String = row.get(0)?;
         let old_path: Option<String> = row.get(18)?;
         Ok(FileSessionBlameRow {
-            file_path: if path_value == file_path {
+            file_path: if path_value == file_path
+                || path_matches_folder_query(&path_value, file_path)
+            {
                 path_value
             } else {
                 old_path.unwrap_or(path_value)
@@ -420,12 +426,13 @@ fn runtime_file_ref_blame_rows(
          LEFT JOIN sessions ON sessions.session_id = file_refs.session_id
          LEFT JOIN events ON events.event_id = file_refs.file_ref_id
          LEFT JOIN diffs generated_diff ON generated_diff.diff_id = file_refs.file_ref_id
-         WHERE file_refs.path = ?1
+         WHERE (file_refs.path = ?1 OR file_refs.path LIKE ?2 ESCAPE '\\')
            AND generated_diff.diff_id IS NULL
          ORDER BY file_refs.recorded_at DESC, file_refs.file_ref_id ASC
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![file_path, limit], |row| {
+    let folder_pattern = folder_like_pattern(file_path);
+    let rows = statement.query_map(params![file_path, folder_pattern, limit], |row| {
         Ok(FileSessionBlameRow {
             file_path: row.get(0)?,
             session_id: row.get(1)?,
@@ -462,6 +469,26 @@ fn collect_blame_rows(
         records.push(row.context(context.to_string())?);
     }
     Ok(records)
+}
+
+fn folder_like_pattern(path: &str) -> String {
+    format!("{}/%", escape_like(path.trim_end_matches('/')))
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn path_matches_folder_query(file_path: &str, query: &str) -> bool {
+    let query = query.trim_end_matches('/');
+    !query.is_empty()
+        && file_path != query
+        && file_path
+            .strip_prefix(query)
+            .is_some_and(|tail| tail.starts_with('/'))
 }
 
 fn prepare_schema_for_rebuild(connection: &Connection) -> Result<()> {

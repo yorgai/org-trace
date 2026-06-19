@@ -274,6 +274,7 @@ pub struct HistoryFileSessionBlameResponse {
     pub source: String,
     pub limit: usize,
     pub status: String,
+    pub truncated: bool,
     pub errors: Vec<String>,
     pub rows: Vec<FileSessionBlameRow>,
 }
@@ -532,13 +533,14 @@ pub(crate) fn build_file_session_blame_response(
 ) -> Result<HistoryFileSessionBlameResponse> {
     let mut rows = Vec::new();
     let mut errors = Vec::new();
+    let query_limit = limit.max(1) + 1;
 
     match store.rebuild_sqlite_index() {
         Ok(_) => match query_sqlite_file_session_blame(
             &store.sqlite_index_path(),
             &SqliteFileSessionBlameQuery {
                 file_path: file_path.to_string(),
-                limit,
+                limit: query_limit,
             },
         ) {
             Ok(runtime_rows) => rows.extend(runtime_rows),
@@ -567,7 +569,7 @@ pub(crate) fn build_file_session_blame_response(
                     file_path: file_path.to_string(),
                     source_id: query_source,
                     repo_path: Some(store.repo_root().to_path_buf()),
-                    limit,
+                    limit: query_limit,
                 }) {
                     Ok(source_rows) => rows.extend(source_rows),
                     Err(error) => errors.push(format!("source_metadata_query: {error}")),
@@ -590,7 +592,9 @@ pub(crate) fn build_file_session_blame_response(
                     .cmp(right.evidence_kind.as_str())
             })
     });
-    rows.truncate(limit.max(1));
+    let result_limit = limit.max(1);
+    let truncated = rows.len() > result_limit;
+    rows.truncate(result_limit);
     let status = if errors.is_empty() {
         if rows.is_empty() {
             "empty"
@@ -608,6 +612,7 @@ pub(crate) fn build_file_session_blame_response(
         source: source.to_string(),
         limit,
         status,
+        truncated,
         errors,
         rows,
     })

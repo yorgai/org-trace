@@ -258,4 +258,30 @@ fn rebuilds_and_queries_sqlite_cache() {
         .source_pointer
         .as_ref()
         .is_some_and(|pointer| pointer.get("diff_id").is_some())));
+
+    let folder_blame = query_sqlite_file_session_blame(
+        &path,
+        &SqliteFileSessionBlameQuery {
+            file_path: "crates/core/src".to_string(),
+            limit: 20,
+        },
+    )
+    .expect("query folder blame");
+    assert_eq!(folder_blame.len(), 2);
+    assert!(folder_blame
+        .iter()
+        .any(|row| row.file_path == "crates/core/src/file_session_blame.rs"));
+    assert!(folder_blame
+        .iter()
+        .any(|row| row.file_path == "crates/core/src/sqlite_index.rs"));
+
+    let boundary_blame = query_sqlite_file_session_blame(
+        &path,
+        &SqliteFileSessionBlameQuery {
+            file_path: "crates/core/sr".to_string(),
+            limit: 20,
+        },
+    )
+    .expect("query folder boundary blame");
+    assert!(boundary_blame.is_empty());
 }

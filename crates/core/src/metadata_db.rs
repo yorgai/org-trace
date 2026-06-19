@@ -1423,8 +1423,13 @@ fn blame_path_matches(query: &str, stored: &str, repo_path: Option<&str>) -> boo
         if join_repo_path(repo, stored) == query || join_repo_path(repo, query) == stored {
             return true;
         }
+        if path_prefix_matches(&join_repo_path(repo, stored), &join_repo_path(repo, query)) {
+            return true;
+        }
     }
-    path_suffix_matches(query, stored) || path_suffix_matches(stored, query)
+    path_suffix_matches(query, stored)
+        || path_suffix_matches(stored, query)
+        || path_prefix_matches(stored, query)
 }
 
 /// Joins a repo root and a (possibly already-absolute) relative path.
@@ -1444,6 +1449,15 @@ fn path_suffix_matches(full: &str, suffix: &str) -> bool {
     }
     full.strip_suffix(suffix)
         .is_some_and(|head| head.ends_with('/'))
+}
+
+fn path_prefix_matches(file_path: &str, directory: &str) -> bool {
+    let directory = directory.trim_end_matches('/');
+    !directory.is_empty()
+        && file_path != directory
+        && file_path
+            .strip_prefix(directory)
+            .is_some_and(|tail| tail.starts_with('/'))
 }
 
 fn touched_files_from_value(value: Option<&Value>) -> Vec<String> {
@@ -1840,6 +1854,50 @@ mod tests {
             "src/lib.rs",
             Some("/repo")
         ));
+        assert!(blame_path_matches("src", "src/lib.rs", None));
+        assert!(blame_path_matches("src/", "src/lib.rs", None));
+        assert!(blame_path_matches("/repo/src", "src/lib.rs", Some("/repo")));
+        assert!(!blame_path_matches("src", "src-old/lib.rs", None));
+        assert!(!blame_path_matches("src", "src2/lib.rs", None));
+    }
+
+    #[test]
+    fn source_blame_matches_folder_prefix() {
+        let path = temp_home("source-blame-folder").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Folder blame", 0))
+            .expect("insert source session");
+
+        let rows = db
+            .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                file_path: "src".to_string(),
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                repo_path: Some(PathBuf::from("/tmp/repo")),
+                limit: 20,
+            })
+            .expect("query source folder blame");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src");
+    }
+
+    #[test]
+    fn source_blame_folder_prefix_does_not_cross_component_boundary() {
+        let path = temp_home("source-blame-folder-boundary").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let mut upsert = sample_upsert("Folder boundary blame", 0);
+        upsert.touched_files_json = Some(json!(["src-old/lib.rs", "src2/main.rs"]));
+        db.upsert_source_session(&upsert)
+            .expect("insert source session");
+
+        let rows = db
+            .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                file_path: "src".to_string(),
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                repo_path: Some(PathBuf::from("/tmp/repo")),
+                limit: 20,
+            })
+            .expect("query source folder blame");
+        assert!(rows.is_empty());
     }
 
     #[test]

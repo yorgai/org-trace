@@ -63,6 +63,7 @@ pub struct MetadataRecallResponse {
     /// One-line natural-language summary suitable for direct agent consumption.
     pub summary: String,
     pub session_count: usize,
+    pub truncated: bool,
     pub errors: Vec<String>,
     pub sessions: Vec<RecallSession>,
 }
@@ -122,7 +123,7 @@ fn build_recall_response(
         });
     }
 
-    let summary = summarize(file_path, &sessions);
+    let summary = summarize(file_path, &sessions, blame.truncated);
     Ok(MetadataRecallResponse {
         schema: "metadata-recall-v1".to_string(),
         file_path: file_path.to_string(),
@@ -130,6 +131,7 @@ fn build_recall_response(
         status: blame.status,
         summary,
         session_count: sessions.len(),
+        truncated: blame.truncated,
         errors: blame.errors,
         sessions,
     })
@@ -306,7 +308,7 @@ fn lookup_intent(
 }
 
 /// Builds a one-line natural-language summary of the recall result.
-fn summarize(file_path: &str, sessions: &[RecallSession]) -> String {
+fn summarize(file_path: &str, sessions: &[RecallSession], truncated: bool) -> String {
     let name = file_path.rsplit('/').next().unwrap_or(file_path);
     if sessions.is_empty() {
         return format!("No prior indexed sessions touched {name}.");
@@ -329,7 +331,12 @@ fn summarize(file_path: &str, sessions: &[RecallSession]) -> String {
         .find_map(|session| session.intent.as_deref())
         .map(|intent| format!(" Most recent: \"{}\".", truncate(intent, 120)))
         .unwrap_or_default();
-    format!("{count} prior {session_word} touched {name} (via {tools_label}).{latest_intent}")
+    let truncated_hint = if truncated {
+        " Results are limited; increase --limit for more."
+    } else {
+        ""
+    };
+    format!("{count} prior {session_word} touched {name} (via {tools_label}).{latest_intent}{truncated_hint}")
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -361,7 +368,7 @@ mod tests {
 
     #[test]
     fn summary_for_no_sessions() {
-        let summary = summarize("/repo/src/lib.rs", &[]);
+        let summary = summarize("/repo/src/lib.rs", &[], false);
         assert_eq!(summary, "No prior indexed sessions touched lib.rs.");
     }
 
@@ -371,7 +378,7 @@ mod tests {
             session("codex_app", Some("Add CSV export")),
             session("claude_code", None),
         ];
-        let summary = summarize("/repo/data.csv", &sessions);
+        let summary = summarize("/repo/data.csv", &sessions, false);
         assert!(summary.starts_with("2 prior sessions touched data.csv"));
         assert!(summary.contains("claude_code, codex_app"));
         assert!(summary.contains("Most recent: \"Add CSV export\"."));
@@ -380,8 +387,15 @@ mod tests {
     #[test]
     fn summary_singular_for_one_session() {
         let sessions = vec![session("gemini", Some("Fix bug"))];
-        let summary = summarize("/x/y.py", &sessions);
+        let summary = summarize("/x/y.py", &sessions, false);
         assert!(summary.starts_with("1 prior session touched y.py (via gemini)."));
+    }
+
+    #[test]
+    fn summary_mentions_truncated_results() {
+        let sessions = vec![session("codex_app", Some("Add CSV export"))];
+        let summary = summarize("/repo/data.csv", &sessions, true);
+        assert!(summary.contains("Results are limited; increase --limit for more."));
     }
 
     #[test]
