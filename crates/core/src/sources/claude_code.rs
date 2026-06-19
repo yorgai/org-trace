@@ -16,7 +16,7 @@ use super::jsonl::{
 };
 
 const CLAUDE_CODE_SOURCE_ID: &str = "claude_code";
-const CLAUDE_CODE_JSONL_PARSER_VERSION: &str = "claude-code-jsonl-v1";
+const CLAUDE_CODE_JSONL_PARSER_VERSION: &str = "claude-code-jsonl-v3";
 const CLAUDE_CODE_PROVIDER_SLUG: &str = "claudecode";
 
 pub(super) fn list_sessions(
@@ -253,6 +253,7 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
     let mut parent_session_id = parent_session_id_from_subagent_path(path);
     let mut agent_id: Option<String> = None;
     let mut attribution_agent: Option<String> = None;
+    let mut touched_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for value in lines {
         update_session_times(&mut metadata, value.get("timestamp"));
@@ -300,10 +301,47 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
                 saw_output_tokens = true;
             }
         }
+
+        // Attribute file edits: a `tool_use` content item for Edit/MultiEdit/
+        // Write carries the target in `input.file_path`; Bash commands may write
+        // files via redirects/heredocs/in-place edits.
+        for item in claude_content_items(message.and_then(|message| message.get("content"))) {
+            if item.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let input = item.get("input");
+            match name {
+                "Edit" | "MultiEdit" | "Write" => {
+                    if let Some(file_path) = input
+                        .and_then(|input| input.get("file_path"))
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.is_empty())
+                    {
+                        touched_files.insert(file_path.to_string());
+                    }
+                }
+                "Bash" => {
+                    if let Some(command) = input
+                        .and_then(|input| input.get("command"))
+                        .and_then(Value::as_str)
+                    {
+                        for file in crate::sources::shell_edits::shell_edit_targets(command) {
+                            touched_files.insert(file);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     metadata.input_tokens = saw_input_tokens.then_some(input_tokens);
     metadata.output_tokens = saw_output_tokens.then_some(output_tokens);
+    if !touched_files.is_empty() {
+        metadata.files_changed = Some(touched_files.len() as u64);
+        metadata.touched_files = touched_files.into_iter().collect();
+    }
     if saw_sidechain {
         if let Some(parent_session_id) = parent_session_id.filter(|value| !value.is_empty()) {
             let subagent_session_id = path
@@ -579,5 +617,28 @@ mod tests {
         assert_eq!(sessions[0].repo_path.as_deref(), Some(Path::new("/repo")));
         assert_eq!(sessions[0].branch.as_deref(), Some("main"));
         assert_eq!(sessions[0].parser_version, CLAUDE_CODE_JSONL_PARSER_VERSION);
+    }
+
+    #[test]
+    fn extracts_claude_code_touched_files_from_edit_and_bash() {
+        let root = temp_source_root("touched");
+        let transcript_path = root.join("claude-session.jsonl");
+        // An assistant turn that Writes a file and runs a Bash redirect.
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"type\":\"user\",\"timestamp\":\"2026-06-18T01:00:00Z\",\"cwd\":\"/repo\",\"message\":{\"role\":\"user\",\"content\":\"Add files\"}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-06-18T01:02:00Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Write\",\"input\":{\"file_path\":\"src/main.rs\",\"content\":\"fn main(){}\"}},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Bash\",\"input\":{\"command\":\"echo hi > notes.txt\"}}]}}\n"
+            ),
+        )
+        .expect("write claude transcript");
+
+        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+
+        assert_eq!(
+            sessions[0].touched_files,
+            vec!["notes.txt".to_string(), "src/main.rs".to_string()]
+        );
+        assert_eq!(sessions[0].files_changed, Some(2));
     }
 }

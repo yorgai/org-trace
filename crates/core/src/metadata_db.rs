@@ -320,6 +320,11 @@ impl MetadataDb {
     }
 
     /// Queries source metadata rows that touched a file path.
+    ///
+    /// `repo_path` is a *ranking preference*, not a hard filter: matches whose
+    /// session repo equals it are ordered first, but sessions from other repos
+    /// still match so blame works regardless of the caller's CWD. Path matching
+    /// is robust to absolute-vs-relative form (see `blame_path_matches`).
     pub fn query_source_file_session_blame(
         &self,
         query: &SourceFileSessionBlameQuery,
@@ -333,32 +338,43 @@ impl MetadataDb {
                     discovered_at, last_seen_at, created_at, updated_at, metadata_json
              FROM source_sessions
              WHERE (?1 IS NULL OR source_id = ?1)
-               AND (?2 IS NULL OR repo_path = ?2)
                AND touched_files_json IS NOT NULL
-             ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC
-             LIMIT ?3",
+             ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC",
         )?;
-        let rows = statement.query_map(
-            params![
-                query.source_id,
-                query
-                    .repo_path
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                limit,
-            ],
-            source_session_from_row,
-        )?;
-        let mut records = Vec::new();
+        let rows = statement.query_map(params![query.source_id], source_session_from_row)?;
+        let preferred_repo = query
+            .repo_path
+            .as_ref()
+            .map(|path| path.display().to_string());
+        // Collect matches with a same-repo flag so we can rank before truncating.
+        let mut matched: Vec<(bool, FileSessionBlameRow)> = Vec::new();
         for row in rows {
             let record = row.context("failed to read metadata source-session blame row")?;
-            if touched_files_from_value(record.touched_files_json.as_ref())
+            let repo_path = record
+                .repo_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let touched = touched_files_from_value(record.touched_files_json.as_ref());
+            if touched
                 .iter()
-                .any(|path| path == &query.file_path)
+                .any(|stored| blame_path_matches(&query.file_path, stored, repo_path.as_deref()))
             {
-                records.push(source_session_blame_row(&query.file_path, record));
+                let same_repo = matches!(
+                    (&preferred_repo, &repo_path),
+                    (Some(want), Some(have)) if want == have
+                );
+                matched.push((
+                    same_repo,
+                    source_session_blame_row(&query.file_path, record),
+                ));
             }
         }
+        // Stable sort keeps the SQL ordering within each rank group; same-repo
+        // first.
+        matched.sort_by(|left, right| right.0.cmp(&left.0));
+        let mut records: Vec<FileSessionBlameRow> =
+            matched.into_iter().map(|(_, row)| row).collect();
+        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(records)
     }
 
@@ -1348,6 +1364,44 @@ fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> Fil
     }
 }
 
+/// Returns whether a queried file path matches a stored touched-file entry.
+///
+/// Tolerant of the absolute-vs-relative mismatch common across tools: a session
+/// records repo-relative `src/lib.rs` while an agent queries absolute
+/// `/repo/src/lib.rs` (or vice versa). Order of checks: exact equality, equality
+/// after resolving either side against the session `repo_path`, then a
+/// path-component-boundary suffix match.
+fn blame_path_matches(query: &str, stored: &str, repo_path: Option<&str>) -> bool {
+    if query == stored {
+        return true;
+    }
+    if let Some(repo) = repo_path {
+        if join_repo_path(repo, stored) == query || join_repo_path(repo, query) == stored {
+            return true;
+        }
+    }
+    path_suffix_matches(query, stored) || path_suffix_matches(stored, query)
+}
+
+/// Joins a repo root and a (possibly already-absolute) relative path.
+fn join_repo_path(repo: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    format!("{}/{}", repo.trim_end_matches('/'), path)
+}
+
+/// Whether `suffix` matches the tail of `full` on a path-component boundary
+/// (so `lib.rs` does not match `notlib.rs`, but `src/lib.rs` matches
+/// `/repo/src/lib.rs`).
+fn path_suffix_matches(full: &str, suffix: &str) -> bool {
+    if full == suffix {
+        return true;
+    }
+    full.strip_suffix(suffix)
+        .is_some_and(|head| head.ends_with('/'))
+}
+
 fn touched_files_from_value(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -1662,6 +1716,65 @@ mod tests {
             })
             .expect("query missing source file blame");
         assert!(missing_rows.is_empty());
+    }
+
+    #[test]
+    fn blame_matches_absolute_query_against_relative_touched_file() {
+        let path = temp_home("source-blame-abs").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Abs blame", 0))
+            .expect("insert source session");
+
+        let rows = db
+            .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                file_path: "/tmp/repo/src/lib.rs".to_string(),
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                repo_path: Some(PathBuf::from("/tmp/repo")),
+                limit: 20,
+            })
+            .expect("query abs blame");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_id.as_deref(), Some(TEST_SOURCE_ID));
+    }
+
+    #[test]
+    fn blame_works_without_matching_repo_path() {
+        let path = temp_home("source-blame-norepo").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("No repo blame", 0))
+            .expect("insert source session");
+
+        let rows = db
+            .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+                file_path: "src/lib.rs".to_string(),
+                source_id: None,
+                repo_path: Some(PathBuf::from("/some/other/cwd")),
+                limit: 20,
+            })
+            .expect("query no-repo blame");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn blame_path_matches_handles_relative_and_absolute() {
+        assert!(blame_path_matches("src/lib.rs", "src/lib.rs", None));
+        assert!(blame_path_matches(
+            "/repo/src/lib.rs",
+            "src/lib.rs",
+            Some("/repo")
+        ));
+        assert!(blame_path_matches(
+            "src/lib.rs",
+            "/repo/src/lib.rs",
+            Some("/repo")
+        ));
+        assert!(blame_path_matches("/a/b/src/lib.rs", "src/lib.rs", None));
+        assert!(!blame_path_matches("/a/notlib.rs", "lib.rs", None));
+        assert!(!blame_path_matches(
+            "src/other.rs",
+            "src/lib.rs",
+            Some("/repo")
+        ));
     }
 
     #[test]

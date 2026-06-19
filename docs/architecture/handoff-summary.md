@@ -699,6 +699,44 @@ Out of scope (future): a higher-level `brick memory recall` that aggregates
 injection via tool hooks/daemon. The static convention-file layer ships first
 because it is the highest-leverage step with no runtime dependencies.
 
+### Touched-files backfill (`file-session-blame` now returns real data) — DONE
+
+`brick history file-session-blame` is what the agent block points at, but on
+real local history it returned `status: empty` because parsers rarely populated
+`source_sessions.touched_files`. Fixed end to end:
+
+- **Codex apply_patch** (`sources/codex_app.rs`): `parse_patch_impact` now
+  understands Codex's own envelope (`*** Begin Patch` / `*** Add File:` /
+  `*** Update File:` / `*** Delete File:` / `*** Move to:`) in addition to
+  git-diff, so structured edits yield touched_files.
+- **Shell-driven edits** (`sources/shell_edits.rs`, new): a conservative,
+  high-confidence extractor maps `Bash`/`exec_command` strings to written paths
+  (redirects `>`/`>>`, `tee`, `sed -i`, `touch`, `cp`/`mv`), used by both Codex
+  and Claude. apply_patch heredocs are parsed as patches, not shell tokens;
+  read-only commands and operator/fd noise (`2>&1`, numbers, `{}`/`=`) are
+  rejected.
+- **Claude Edit/Write/Bash** (`sources/claude_code.rs`): `extract()` now folds
+  `Edit`/`MultiEdit`/`Write` `file_path` and `Bash` write targets into the
+  session-level touched_files (previously only Cursor did this).
+- **Blame query relaxed** (`metadata_db.rs`): the hard `repo_path =` filter is
+  gone (repo is now a ranking *preference*, same-repo first), and `path_matches`
+  handles absolute-vs-relative form (exact / repo-resolved / component-boundary
+  suffix), so blame works from any CWD. Unit-tested.
+- **Auto-reindex on parser upgrade** (`cli/src/history.rs`): the source
+  fingerprint now includes `parser_version`, so bumping a parser (these went to
+  `…-jsonl-v3`) invalidates indexed rows and forces a re-parse — no manual
+  reindex command needed.
+
+Verified live against the user's real `~/.codex`: 52 Codex sessions now carry
+touched_files (0 junk after hardening), and
+`file-session-blame --path …/sample_sales.csv` returns the editing session by
+absolute *and* relative path. Note: a tool with no file-edit signal in its
+history (the user's recent Claude sessions are chat/research) correctly yields no
+hits — a data fact, not a parser failure (Claude extraction is unit-tested).
+
+Next (still out of scope here): Gemini provider, and `brick memory recall` — both
+now unblocked because blame returns real data.
+
 ## Design cautions
 
 - Treat ORGII external-history code as a whole subsystem: scan, parse, metadata indexing, source-specific loading/windowing, chunk load, recent paths, impact stats, backfill, and diagnostics move together into Brick over time.

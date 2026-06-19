@@ -6,6 +6,7 @@ mod cursor_family;
 mod cursor_ide;
 mod jsonl;
 mod opencode;
+pub(crate) mod shell_edits;
 mod traits;
 mod windsurf;
 

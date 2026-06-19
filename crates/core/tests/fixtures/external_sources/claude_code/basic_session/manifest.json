@@ -10,7 +10,7 @@
       {
         "externalSessionId": "session-basic",
         "title": "Run tests",
-        "parserVersion": "claude-code-jsonl-v1",
+        "parserVersion": "claude-code-jsonl-v3",
         "model": "claude-sonnet-example",
         "inputTokens": 15,
         "outputTokens": 7,

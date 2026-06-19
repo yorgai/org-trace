@@ -16,7 +16,7 @@ use super::jsonl::{
 };
 
 const CODEX_APP_SOURCE_ID: &str = "codex_app";
-const CODEX_APP_JSONL_PARSER_VERSION: &str = "codex-app-jsonl-v1";
+const CODEX_APP_JSONL_PARSER_VERSION: &str = "codex-app-jsonl-v3";
 const CODEX_APP_PROVIDER_SLUG: &str = "codex";
 
 #[derive(Debug, Default)]
@@ -256,6 +256,7 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
 
         if matches!(payload_type, Some("function_call" | "custom_tool_call")) {
             collect_patch_impact(payload, &mut patch_impact);
+            collect_shell_edits(payload, &mut patch_impact);
         }
     }
 
@@ -267,6 +268,35 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
     }
 
     Ok(metadata)
+}
+
+fn collect_shell_edits(payload: &Value, impact: &mut PatchImpact) {
+    let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+    if !matches!(name, "shell" | "exec_command" | "local_shell") {
+        return;
+    }
+    // The command may be a string, or a list of argv tokens, inside
+    // `arguments` (a JSON string) or directly on the payload.
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let command_value = arguments
+        .as_ref()
+        .and_then(|args| args.get("command").cloned())
+        .or_else(|| payload.get("command").cloned());
+    let command = match command_value {
+        Some(Value::String(text)) => text,
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return,
+    };
+    for file in crate::sources::shell_edits::shell_edit_targets(&command) {
+        impact.touched_files.insert(file);
+    }
 }
 
 fn collect_patch_impact(payload: &Value, impact: &mut PatchImpact) {
@@ -296,7 +326,28 @@ fn collect_patch_impact(payload: &Value, impact: &mut PatchImpact) {
 }
 
 fn parse_patch_impact(patch: &str, impact: &mut PatchImpact) {
+    // Codex's `apply_patch` uses its own envelope rather than a git diff:
+    //   *** Begin Patch
+    //   *** Add File: <path>      (or Update File / Delete File / Move to:)
+    //   +<added line>             (no +++/--- headers)
+    //   *** End Patch
+    // We recognize those `*** … File:` headers for touched_files and only count
+    // body +/- lines, while still understanding plain git-diff output from other
+    // emitters.
     for line in patch.lines() {
+        if line.starts_with("*** Begin Patch") || line.starts_with("*** End Patch") {
+            continue;
+        }
+        if let Some(path) = codex_patch_header_path(line) {
+            if let Some(normalized) = normalize_diff_path(&path) {
+                impact.touched_files.insert(normalized);
+            }
+            continue;
+        }
+        if line.starts_with("*** ") {
+            // Other Codex patch directives (e.g. hunk markers) carry no path.
+            continue;
+        }
         if let Some(path) = line.strip_prefix("diff --git ") {
             for part in path.split_whitespace().take(2) {
                 if let Some(normalized) = normalize_diff_path(part) {
@@ -319,6 +370,22 @@ fn parse_patch_impact(patch: &str, impact: &mut PatchImpact) {
             impact.lines_removed = impact.lines_removed.saturating_add(1);
         }
     }
+}
+
+/// Extracts the target path from a Codex apply_patch file header line such as
+/// `*** Add File: src/lib.rs` / `*** Update File: …` / `*** Delete File: …` /
+/// `*** Move to: …`.
+fn codex_patch_header_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("*** ")?;
+    for marker in ["Add File:", "Update File:", "Delete File:", "Move to:"] {
+        if let Some(path) = rest.strip_prefix(marker) {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn normalize_diff_path(path: &str) -> Option<String> {
@@ -545,5 +612,50 @@ mod tests {
         assert_eq!(sessions[0].lines_removed, Some(1));
         assert_eq!(sessions[0].touched_files, vec!["src/lib.rs".to_string()]);
         assert_eq!(sessions[0].parser_version, CODEX_APP_JSONL_PARSER_VERSION);
+    }
+
+    #[test]
+    fn extracts_codex_apply_patch_envelope_touched_files() {
+        let root = temp_source_root("apply-patch");
+        let transcript_path = root.join("codex-session.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"timestamp\":\"2026-06-18T01:00:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"Add a CSV\",\"cwd\":\"/repo\"}}\n",
+                "{\"timestamp\":\"2026-06-18T01:02:00Z\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Add File: data/sample.csv\\n+a,b\\n+1,2\\n*** End Patch\\n\"}}\n",
+                "{\"timestamp\":\"2026-06-18T01:03:00Z\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c2\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Update File: src/main.rs\\n-old\\n+new\\n*** End Patch\\n\"}}\n"
+            ),
+        )
+        .expect("write codex apply_patch transcript");
+
+        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+
+        assert_eq!(
+            sessions[0].touched_files,
+            vec!["data/sample.csv".to_string(), "src/main.rs".to_string()]
+        );
+        assert_eq!(sessions[0].files_changed, Some(2));
+    }
+
+    #[test]
+    fn codex_patch_header_path_parses_all_directives() {
+        assert_eq!(
+            codex_patch_header_path("*** Add File: a/b.rs").as_deref(),
+            Some("a/b.rs")
+        );
+        assert_eq!(
+            codex_patch_header_path("*** Update File: src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            codex_patch_header_path("*** Delete File: old.txt").as_deref(),
+            Some("old.txt")
+        );
+        assert_eq!(
+            codex_patch_header_path("*** Move to: new/path.rs").as_deref(),
+            Some("new/path.rs")
+        );
+        assert_eq!(codex_patch_header_path("*** End Patch"), None);
+        assert_eq!(codex_patch_header_path("+some content"), None);
     }
 }

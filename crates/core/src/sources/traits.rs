@@ -103,7 +103,7 @@ mod tests {
             list_source_sessions(&source_profile, Some(10)).expect("list claude sessions");
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].parser_version, "claude-code-jsonl-v1");
+        assert_eq!(sessions[0].parser_version, "claude-code-jsonl-v3");
         assert_eq!(sessions[0].model.as_deref(), Some("claude-sonnet"));
         assert_eq!(sessions[0].input_tokens, Some(11));
         assert_eq!(sessions[0].output_tokens, Some(7));

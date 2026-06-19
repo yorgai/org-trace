@@ -10,7 +10,7 @@
       {
         "externalSessionId": "codex-patch-session",
         "title": "Patch the greeting",
-        "parserVersion": "codex-app-jsonl-v1",
+        "parserVersion": "codex-app-jsonl-v3",
         "model": "codex-example-model",
         "inputTokens": 31,
         "outputTokens": 12,

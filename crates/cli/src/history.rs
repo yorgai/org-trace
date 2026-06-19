@@ -995,8 +995,8 @@ fn provider_kind(source_id: &str) -> &'static str {
 
 fn parser_kind(source_id: &str) -> &'static str {
     match source_id {
-        "claude_code" => "claude-code-jsonl-v1",
-        "codex_app" => "codex-app-jsonl-v1",
+        "claude_code" => "claude-code-jsonl-v3",
+        "codex_app" => "codex-app-jsonl-v3",
         "cursor_ide" => "cursor-ide-composer-headers-v1",
         "windsurf" => "windsurf-composer-data-v1",
         "opencode" => "opencode-sqlite-v1",
@@ -1452,8 +1452,18 @@ fn source_session_upsert(
     let now = Utc::now();
     let source_mtime = session.modified_at.map(system_time_to_utc);
     let listable = session.listable;
-    let source_fingerprint =
-        source_mtime.map(|mtime| format!("{}:{}", mtime.to_rfc3339(), session.size_bytes));
+    // Fold the parser version into the fingerprint so that upgrading a parser
+    // (which changes what we extract, e.g. touched_files) invalidates already-
+    // indexed rows and forces a re-parse, without the user having to remember a
+    // manual reindex. mtime+size alone would skip unchanged files forever.
+    let source_fingerprint = source_mtime.map(|mtime| {
+        format!(
+            "{}:{}:{}",
+            mtime.to_rfc3339(),
+            session.size_bytes,
+            session.parser_version
+        )
+    });
     let metadata_json = source_session_metadata(profile, &session);
     SourceSessionUpsert {
         source_id: profile.name.clone(),
@@ -1745,7 +1755,7 @@ mod tests {
         assert_eq!(row.source_id, "claude_code");
         assert_eq!(row.status, "error");
         assert_eq!(row.provider_kind, "claude_code_jsonl");
-        assert_eq!(row.parser_kind, "claude-code-jsonl-v1");
+        assert_eq!(row.parser_kind, "claude-code-jsonl-v3");
         assert!(!row.profile.exists);
         assert!(row
             .errors
@@ -1980,7 +1990,7 @@ mod tests {
             source_mtime: Some(updated_at),
             source_size: Some(123),
             source_fingerprint: Some("sha256:abc".to_string()),
-            parser_version: Some("claude-code-jsonl-v1".to_string()),
+            parser_version: Some("claude-code-jsonl-v3".to_string()),
             session_created_at: Some(created_at),
             session_updated_at: Some(updated_at),
             model: Some("claude-sonnet".to_string()),
@@ -2045,7 +2055,7 @@ mod tests {
         );
         assert_eq!(
             serialized["source_session"]["parser_version"],
-            "claude-code-jsonl-v1"
+            "claude-code-jsonl-v3"
         );
     }
 
