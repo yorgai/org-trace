@@ -275,17 +275,29 @@ wipes them.
 
 ## Verifying
 
-Two harnesses cover the kit end to end; both spawn the real `brick mcp-serve`
-binary and speak the real stdio JSON-RPC protocol, with two native source
-profiles (codex_app + claude_code) backed by real transcript files. Each asserts
-cross-tool memory (a Codex session's work recalled by a Claude session), FTS5
-search, the planning loop, and liveness-aware claim retirement.
+`cargo test -p brick --test mcp_smoke` exercises the whole kit end to end with no
+external dependencies — it spawns the real `brick mcp-serve` binary and speaks the
+real stdio JSON-RPC protocol, with two native source profiles (codex_app +
+claude_code) backed by real transcript files under a temp `BRICK_HOME` and a
+throwaway git repo. It never touches your real Brick home or working tree.
 
-- **`cargo test -p brick --test mcp_smoke`** — a self-contained Rust integration
-  test (`crates/cli/tests/mcp_smoke.rs`). No external dependencies; runs as part
-  of `cargo test`. Uses a temp `BRICK_HOME` and a throwaway git repo.
-- **`scripts/smoke_mcp.sh`** — a shell harness that clones a real git repo (this
-  one by default; override with `SMOKE_SRC_REPO`) and drives the same flow via a
-  `python3` stdio driver (`scripts/smoke_mcp_driver.py`).
+It is four tests, split the way a capability kit must be proven:
 
-Neither touches your real Brick home or working tree.
+- **`mcp_capability_kit_end_to_end`** — all 13 tools across the three
+  capabilities, plus the cross-tool flow where a Claude-side `show_mission` reads
+  a Codex-authored mission/artifact.
+- **`liveness_flips_when_turn_completes_same_process`** — proves liveness is
+  recomputed every call, not cached: on one long-lived server, a session that is
+  live with an open turn drops out of `live_sessions` the instant its transcript
+  gains a completion marker.
+- **`liveness_respects_active_window_same_process`** — proves the 120s
+  ACTIVE_WINDOW gates before turn signals: the same open-turn transcript, aged
+  past the window, reads as not-live.
+- **`cross_client_announcement_visibility_and_retirement`** — two independent
+  mcp-serve processes (modeling Codex and Claude Code side by side) over one
+  `BRICK_HOME`: work announced by one is immediately visible to the other, and a
+  claim is retired on the peer's next read once its owning session ends.
+
+The two liveness flips are behavioral contracts, not snapshots — they were
+validated by mutation testing (breaking the window gate or the turn-complete
+parser turns them red).

@@ -143,15 +143,27 @@ fn write_lines(path: &Path, lines: &[Value]) {
 
 /// A live Codex session (open turn) that patched a real repo file.
 fn write_codex(dir: &Path, sid: &str, repo: &Path, file: &str) {
+    write_codex_at(dir, sid, repo, file, 0, false);
+}
+
+/// Writes a Codex transcript with controllable freshness and turn state.
+///
+/// `base_offset` shifts every embedded timestamp into the past (seconds), which
+/// drives the liveness ACTIVE_WINDOW gate because `session_updated_at` is parsed
+/// from these timestamps — not the file mtime. `closed` appends a `task_complete`
+/// so the turn-signal parser reports the turn as finished (Idle).
+fn write_codex_at(dir: &Path, sid: &str, repo: &Path, file: &str, base_offset: i64, closed: bool) {
     let patch = format!("diff --git a/{file} b/{file}\n+++ b/{file}\n+// cache git status\n");
-    let lines = vec![
-        json!({"timestamp":iso(-30),"payload":{"type":"user_message","message":"Cache git status lookups in commands_git","cwd":repo.display().to_string(),"model":"gpt-5"}}),
-        json!({"timestamp":iso(-25),"payload":{"type":"task_started"}}),
-        json!({"timestamp":iso(-20),"payload":{"type":"agent_message","message":"Adding a cache layer"}}),
-        json!({"timestamp":iso(-15),"payload":{"type":"function_call","call_id":"c1","name":"apply_patch","arguments": json!({"patch": patch}).to_string()}}),
-        json!({"timestamp":iso(-14),"payload":{"type":"function_call_output","call_id":"c1","output":"applied"}}),
-        // No task_complete → the turn is still open → Active.
+    let mut lines = vec![
+        json!({"timestamp":iso(base_offset - 30),"payload":{"type":"user_message","message":"Cache git status lookups in commands_git","cwd":repo.display().to_string(),"model":"gpt-5"}}),
+        json!({"timestamp":iso(base_offset - 25),"payload":{"type":"task_started"}}),
+        json!({"timestamp":iso(base_offset - 20),"payload":{"type":"agent_message","message":"Adding a cache layer"}}),
+        json!({"timestamp":iso(base_offset - 15),"payload":{"type":"function_call","call_id":"c1","name":"apply_patch","arguments": json!({"patch": patch}).to_string()}}),
+        json!({"timestamp":iso(base_offset - 14),"payload":{"type":"function_call_output","call_id":"c1","output":"applied"}}),
     ];
+    if closed {
+        lines.push(json!({"timestamp":iso(base_offset - 12),"payload":{"type":"task_complete"}}));
+    }
     write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
 }
 
@@ -164,9 +176,20 @@ fn write_claude(dir: &Path, sid: &str, repo: &Path, file: &str) {
     write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
 }
 
-#[test]
-fn mcp_capability_kit_end_to_end() {
-    let root = unique_tmp("e2e");
+/// A live Claude session (trailing assistant with no stop_reason → Active).
+fn write_claude_live(dir: &Path, sid: &str, repo: &Path, file: &str) {
+    let lines = vec![
+        json!({"type":"user","timestamp":iso(-20),"message":{"role":"user","content":format!("Refactor {file}"),"cwd":repo.display().to_string()}}),
+        json!({"type":"assistant","timestamp":iso(-10),"message":{"content":[{"type":"text","text":"Working"}],"stop_reason":Value::Null}}),
+    ];
+    write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
+}
+
+/// Spins up two configured native source profiles under one `BRICK_HOME` and a
+/// temp git repo. Returns `(root, home, repo, codex_dir, claude_dir)`. Shared by
+/// the behavioral tests so each gets an isolated, fully-initialized Brick world.
+fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let root = unique_tmp(tag);
     let home = root.join("home");
     let repo = root.join("repo");
     let codex_dir = root.join("codex");
@@ -174,13 +197,9 @@ fn mcp_capability_kit_end_to_end() {
     for d in [&home, &repo, &codex_dir, &claude_dir] {
         std::fs::create_dir_all(d).unwrap();
     }
-
-    // A real git repo with real tracked source files the agents reference.
-    let file_codex = "src/commands_git.rs";
-    let file_claude = "src/commands_memory.rs";
     std::fs::create_dir_all(repo.join("src")).unwrap();
-    std::fs::write(repo.join(file_codex), "// real file\n").unwrap();
-    std::fs::write(repo.join(file_claude), "// real file\n").unwrap();
+    std::fs::write(repo.join("src/commands_git.rs"), "// real file\n").unwrap();
+    std::fs::write(repo.join("src/commands_memory.rs"), "// real file\n").unwrap();
     assert!(Command::new("git")
         .arg("init")
         .arg("-q")
@@ -226,6 +245,38 @@ fn mcp_capability_kit_end_to_end() {
             claude_dir.to_str().unwrap(),
         ],
     );
+    (root, home, repo, codex_dir, claude_dir)
+}
+
+/// External session ids visible in a `live_sessions` response.
+fn live_ids(m: &mut Mcp) -> Vec<String> {
+    let live = m.call("live_sessions", json!({}));
+    live["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s["external_session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Active-claim scopes visible in a `list_announcements` response.
+fn claim_scopes(m: &mut Mcp) -> Vec<String> {
+    let la = m.call("list_announcements", json!({}));
+    la["announcements"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|a| a["scope"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn mcp_capability_kit_end_to_end() {
+    let (root, home, repo, codex_dir, claude_dir) = setup_world("e2e");
+    let file_codex = "src/commands_git.rs";
+    let file_claude = "src/commands_memory.rs";
     write_codex(&codex_dir, "codex-live-001", &repo, file_codex);
     write_claude(&claude_dir, "claude-done-002", &repo, file_claude);
 
@@ -417,5 +468,121 @@ fn mcp_capability_kit_end_to_end() {
         .any(|a| a == &json!(aid)));
 
     drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Liveness is recomputed every call, never cached: a session that is live while
+/// its turn is open must drop out of `live_sessions` the moment the transcript
+/// gains a completion marker — on the SAME long-lived mcp-serve process. A static
+/// one-shot snapshot cannot tell "recomputed" apart from "cached after first
+/// scan"; only this in-place flip proves the architectural claim.
+#[test]
+fn liveness_flips_when_turn_completes_same_process() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("flip-turn");
+    let file = "src/commands_git.rs";
+    write_codex_at(&codex_dir, "codex-turn", &repo, file, 0, false); // open turn, fresh
+
+    let mut m = Mcp::spawn(&home, &repo);
+    assert!(
+        live_ids(&mut m).contains(&"codex-turn".to_string()),
+        "open fresh turn should be live"
+    );
+
+    // Same session id, same freshness, but now the turn is complete.
+    write_codex_at(&codex_dir, "codex-turn", &repo, file, 0, true);
+    assert!(
+        !live_ids(&mut m).contains(&"codex-turn".to_string()),
+        "completed turn must drop out of live_sessions on the next call (recomputed, not cached)"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The 120s ACTIVE_WINDOW is real: an open-turn session that is fresh shows as
+/// live, but the identical transcript aged past the window must read as not-live
+/// even though its turn is still open — proving recency gates before turn signals.
+#[test]
+fn liveness_respects_active_window_same_process() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("flip-window");
+    let file = "src/commands_git.rs";
+    write_codex_at(&codex_dir, "codex-fresh", &repo, file, 0, false); // open + fresh
+
+    let mut m = Mcp::spawn(&home, &repo);
+    assert!(
+        live_ids(&mut m).contains(&"codex-fresh".to_string()),
+        "fresh open turn should be live"
+    );
+
+    // Push every timestamp ~200s into the past (> ACTIVE_WINDOW = 120s). Still an
+    // open turn, but stale → must be Idle without even consulting turn signals.
+    write_codex_at(&codex_dir, "codex-fresh", &repo, file, -200, false);
+    assert!(
+        !live_ids(&mut m).contains(&"codex-fresh".to_string()),
+        "an aged session must fall out of the active window regardless of open turn"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two independent mcp-serve processes — modeling Codex and Claude Code running
+/// side by side against the same machine — share one BRICK_HOME. Work announced
+/// by one process is immediately visible to the other (real cross-client
+/// coordination), and when the announcing session ends, its claim is retired on
+/// the peer's next read (liveness-aware retirement across process boundaries).
+#[test]
+fn cross_client_announcement_visibility_and_retirement() {
+    let (root, home, repo, codex_dir, claude_dir) = setup_world("cross-client");
+    let codex_file = "src/commands_git.rs";
+
+    // A live Codex session (process A's "self") and a live Claude session whose
+    // claim we will later retire by ending it.
+    write_codex_at(&codex_dir, "codex-A", &repo, codex_file, 0, false);
+    write_claude_live(&claude_dir, "claude-B", &repo, "src/commands_memory.rs");
+
+    let mut client_a = Mcp::spawn(&home, &repo); // pretend: Codex's MCP client
+    let mut client_b = Mcp::spawn(&home, &repo); // pretend: Claude Code's MCP client
+
+    // Client A announces work tied to its live Codex session.
+    client_a.call("announce_work", json!({
+        "scope": codex_file, "message": "refactoring", "source": "codex_app", "session_id": "codex-A"
+    }));
+    // Client B announces work tied to its live Claude session.
+    client_b.call("announce_work", json!({
+        "scope": "src/commands_memory.rs", "message": "reviewing", "source": "claude_code", "session_id": "claude-B"
+    }));
+
+    // Cross-client visibility: B sees A's claim and vice versa.
+    let seen_by_b = claim_scopes(&mut client_b);
+    assert!(
+        seen_by_b.contains(&codex_file.to_string()),
+        "B must see A's claim: {seen_by_b:?}"
+    );
+    assert!(
+        seen_by_b.contains(&"src/commands_memory.rs".to_string()),
+        "B must see its own claim: {seen_by_b:?}"
+    );
+    let seen_by_a = claim_scopes(&mut client_a);
+    assert!(
+        seen_by_a.contains(&"src/commands_memory.rs".to_string()),
+        "A must see B's claim: {seen_by_a:?}"
+    );
+
+    // End Claude session B: its transcript becomes a finished turn. The claim is
+    // now owned by a dead session and must be retired on the next peer read.
+    write_claude(&claude_dir, "claude-B", &repo, "src/commands_memory.rs");
+    let after = claim_scopes(&mut client_a);
+    assert!(
+        after.contains(&codex_file.to_string()),
+        "A's claim (live session) must survive: {after:?}"
+    );
+    assert!(
+        !after.contains(&"src/commands_memory.rs".to_string()),
+        "B's claim must be retired once its session ended, seen from the peer process: {after:?}"
+    );
+
+    drop(client_a);
+    drop(client_b);
     let _ = std::fs::remove_dir_all(&root);
 }

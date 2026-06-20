@@ -108,7 +108,7 @@ The server is an append-only HTTP remote backed by `events.jsonl` under `--data-
 
 The repository includes an MVP smoke harness at `scripts/smoke_mvp.sh`. It runs in temporary directories, avoids the user's working tree, starts and cleans up a background local server, pushes by repo ID, pulls into a second store, and checks local and server query paths.
 
-A second harness at `scripts/smoke_mcp.sh` covers the MCP capability kit: it clones a real git repo into a temp dir, configures two native source profiles (codex_app + claude_code) backed by real transcript files, and drives all 13 `brick mcp-serve` tools over the real stdio JSON-RPC protocol — verifying cross-tool memory, FTS5 search, the planning loop, and liveness-aware claim retirement. It requires `python3` for the stdio driver (`scripts/smoke_mcp_driver.py`).
+The MCP capability kit is covered by a self-contained Rust integration test at `crates/cli/tests/mcp_smoke.rs` (run via `cargo test -p brick --test mcp_smoke`). It spawns the real `brick mcp-serve` binary and drives all 13 tools over the real stdio JSON-RPC protocol with two native source profiles (codex_app + claude_code) backed by real transcript files — verifying cross-tool memory, FTS5 search, the planning loop, and two behavioral liveness contracts (turn-complete flip and active-window flip on one long-lived server) plus cross-client claim retirement across two processes. No external dependencies; it runs under `cargo test`.
 
 Recommended verification before release:
 
@@ -118,5 +118,4 @@ cargo check --workspace
 cargo test --workspace
 cargo doc --workspace --no-deps
 scripts/smoke_mvp.sh
-scripts/smoke_mcp.sh
 ```
