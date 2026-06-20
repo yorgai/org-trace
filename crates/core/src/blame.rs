@@ -61,6 +61,28 @@ pub struct BlameLine {
     pub confidence: BlameConfidence,
 }
 
+/// One commit in a line range's history, with the owner session that captured it
+/// when Brick can attribute it. Unlike `BlameLine` (which `git blame` pins to the
+/// single *last* commit touching a line), this is the *full* history of a range:
+/// every commit `git log -L` walks through, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTouch {
+    pub commit: String,
+    pub subject: Option<String>,
+    pub committed_at: Option<String>,
+    /// Owner attribution when a captured patch-id matches this commit's per-file
+    /// slice; `None` for commits Brick cannot attribute (others' commits, hand
+    /// edits, or history rewritten by squash/rebase — reported, not guessed).
+    pub session_id: Option<String>,
+    pub actor_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub mission_id: Option<String>,
+    pub occurred_at: Option<String>,
+    pub source_event_id: Option<String>,
+    /// True when an owner session was attributed via the captured patch-id.
+    pub attributed: bool,
+}
+
 /// The Brick-side attribution carried by a `diff.captured` event.
 #[derive(Debug, Clone)]
 struct Attribution {
@@ -176,6 +198,130 @@ pub fn blame_file(store: &LocalStore, repo_root: &Path, rel_path: &str) -> Resul
     }
 
     Ok(lines)
+}
+
+/// Returns the FULL session history of a line range `[line_start, line_end]` in
+/// `rel_path`: every commit that touched the range (newest first, via
+/// `git log -L`), each tagged with the owner session that captured it when a
+/// recorded patch-id matches. This is the "all variations of this code" view —
+/// `blame_file` only resolves the single last commit per line, whereas this walks
+/// the whole range history. Commits Brick cannot attribute (others', hand edits,
+/// or squash/rebase-rewritten history whose patch-id no longer matches) are still
+/// listed with `attributed = false`, never guessed.
+pub fn blame_line_range_history(
+    store: &LocalStore,
+    repo_root: &Path,
+    rel_path: &str,
+    line_start: u64,
+    line_end: u64,
+) -> Result<Vec<SessionTouch>> {
+    if line_start == 0 || line_end < line_start {
+        return Err(anyhow!(
+            "invalid line range {line_start},{line_end}: start must be >= 1 and <= end"
+        ));
+    }
+
+    // Same capture index as blame_file: per-file patch-id → who captured it.
+    let events = store.read_all_events()?;
+    let diff_events = collect_diff_events(&events, rel_path);
+    let mut patch_to_attr: HashMap<String, Attribution> = HashMap::new();
+    for (event, payload) in &diff_events {
+        let attr = attribution_of(event, payload);
+        for change in payload
+            .file_changes
+            .iter()
+            .filter(|change| change.path == rel_path)
+        {
+            if let Some(patch_id) = change.patch_id.clone() {
+                patch_to_attr.insert(patch_id, attr);
+                break;
+            }
+        }
+    }
+
+    let commits = git_log_line_range_commits(repo_root, rel_path, line_start, line_end)?;
+    let mut touches = Vec::with_capacity(commits.len());
+    for commit in commits {
+        let mut touch = SessionTouch {
+            commit: commit.sha.clone(),
+            subject: commit.subject,
+            committed_at: commit.committed_at,
+            session_id: None,
+            actor_type: None,
+            actor_id: None,
+            mission_id: None,
+            occurred_at: None,
+            source_event_id: None,
+            attributed: false,
+        };
+        if let Some(patch_id) = commit_file_patch_id(repo_root, &commit.sha, rel_path) {
+            if let Some(attr) = patch_to_attr.get(&patch_id) {
+                touch.session_id = attr.session_id.clone();
+                touch.actor_type = Some(attr.actor_type.clone());
+                touch.actor_id = Some(attr.actor_id.clone());
+                touch.mission_id = attr.mission_id.clone();
+                touch.occurred_at = Some(attr.occurred_at.clone());
+                touch.source_event_id = Some(attr.event_id.clone());
+                touch.attributed = true;
+            }
+        }
+        touches.push(touch);
+    }
+    Ok(touches)
+}
+
+/// A commit reported by `git log -L`, with its subject and author date.
+struct RangeCommit {
+    sha: String,
+    subject: Option<String>,
+    committed_at: Option<String>,
+}
+
+/// Walks the history of a line range with
+/// `git log -L <start>,<end>:<file> --no-patch`, returning the commits that
+/// touched it newest-first. `-L` follows the range across edits and renames, so
+/// this is the complete change history of those lines (what `git blame`, which
+/// only reports the last touch, cannot give). Output is delimited per commit by a
+/// `%x1f`-separated `sha<US>subject<US>iso-date` line.
+fn git_log_line_range_commits(
+    repo_root: &Path,
+    rel_path: &str,
+    line_start: u64,
+    line_end: u64,
+) -> Result<Vec<RangeCommit>> {
+    let range = format!("{line_start},{line_end}:{rel_path}");
+    let output = Command::new("git")
+        .arg("log")
+        .arg("-L")
+        .arg(&range)
+        .arg("--no-patch")
+        .arg("--format=%H%x1f%s%x1f%cI")
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git log -L")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git log -L failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut commits = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split('\u{1f}');
+        let Some(sha) = fields.next() else { continue };
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let subject = fields.next().map(str::to_string).filter(|s| !s.is_empty());
+        let committed_at = fields.next().map(str::to_string).filter(|s| !s.is_empty());
+        commits.push(RangeCommit {
+            sha: sha.to_string(),
+            subject,
+            committed_at,
+        });
+    }
+    Ok(commits)
 }
 
 /// True for git's all-zero "not yet committed" boundary SHA.

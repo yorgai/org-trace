@@ -275,6 +275,9 @@ fn claim_scopes(m: &mut Mcp) -> Vec<String> {
 #[test]
 fn mcp_capability_kit_end_to_end() {
     let (root, home, repo, codex_dir, claude_dir) = setup_world("e2e");
+    // This kit exercises gated planning/blame tools too, so seed a login (no-op
+    // in the open build). The free/gated boundary is asserted in dedicated tests.
+    write_fake_login(&home);
     let file_codex = "src/commands_git.rs";
     let file_claude = "src/commands_memory.rs";
     write_codex(&codex_dir, "codex-live-001", &repo, file_codex);
@@ -608,6 +611,7 @@ fn blame_file_attributes_changed_lines_to_agent_session() {
     assert!(git(&repo, &["commit", "-qm", "init"]).success());
 
     brick(&home, &repo, &["init"]);
+    write_fake_login(&home);
     let org = extract(
         &brick(&home, &repo, &["org", "create", "BlameOrg"]),
         "org_id",
@@ -782,6 +786,29 @@ fn git(repo: &Path, args: &[&str]) -> std::process::ExitStatus {
         .expect("run git")
 }
 
+/// Writes a valid, non-expired login session into `$BRICK_HOME/identity.json`
+/// so the proprietary `sync` build's soft gate lets blame/planning tools run.
+/// The shape mirrors `brick_sync::identity::Identity`. No-op in the open build.
+fn write_fake_login(home: &Path) {
+    let far_future =
+        (Utc::now() + chrono::Duration::days(3650)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let body = serde_json::json!({
+        "user_id": "test-user",
+        "email": "tester@example.com",
+        "access_token": "test-access",
+        "refresh_token": "test-refresh",
+        "expires_at": far_future,
+    });
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(home.join("identity.json"), body.to_string()).unwrap();
+}
+
+/// Removes the login session so the soft gate denies gated tools.
+#[cfg_attr(not(feature = "sync"), allow(dead_code))]
+fn remove_login(home: &Path) {
+    let _ = std::fs::remove_file(home.join("identity.json"));
+}
+
 /// Bootstraps a git repo + brick home + an active agent mission/session/artifact
 /// for blame tests. Returns `(root, home, repo, session, mission, artifact)`.
 fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
@@ -799,6 +826,11 @@ fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
     assert!(git(&repo, &["commit", "-qm", "init"]).success());
 
     brick(&home, &repo, &["init"]);
+    // Under the proprietary `sync` build, line-level blame is gated behind a
+    // login. Existing blame scenarios assert attribution, not the gate, so seed
+    // a valid login here; the dedicated gate test below removes it to assert the
+    // denial. No-op in the open-source build (no login concept).
+    write_fake_login(&home);
     let org = extract(&brick(&home, &repo, &["org", "create", "O"]), "org_id").expect("org");
     let project = extract(
         &brick(&home, &repo, &["project", "create", "--org", &org, "P"]),
@@ -919,6 +951,16 @@ impl BlameWorld {
     fn blame(&self, path: &str) -> Value {
         let mut m = Mcp::spawn(&self.home, &self.repo);
         let v = m.call("blame_file", json!({ "path": path }));
+        drop(m);
+        v
+    }
+
+    fn blame_history(&self, path: &str, line_start: u64, line_end: u64) -> Value {
+        let mut m = Mcp::spawn(&self.home, &self.repo);
+        let v = m.call(
+            "blame_history",
+            json!({ "path": path, "line_start": line_start, "line_end": line_end }),
+        );
         drop(m);
         v
     }
@@ -1074,5 +1116,151 @@ fn blame_attributes_each_file_in_a_multi_file_commit() {
         "b.rs L2: {blame_b}"
     );
     assert_eq!(blame_b["owner_lines"], json!(1), "b.rs: {blame_b}");
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// blame_history lists the FULL change history of a line range, not just the last
+/// touch. Two AI-captured commits modify the same line in sequence; the history
+/// must return BOTH commits (newest first), both attributed to the agent — the
+/// thing blame_file (last-commit-only) cannot do.
+#[test]
+fn blame_history_lists_all_sessions_for_a_line_range() {
+    let w = blame_world(
+        "blame-history",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+
+    // Capture #1: agent changes line 2, commit.
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 10;\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "A: x = 10"]).success());
+
+    // Capture #2: agent changes the SAME line again, commit.
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 20;\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "B: x = 20"]).success());
+
+    let hist = w.blame_history("src/main.rs", 2, 2);
+    let commits = hist["history"].as_array().expect("history array");
+    // Both commits that touched line 2 must be present (full history, not just
+    // the last one), newest-first.
+    assert!(
+        commits.len() >= 2,
+        "expected >=2 commits in line history: {hist}"
+    );
+    assert_eq!(
+        commits[0]["subject"].as_str(),
+        Some("B: x = 20"),
+        "newest commit first: {hist}"
+    );
+    assert_eq!(
+        commits[1]["subject"].as_str(),
+        Some("A: x = 10"),
+        "older commit second: {hist}"
+    );
+    // Both are owner-attributed to the capturing agent.
+    for (i, c) in commits.iter().take(2).enumerate() {
+        assert_eq!(
+            c["actor_id"].as_str(),
+            Some("codex-bot"),
+            "commit {i} actor: {hist}"
+        );
+        assert_eq!(
+            c["attributed"],
+            json!(true),
+            "commit {i} attributed: {hist}"
+        );
+    }
+    assert!(
+        hist["attributed_commits"].as_u64().unwrap() >= 2,
+        "attributed_commits >= 2: {hist}"
+    );
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// Free layer must never be gated: with NO login present, the file-level recall
+/// and live-awareness tools all return normal payloads (no `login_required`).
+/// `setup_world` never writes an identity, so this exercises the unauthenticated
+/// path directly. Locks the free/registered boundary so a future gate widening
+/// can't accidentally wall off the free tools.
+#[test]
+fn free_tools_work_without_login() {
+    let (root, home, repo, codex_dir, claude_dir) = setup_world("free-no-login");
+    write_codex(&codex_dir, "codex-live-free", &repo, "src/commands_git.rs");
+    write_claude(
+        &claude_dir,
+        "claude-done-free",
+        &repo,
+        "src/commands_memory.rs",
+    );
+    // Be explicit: no identity file exists in this world.
+    remove_login(&home);
+
+    let mut m = Mcp::spawn(&home, &repo);
+    for (tool, args) in [
+        ("recall_file", json!({ "path": "src/commands_git.rs" })),
+        (
+            "explore_memory",
+            json!({ "question": "git status caching" }),
+        ),
+        ("search_sessions", json!({ "query": "cache" })),
+        ("live_sessions", json!({})),
+        ("list_announcements", json!({})),
+    ] {
+        let resp = m.call(tool, args);
+        assert!(
+            resp.get("error").and_then(Value::as_str) != Some("login_required"),
+            "free tool {tool} was gated: {resp}"
+        );
+    }
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Soft gate (proprietary `sync` build only): line-level blame is denied without
+/// a login and allowed once a valid session exists. Proves the registered layer
+/// is actually walled in the official binary.
+#[cfg(feature = "sync")]
+#[test]
+fn line_blame_requires_login_under_sync() {
+    let w = blame_world(
+        "blame-gate",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    // blame_world seeded a login; remove it to assert the denial.
+    remove_login(&w.home);
+    let denied = {
+        let mut m = Mcp::spawn(&w.home, &w.repo);
+        let v = m.call("blame_file", json!({ "path": "src/main.rs" }));
+        drop(m);
+        v
+    };
+    assert_eq!(
+        denied.get("error").and_then(Value::as_str),
+        Some("login_required"),
+        "blame_file must be gated without login: {denied}"
+    );
+
+    // Restore the login → the same call now succeeds.
+    write_fake_login(&w.home);
+    let allowed = w.blame("src/main.rs");
+    assert!(
+        allowed.get("error").is_none(),
+        "blame_file must succeed once logged in: {allowed}"
+    );
+    assert!(
+        allowed.get("lines").is_some() || allowed.get("owner_lines").is_some(),
+        "logged-in blame returns a payload: {allowed}"
+    );
     let _ = std::fs::remove_dir_all(&w.root);
 }

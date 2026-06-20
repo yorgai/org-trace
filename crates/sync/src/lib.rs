@@ -11,12 +11,14 @@
 //! of truth after a successful remote append. Pull stores remote events in a
 //! separate inbound log and deduplicates by event ID before writing.
 
+pub mod identity;
 pub mod wire;
 
 use anyhow::{Context, Result};
 use brick_core::LocalStore;
 use brick_protocol::TraceEvent;
 
+pub use identity::{is_logged_in, Identity};
 pub use wire::{EventCursor, ListEventsResponse, PushEventsRequest, PushEventsResponse};
 
 const DEFAULT_REMOTE: &str = "http://127.0.0.1:7821";

@@ -18,6 +18,8 @@ use dialoguer::{Confirm, Input, MultiSelect};
 mod agent;
 mod announce;
 mod args;
+#[cfg(feature = "sync")]
+mod auth;
 mod claude_hook;
 mod commands;
 mod context;
@@ -58,6 +60,15 @@ fn main() -> Result<()> {
     if let Command::Version { format } = &cli.command {
         history::print_version(*format)?;
         return Ok(());
+    }
+    // Account commands don't need a repo, so handle them before repo discovery
+    // (which would fail outside a git working tree).
+    #[cfg(feature = "sync")]
+    match &cli.command {
+        Command::Login { email } => return auth::handle_login(email.clone()),
+        Command::Logout => return auth::handle_logout(),
+        Command::Whoami => return auth::handle_whoami(),
+        _ => {}
     }
     let work_dir = std::env::current_dir().context("failed to read current directory")?;
     let repo_root = discover_repo_root(&work_dir)?;
@@ -219,6 +230,10 @@ fn main() -> Result<()> {
                 handle_pull(&store, args.dry_run, args.remote, args.repo_id)?
             }
         },
+        #[cfg(feature = "sync")]
+        Command::Login { .. } | Command::Logout | Command::Whoami => {
+            unreachable!("account commands handled before repo discovery")
+        }
         Command::Maintenance { command } => match command {
             MaintenanceCommand::Status => print_status(&store, &repo_root, &work_dir)?,
             MaintenanceCommand::Log { limit } => print_log(&store, limit)?,
@@ -239,6 +254,13 @@ fn handle_blame(
     line_end: Option<usize>,
     format: args::HistoryFormatArg,
 ) -> Result<()> {
+    // Soft login gate: line-level blame requires a Brick account. Only enforced
+    // in the proprietary `sync` build; the open-source binary has no login
+    // concept and runs unguarded (registration hook, not a security boundary).
+    #[cfg(feature = "sync")]
+    if !brick_sync::is_logged_in() {
+        anyhow::bail!("line-level blame needs a Brick account. Run `brick login` first.");
+    }
     history::ensure_json(format);
     let cwd = std::env::current_dir()?;
     let repo_root = discover_repo_root(&cwd)?;

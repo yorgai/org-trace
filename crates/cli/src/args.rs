@@ -132,6 +132,20 @@ pub enum Command {
         #[command(subcommand)]
         command: SyncCommand,
     },
+    /// Log in to your Brick account (email one-time code). Required for
+    /// line-level blame and planning tools.
+    #[cfg(feature = "sync")]
+    Login {
+        /// Email address to receive the one-time code. Prompted if omitted.
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Log out, removing the local login session.
+    #[cfg(feature = "sync")]
+    Logout,
+    /// Show the currently logged-in account.
+    #[cfg(feature = "sync")]
+    Whoami,
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,

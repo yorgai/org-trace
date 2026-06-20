@@ -15,8 +15,8 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    blame_file, discover_repo_root, list_source_sessions, AnnouncementStore, ClaimValidity,
-    LocalStore, NewAnnouncement, SourceProfileStore,
+    blame_file, blame_line_range_history, discover_repo_root, list_source_sessions,
+    AnnouncementStore, ClaimValidity, LocalStore, NewAnnouncement, SourceProfileStore,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -193,6 +193,35 @@ fn tools_list_result() -> Value {
                         }
                     },
                     "required": ["path"]
+                }
+            },
+            {
+                "name": "blame_history",
+                "description": "Full change history of a line range: every commit \
+    that touched lines [line_start, line_end] of a file (newest first), each \
+    tagged with the AI session that produced it when this machine's local history \
+    can attribute it. Unlike blame_file (which only resolves the single LAST \
+    commit per line), this lists ALL the sessions that ever changed this code. \
+    Commits not in local records (others' commits, hand edits, or \
+    squash/rebase-rewritten history) are listed with attributed=false, not \
+    guessed. Use it to trace how a specific block of code evolved across sessions.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repo-relative file path."
+                        },
+                        "line_start": {
+                            "type": "integer",
+                            "description": "1-based first line of the range (required)."
+                        },
+                        "line_end": {
+                            "type": "integer",
+                            "description": "1-based last line of the range (required)."
+                        }
+                    },
+                    "required": ["path", "line_start", "line_end"]
                 }
             },
             {
@@ -463,6 +492,40 @@ fn tools_list_result() -> Value {
     })
 }
 
+/// Tools that require a Brick account (soft login gate). Line-level blame and
+/// planning/artifact tools are gated; file-level recall and live-awareness are
+/// free. Defined unconditionally so the tool set is identical across builds —
+/// only the *enforcement* (`login_required_error`) is feature-gated.
+fn tool_requires_login(name: &str) -> bool {
+    matches!(
+        name,
+        "blame_file" | "blame_history" | "manage_mission" | "record_artifact" | "attach_evidence"
+    )
+}
+
+/// Returns a structured `login_required` error payload when a gated tool is
+/// called without a valid login, or `None` to allow the call.
+///
+/// In the proprietary `sync` build this consults `brick_sync::identity`. In the
+/// open-source build there is no login concept, so it always allows (returns
+/// `None`) — the gate is a no-op and the tool runs unguarded.
+#[cfg(feature = "sync")]
+fn login_required_error(name: &str) -> Option<Value> {
+    if brick_sync::is_logged_in() {
+        return None;
+    }
+    Some(json!({
+        "error": "login_required",
+        "tool": name,
+        "hint": "This tool needs a Brick account. Run `brick login` first.",
+    }))
+}
+
+#[cfg(not(feature = "sync"))]
+fn login_required_error(_name: &str) -> Option<Value> {
+    None
+}
+
 fn handle_tool_call(
     profiles: &SourceProfileStore,
     store: &LocalStore,
@@ -478,360 +541,390 @@ fn handle_tool_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let payload = match name {
-        "explore_memory" => {
-            let question = str_arg(&args, "question")?;
-            let query = build_query_response(profiles, &question, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-            explore_summary(&question, &query)
-        }
-        "recall_file" => {
-            let path = str_arg(&args, "path")?;
-            let recall =
-                build_recall_response(store, profiles, &path, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-            let mut value = serde_json::to_value(recall)?;
-            // MCP-ONLY enrichment (not produced by the CLI `metadata recall`):
-            // the MCP surface adds real-time coordination signals on top of the
-            // shared recall payload. Tiered live-awareness — if another running
-            // session collides with this file or its work scope, attach a
-            // broadcast so the agent can avoid a cross-session edit conflict.
-            // Silent when there is no overlap. This asymmetry is deliberate: it
-            // is a coordination capability that only makes sense for a live agent,
-            // so it lives on the MCP path, not in the CLI's batch output.
-            if let Ok(all_profiles) = profiles.list_profiles() {
-                if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
-                    if let Value::Object(map) = &mut value {
-                        map.insert(
-                            "live_broadcast".to_string(),
-                            serde_json::to_value(broadcast)?,
-                        );
-                    }
-                }
+    // Soft login gate: line-level blame and planning tools require a Brick
+    // account. Free tools (file-level recall + live-awareness) are never gated.
+    // The gate is only compiled into the proprietary `sync` build; the
+    // open-source binary has no login concept and never blocks. See
+    // `brick_sync::identity` for why this is a registration hook, not a security
+    // boundary. The denial flows through the same content wrapper below so the
+    // client still receives a well-formed tool result.
+    let gate_denial = if tool_requires_login(name) {
+        login_required_error(name)
+    } else {
+        None
+    };
+    let payload = if let Some(denial) = gate_denial {
+        denial
+    } else {
+        match name {
+            "explore_memory" => {
+                let question = str_arg(&args, "question")?;
+                let query =
+                    build_query_response(profiles, &question, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
+                explore_summary(&question, &query)
             }
-            // Bulletin-board claims: another session may have explicitly asked
-            // others to hold off this file/area. Surface those notes directly,
-            // dropping any whose owning session has already ended.
-            if let Ok(announce_store) = AnnouncementStore::open_global() {
-                let validity = build_claim_validity(profiles);
-                if let Ok(claims) = announce_store.matching_live(&path, validity) {
-                    if !claims.is_empty() {
+            "recall_file" => {
+                let path = str_arg(&args, "path")?;
+                let recall =
+                    build_recall_response(store, profiles, &path, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
+                let mut value = serde_json::to_value(recall)?;
+                // MCP-ONLY enrichment (not produced by the CLI `metadata recall`):
+                // the MCP surface adds real-time coordination signals on top of the
+                // shared recall payload. Tiered live-awareness — if another running
+                // session collides with this file or its work scope, attach a
+                // broadcast so the agent can avoid a cross-session edit conflict.
+                // Silent when there is no overlap. This asymmetry is deliberate: it
+                // is a coordination capability that only makes sense for a live agent,
+                // so it lives on the MCP path, not in the CLI's batch output.
+                if let Ok(all_profiles) = profiles.list_profiles() {
+                    if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
                         if let Value::Object(map) = &mut value {
                             map.insert(
-                                "active_claims".to_string(),
-                                json!({
-                                    "count": claims.len(),
-                                    "message": "Another session posted a heads-up covering \
-                                this path. Review before editing.",
-                                    "claims": claims,
-                                }),
+                                "live_broadcast".to_string(),
+                                serde_json::to_value(broadcast)?,
                             );
                         }
                     }
                 }
-            }
-            value
-        }
-        "search_sessions" => {
-            let query = str_arg(&args, "query")?;
-            let response = build_query_response(profiles, &query, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-            serde_json::to_value(response)?
-        }
-        "blame_file" => {
-            let path = str_arg(&args, "path")?;
-            let line_start = usize_arg(&args, "line_start");
-            let line_end = usize_arg(&args, "line_end");
-            let include_unattributed = args
-                .get("include_unattributed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            blame_response(store, &path, line_start, line_end, include_unattributed)?
-        }
-        "read_session" => {
-            let source = str_arg(&args, "source")?;
-            let session_id = str_arg(&args, "session_id")?;
-            let offset = usize_arg(&args, "offset").unwrap_or(0);
-            let limit = usize_arg(&args, "limit").unwrap_or(50);
-            let max_field_bytes =
-                usize_arg(&args, "max_field_bytes").unwrap_or(DEFAULT_MAX_FIELD_BYTES);
-            let profile = read_profile(profiles, &source)?;
-            let response = build_chunks_response(
-                &profile,
-                &source,
-                &session_id,
-                limit,
-                offset,
-                max_field_bytes,
-            )?;
-            serde_json::to_value(response)?
-        }
-        "live_sessions" => {
-            let scope = args.get("scope").and_then(Value::as_str);
-            let all_profiles = profiles.list_profiles()?;
-            let live = collect_live_sessions(&all_profiles, 0, 50);
-            let rows: Vec<Value> = live
-                .iter()
-                .filter(|session| match scope {
-                    Some(prefix) => brick_core::work_scope(session)
-                        .map(|path| path.starts_with(prefix))
-                        .unwrap_or(false),
-                    None => true,
-                })
-                .map(|session| serde_json::to_value(live_session_row(session)))
-                .collect::<std::result::Result<_, _>>()?;
-            json!({
-                "count": rows.len(),
-                "sessions": rows,
-                "note": "These sessions appear to be running now. Avoid editing files \
-            they recently touched; call read_session to see what one is doing."
-            })
-        }
-        "announce_work" => {
-            let scope = str_arg(&args, "scope")?;
-            let message = str_arg(&args, "message")?;
-            let session_id = args
-                .get("session_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("mcp-session")
-                .to_string();
-            let source_id = args
-                .get("source")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("mcp")
-                .to_string();
-            let ttl =
-                usize_arg(&args, "ttl_minutes").map(|minutes| Duration::minutes(minutes as i64));
-            let work_dir = std::env::current_dir()
-                .ok()
-                .map(|path| path.display().to_string());
-            let announce_store = AnnouncementStore::open_global()?;
-            let announcement = announce_store.publish(NewAnnouncement {
-                source_id,
-                session_id,
-                scope,
-                message,
-                work_dir,
-                ttl,
-            })?;
-            json!({
-                "published": announcement,
-                "note": "Heads-up posted. Other sessions calling recall_file on a \
-            matching path will see it. It auto-expires; no need to clear it manually."
-            })
-        }
-        "list_announcements" => {
-            let announce_store = AnnouncementStore::open_global()?;
-            let validity = build_claim_validity(profiles);
-            let claims = match args.get("path").and_then(Value::as_str) {
-                Some(path) if !path.is_empty() => announce_store.matching_live(path, validity)?,
-                _ => announce_store.list_live(validity)?,
-            };
-            json!({ "count": claims.len(), "announcements": claims })
-        }
-        "current_context" => {
-            // Load-or-rebuild: the staleness check rebuilds only when the queue
-            // grew since the cache was written (e.g. events just appended by
-            // other MCP calls), so back-to-back reads in one flow don't each pay
-            // a full rebuild + disk rewrite.
-            let index = store.load_or_rebuild_index()?;
-            let context = store.read_current_context().ok().flatten();
-            let current_mission = context
-                .as_ref()
-                .and_then(|ctx| ctx.mission_id.as_ref())
-                .and_then(|id| index.missions.get(id.as_str()));
-            json!({
-                "current": context,
-                "current_mission": current_mission,
-                "counts": {
-                    "orgs": index.orgs.len(),
-                    "projects": index.projects.len(),
-                    "missions": index.missions.len(),
-                    "sessions": index.sessions.len(),
-                    "artifacts": index.artifacts.len(),
-                },
-                "note": "Use list_missions to see in-flight work, manage_mission to \
-            open or update a goal, and record_artifact to log deliverables."
-            })
-        }
-        "list_missions" => {
-            let index = store.load_or_rebuild_index()?;
-            let status_filter = args
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|raw| raw.trim().to_lowercase());
-            let project_filter = args
-                .get("project")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty());
-            let limit = usize_arg(&args, "limit").unwrap_or(50);
-            let mut missions: Vec<_> = index
-                .missions
-                .values()
-                .filter(|mission| match &status_filter {
-                    Some(status) => mission_status_str(mission.status) == status,
-                    None => true,
-                })
-                .filter(|mission| match project_filter {
-                    Some(project) => mission.project_id.as_deref() == Some(project),
-                    None => true,
-                })
-                .collect();
-            // Newest activity first so "what's in flight" surfaces at the top.
-            missions.sort_by_key(|mission| std::cmp::Reverse(mission.last_event_at));
-            missions.truncate(limit);
-            json!({ "count": missions.len(), "missions": missions })
-        }
-        "show_mission" => {
-            let mission = str_arg(&args, "mission")?;
-            let index = store.load_or_rebuild_index()?;
-            let item = index
-                .missions
-                .get(&mission)
-                .ok_or_else(|| anyhow::anyhow!("mission not found: {mission}"))?;
-            serde_json::to_value(item)?
-        }
-        "manage_mission" => {
-            let action = str_arg(&args, "action")?;
-            let actor = mcp_actor(&args);
-            match action.as_str() {
-                "create" => {
-                    let project = str_arg(&args, "project")?;
-                    let title = str_arg(&args, "title")?;
-                    let project_id = ProjectId::from_str(&project)
-                        .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?;
-                    let mission_id = MissionId::new();
-                    let event = TraceEvent::mission_created(
-                        actor,
-                        mission_id.clone(),
-                        MissionCreatedPayload {
-                            project_id,
-                            title,
-                            description: opt_str_arg(&args, "description"),
-                            status: mission_status_from_str(
-                                args.get("status").and_then(Value::as_str),
-                            )?,
-                            repo_context_id: None,
-                        },
-                    )?;
-                    store.append_event(&event)?;
-                    json!({
-                        "created": true,
-                        "mission_id": mission_id.to_string(),
-                        "note": "Mission opened. Record deliverables against it with \
-                    record_artifact, and update its status with manage_mission action='update'."
-                    })
+                // Bulletin-board claims: another session may have explicitly asked
+                // others to hold off this file/area. Surface those notes directly,
+                // dropping any whose owning session has already ended.
+                if let Ok(announce_store) = AnnouncementStore::open_global() {
+                    let validity = build_claim_validity(profiles);
+                    if let Ok(claims) = announce_store.matching_live(&path, validity) {
+                        if !claims.is_empty() {
+                            if let Value::Object(map) = &mut value {
+                                map.insert(
+                                    "active_claims".to_string(),
+                                    json!({
+                                        "count": claims.len(),
+                                        "message": "Another session posted a heads-up covering \
+                                    this path. Review before editing.",
+                                        "claims": claims,
+                                    }),
+                                );
+                            }
+                        }
+                    }
                 }
-                "update" => {
-                    let mission = str_arg(&args, "mission")?;
-                    let mission_id = MissionId::from_str(&mission)
-                        .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?;
-                    let project_id = match args.get("project").and_then(Value::as_str) {
-                        Some(project) if !project.is_empty() => Some(
-                            ProjectId::from_str(project)
-                                .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?,
-                        ),
-                        _ => None,
-                    };
-                    let title = opt_str_arg(&args, "title");
-                    let description = opt_str_arg(&args, "description");
-                    let status = match args.get("status").and_then(Value::as_str) {
-                        Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
-                        _ => None,
-                    };
-                    if project_id.is_none()
-                        && title.is_none()
-                        && description.is_none()
-                        && status.is_none()
-                    {
-                        return Err(anyhow::anyhow!(
+                value
+            }
+            "search_sessions" => {
+                let query = str_arg(&args, "query")?;
+                let response =
+                    build_query_response(profiles, &query, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
+                serde_json::to_value(response)?
+            }
+            "blame_file" => {
+                let path = str_arg(&args, "path")?;
+                let line_start = usize_arg(&args, "line_start");
+                let line_end = usize_arg(&args, "line_end");
+                let include_unattributed = args
+                    .get("include_unattributed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                blame_response(store, &path, line_start, line_end, include_unattributed)?
+            }
+            "blame_history" => {
+                let path = str_arg(&args, "path")?;
+                let line_start = usize_arg(&args, "line_start")
+                    .ok_or_else(|| anyhow::anyhow!("blame_history requires line_start"))?;
+                let line_end = usize_arg(&args, "line_end")
+                    .ok_or_else(|| anyhow::anyhow!("blame_history requires line_end"))?;
+                blame_history_response(store, &path, line_start as u64, line_end as u64)?
+            }
+            "read_session" => {
+                let source = str_arg(&args, "source")?;
+                let session_id = str_arg(&args, "session_id")?;
+                let offset = usize_arg(&args, "offset").unwrap_or(0);
+                let limit = usize_arg(&args, "limit").unwrap_or(50);
+                let max_field_bytes =
+                    usize_arg(&args, "max_field_bytes").unwrap_or(DEFAULT_MAX_FIELD_BYTES);
+                let profile = read_profile(profiles, &source)?;
+                let response = build_chunks_response(
+                    &profile,
+                    &source,
+                    &session_id,
+                    limit,
+                    offset,
+                    max_field_bytes,
+                )?;
+                serde_json::to_value(response)?
+            }
+            "live_sessions" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let all_profiles = profiles.list_profiles()?;
+                let live = collect_live_sessions(&all_profiles, 0, 50);
+                let rows: Vec<Value> = live
+                    .iter()
+                    .filter(|session| match scope {
+                        Some(prefix) => brick_core::work_scope(session)
+                            .map(|path| path.starts_with(prefix))
+                            .unwrap_or(false),
+                        None => true,
+                    })
+                    .map(|session| serde_json::to_value(live_session_row(session)))
+                    .collect::<std::result::Result<_, _>>()?;
+                json!({
+                    "count": rows.len(),
+                    "sessions": rows,
+                    "note": "These sessions appear to be running now. Avoid editing files \
+                they recently touched; call read_session to see what one is doing."
+                })
+            }
+            "announce_work" => {
+                let scope = str_arg(&args, "scope")?;
+                let message = str_arg(&args, "message")?;
+                let session_id = args
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("mcp-session")
+                    .to_string();
+                let source_id = args
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("mcp")
+                    .to_string();
+                let ttl = usize_arg(&args, "ttl_minutes")
+                    .map(|minutes| Duration::minutes(minutes as i64));
+                let work_dir = std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string());
+                let announce_store = AnnouncementStore::open_global()?;
+                let announcement = announce_store.publish(NewAnnouncement {
+                    source_id,
+                    session_id,
+                    scope,
+                    message,
+                    work_dir,
+                    ttl,
+                })?;
+                json!({
+                    "published": announcement,
+                    "note": "Heads-up posted. Other sessions calling recall_file on a \
+                matching path will see it. It auto-expires; no need to clear it manually."
+                })
+            }
+            "list_announcements" => {
+                let announce_store = AnnouncementStore::open_global()?;
+                let validity = build_claim_validity(profiles);
+                let claims = match args.get("path").and_then(Value::as_str) {
+                    Some(path) if !path.is_empty() => {
+                        announce_store.matching_live(path, validity)?
+                    }
+                    _ => announce_store.list_live(validity)?,
+                };
+                json!({ "count": claims.len(), "announcements": claims })
+            }
+            "current_context" => {
+                // Load-or-rebuild: the staleness check rebuilds only when the queue
+                // grew since the cache was written (e.g. events just appended by
+                // other MCP calls), so back-to-back reads in one flow don't each pay
+                // a full rebuild + disk rewrite.
+                let index = store.load_or_rebuild_index()?;
+                let context = store.read_current_context().ok().flatten();
+                let current_mission = context
+                    .as_ref()
+                    .and_then(|ctx| ctx.mission_id.as_ref())
+                    .and_then(|id| index.missions.get(id.as_str()));
+                json!({
+                    "current": context,
+                    "current_mission": current_mission,
+                    "counts": {
+                        "orgs": index.orgs.len(),
+                        "projects": index.projects.len(),
+                        "missions": index.missions.len(),
+                        "sessions": index.sessions.len(),
+                        "artifacts": index.artifacts.len(),
+                    },
+                    "note": "Use list_missions to see in-flight work, manage_mission to \
+                open or update a goal, and record_artifact to log deliverables."
+                })
+            }
+            "list_missions" => {
+                let index = store.load_or_rebuild_index()?;
+                let status_filter = args
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(|raw| raw.trim().to_lowercase());
+                let project_filter = args
+                    .get("project")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let limit = usize_arg(&args, "limit").unwrap_or(50);
+                let mut missions: Vec<_> = index
+                    .missions
+                    .values()
+                    .filter(|mission| match &status_filter {
+                        Some(status) => mission_status_str(mission.status) == status,
+                        None => true,
+                    })
+                    .filter(|mission| match project_filter {
+                        Some(project) => mission.project_id.as_deref() == Some(project),
+                        None => true,
+                    })
+                    .collect();
+                // Newest activity first so "what's in flight" surfaces at the top.
+                missions.sort_by_key(|mission| std::cmp::Reverse(mission.last_event_at));
+                missions.truncate(limit);
+                json!({ "count": missions.len(), "missions": missions })
+            }
+            "show_mission" => {
+                let mission = str_arg(&args, "mission")?;
+                let index = store.load_or_rebuild_index()?;
+                let item = index
+                    .missions
+                    .get(&mission)
+                    .ok_or_else(|| anyhow::anyhow!("mission not found: {mission}"))?;
+                serde_json::to_value(item)?
+            }
+            "manage_mission" => {
+                let action = str_arg(&args, "action")?;
+                let actor = mcp_actor(&args);
+                match action.as_str() {
+                    "create" => {
+                        let project = str_arg(&args, "project")?;
+                        let title = str_arg(&args, "title")?;
+                        let project_id = ProjectId::from_str(&project)
+                            .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?;
+                        let mission_id = MissionId::new();
+                        let event = TraceEvent::mission_created(
+                            actor,
+                            mission_id.clone(),
+                            MissionCreatedPayload {
+                                project_id,
+                                title,
+                                description: opt_str_arg(&args, "description"),
+                                status: mission_status_from_str(
+                                    args.get("status").and_then(Value::as_str),
+                                )?,
+                                repo_context_id: None,
+                            },
+                        )?;
+                        store.append_event(&event)?;
+                        json!({
+                            "created": true,
+                            "mission_id": mission_id.to_string(),
+                            "note": "Mission opened. Record deliverables against it with \
+                        record_artifact, and update its status with manage_mission action='update'."
+                        })
+                    }
+                    "update" => {
+                        let mission = str_arg(&args, "mission")?;
+                        let mission_id = MissionId::from_str(&mission)
+                            .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?;
+                        let project_id = match args.get("project").and_then(Value::as_str) {
+                            Some(project) if !project.is_empty() => Some(
+                                ProjectId::from_str(project)
+                                    .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?,
+                            ),
+                            _ => None,
+                        };
+                        let title = opt_str_arg(&args, "title");
+                        let description = opt_str_arg(&args, "description");
+                        let status = match args.get("status").and_then(Value::as_str) {
+                            Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
+                            _ => None,
+                        };
+                        if project_id.is_none()
+                            && title.is_none()
+                            && description.is_none()
+                            && status.is_none()
+                        {
+                            return Err(anyhow::anyhow!(
                             "manage_mission update needs at least one of project, title, description, or status"
                         ));
+                        }
+                        let event = TraceEvent::mission_updated(
+                            actor,
+                            mission_id.clone(),
+                            MissionUpdatedPayload {
+                                project_id,
+                                title,
+                                description,
+                                status,
+                                repo_context_id: None,
+                            },
+                        )?;
+                        store.append_event(&event)?;
+                        json!({ "updated": true, "mission_id": mission_id.to_string() })
                     }
-                    let event = TraceEvent::mission_updated(
-                        actor,
-                        mission_id.clone(),
-                        MissionUpdatedPayload {
-                            project_id,
-                            title,
-                            description,
-                            status,
-                            repo_context_id: None,
-                        },
-                    )?;
-                    store.append_event(&event)?;
-                    json!({ "updated": true, "mission_id": mission_id.to_string() })
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
+                    other => {
+                        return Err(anyhow::anyhow!(
                         "unknown manage_mission action: {other} (expected 'create' or 'update')"
                     ))
+                    }
                 }
             }
+            "record_artifact" => {
+                let title = str_arg(&args, "title")?;
+                let actor = mcp_actor(&args);
+                let mission_id = match args.get("mission").and_then(Value::as_str) {
+                    Some(mission) if !mission.is_empty() => Some(
+                        MissionId::from_str(mission)
+                            .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?,
+                    ),
+                    _ => None,
+                };
+                let session_id = match args.get("session_id").and_then(Value::as_str) {
+                    Some(session) if !session.is_empty() => Some(
+                        SessionId::from_str(session)
+                            .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
+                    ),
+                    _ => None,
+                };
+                let artifact_id = ArtifactId::new();
+                let event = TraceEvent::artifact_created(
+                    actor,
+                    artifact_id.clone(),
+                    mission_id,
+                    session_id,
+                    ArtifactCreatedPayload {
+                        artifact_kind: artifact_kind_from_str(
+                            args.get("kind").and_then(Value::as_str),
+                        ),
+                        title,
+                        body: opt_str_arg(&args, "body"),
+                        repo_context_id: None,
+                    },
+                )?;
+                store.append_event(&event)?;
+                json!({
+                    "recorded": true,
+                    "artifact_id": artifact_id.to_string(),
+                    "note": "Deliverable logged. Attach the backing files with attach_evidence."
+                })
+            }
+            "attach_evidence" => {
+                let artifact = str_arg(&args, "artifact")?;
+                let path = str_arg(&args, "path")?;
+                let actor = mcp_actor(&args);
+                let artifact_id = ArtifactId::from_str(&artifact)
+                    .map_err(|err| anyhow::anyhow!("invalid artifact id: {err}"))?;
+                let session_id = match args.get("session_id").and_then(Value::as_str) {
+                    Some(session) if !session.is_empty() => Some(
+                        SessionId::from_str(session)
+                            .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
+                    ),
+                    _ => None,
+                };
+                let event = TraceEvent::artifact_file_ref_recorded(
+                    actor,
+                    artifact_id.clone(),
+                    session_id,
+                    ArtifactFileRefRecordedPayload {
+                        file_ref_id: FileRefId::new(),
+                        path,
+                        repo_context_id: None,
+                    },
+                )?;
+                store.append_event(&event)?;
+                json!({ "attached": true, "artifact_id": artifact_id.to_string() })
+            }
+            other => return Err(anyhow::anyhow!("unknown tool: {other}")),
         }
-        "record_artifact" => {
-            let title = str_arg(&args, "title")?;
-            let actor = mcp_actor(&args);
-            let mission_id = match args.get("mission").and_then(Value::as_str) {
-                Some(mission) if !mission.is_empty() => Some(
-                    MissionId::from_str(mission)
-                        .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?,
-                ),
-                _ => None,
-            };
-            let session_id = match args.get("session_id").and_then(Value::as_str) {
-                Some(session) if !session.is_empty() => Some(
-                    SessionId::from_str(session)
-                        .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
-                ),
-                _ => None,
-            };
-            let artifact_id = ArtifactId::new();
-            let event = TraceEvent::artifact_created(
-                actor,
-                artifact_id.clone(),
-                mission_id,
-                session_id,
-                ArtifactCreatedPayload {
-                    artifact_kind: artifact_kind_from_str(args.get("kind").and_then(Value::as_str)),
-                    title,
-                    body: opt_str_arg(&args, "body"),
-                    repo_context_id: None,
-                },
-            )?;
-            store.append_event(&event)?;
-            json!({
-                "recorded": true,
-                "artifact_id": artifact_id.to_string(),
-                "note": "Deliverable logged. Attach the backing files with attach_evidence."
-            })
-        }
-        "attach_evidence" => {
-            let artifact = str_arg(&args, "artifact")?;
-            let path = str_arg(&args, "path")?;
-            let actor = mcp_actor(&args);
-            let artifact_id = ArtifactId::from_str(&artifact)
-                .map_err(|err| anyhow::anyhow!("invalid artifact id: {err}"))?;
-            let session_id = match args.get("session_id").and_then(Value::as_str) {
-                Some(session) if !session.is_empty() => Some(
-                    SessionId::from_str(session)
-                        .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
-                ),
-                _ => None,
-            };
-            let event = TraceEvent::artifact_file_ref_recorded(
-                actor,
-                artifact_id.clone(),
-                session_id,
-                ArtifactFileRefRecordedPayload {
-                    file_ref_id: FileRefId::new(),
-                    path,
-                    repo_context_id: None,
-                },
-            )?;
-            store.append_event(&event)?;
-            json!({ "attached": true, "artifact_id": artifact_id.to_string() })
-        }
-        other => return Err(anyhow::anyhow!("unknown tool: {other}")),
     };
 
     // MCP tool results wrap content blocks; we hand back the JSON as text so the
@@ -940,6 +1033,40 @@ fn blame_response(
     include_unattributed=true to see every line."
         ),
         "lines": owner_lines,
+    }))
+}
+
+/// Builds the `blame_history` tool response: the FULL change history of a line
+/// range — every commit that touched `[line_start, line_end]` (newest first),
+/// each tagged with the owner session that captured it when attributable. This is
+/// the "all the sessions that ever changed this code" view, distinct from
+/// `blame_file`, which only resolves the single last commit per line. Commits
+/// Brick cannot attribute are listed with `attributed=false`, not guessed.
+fn blame_history_response(
+    store: &LocalStore,
+    path: &str,
+    line_start: u64,
+    line_end: u64,
+) -> Result<Value> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd)?;
+    let rel_path = normalize_repo_relative(&repo_root, path);
+    let touches = blame_line_range_history(store, &repo_root, &rel_path, line_start, line_end)?;
+    let attributed = touches.iter().filter(|touch| touch.attributed).count();
+    Ok(json!({
+        "path": rel_path,
+        "line_start": line_start,
+        "line_end": line_end,
+        "commit_count": touches.len(),
+        "attributed_commits": attributed,
+        "note": format!(
+            "Full history of lines {line_start}-{line_end}: {} commit(s) touched this range, \
+    {attributed} attributable to a local AI session. Commits with attributed=false are not in \
+    local records (others' commits, hand edits, or squash/rebase-rewritten history) and are not \
+    guessed.",
+            touches.len()
+        ),
+        "history": touches,
     }))
 }
 
