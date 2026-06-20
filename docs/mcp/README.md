@@ -275,10 +275,17 @@ wipes them.
 
 ## Verifying
 
-`scripts/smoke_mcp.sh` exercises every tool above end-to-end. It clones a real
-git repo into a temp dir, configures two native source profiles (codex_app +
-claude_code) backed by real transcript files, then drives all thirteen tools
-over the real stdio JSON-RPC protocol — asserting cross-tool memory (a Codex
-session's work recalled by a Claude session), FTS5 search, the planning loop,
-and liveness-aware claim retirement. It needs `python3` (the stdio driver is
-`scripts/smoke_mcp_driver.py`) and never touches your working tree.
+Two harnesses cover the kit end to end; both spawn the real `brick mcp-serve`
+binary and speak the real stdio JSON-RPC protocol, with two native source
+profiles (codex_app + claude_code) backed by real transcript files. Each asserts
+cross-tool memory (a Codex session's work recalled by a Claude session), FTS5
+search, the planning loop, and liveness-aware claim retirement.
+
+- **`cargo test -p brick --test mcp_smoke`** — a self-contained Rust integration
+  test (`crates/cli/tests/mcp_smoke.rs`). No external dependencies; runs as part
+  of `cargo test`. Uses a temp `BRICK_HOME` and a throwaway git repo.
+- **`scripts/smoke_mcp.sh`** — a shell harness that clones a real git repo (this
+  one by default; override with `SMOKE_SRC_REPO`) and drives the same flow via a
+  `python3` stdio driver (`scripts/smoke_mcp_driver.py`).
+
+Neither touches your real Brick home or working tree.
