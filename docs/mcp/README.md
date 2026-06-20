@@ -270,3 +270,15 @@ Announcements are deliberately **not** in the rebuildable event log. They are
 authored intent with a TTL, stored in their own additive-only
 `<BRICK_HOME>/announcements.sqlite` so a schema bump to the metadata cache never
 wipes them.
+
+---
+
+## Verifying
+
+`scripts/smoke_mcp.sh` exercises every tool above end-to-end. It clones a real
+git repo into a temp dir, configures two native source profiles (codex_app +
+claude_code) backed by real transcript files, then drives all thirteen tools
+over the real stdio JSON-RPC protocol — asserting cross-tool memory (a Codex
+session's work recalled by a Claude session), FTS5 search, the planning loop,
+and liveness-aware claim retirement. It needs `python3` (the stdio driver is
+`scripts/smoke_mcp_driver.py`) and never touches your working tree.
