@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use brick_protocol::{
-    ActorRef, ActorType, ArtifactKind, DiffFileChangeKind, DiffTarget, EvidenceAvailability,
-    MissionStatus, SessionLogFormat, SessionSource,
+    ActorRef, ActorType, ArtifactKind, DiffFileChangeKind, DiffHunk, DiffTarget,
+    EvidenceAvailability, MissionStatus, SessionLogFormat, SessionSource,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -233,6 +233,15 @@ pub struct IndexedDiff {
 }
 
 /// File-level statistics associated with an indexed diff capture.
+///
+/// NOTE: `patch_id` is intentionally OMITTED here even though the source-of-truth
+/// payload (`brick_protocol::DiffFileChange`) carries it. Line-level owner blame
+/// is events-authoritative: it computes attribution by reading `patch_id`
+/// straight from the JSONL event stream (`read_all_events`), never from this
+/// derived index or the SQLite cache. Mirroring `patch_id` into the cache would
+/// invite code to "blame from the cache", which would silently break attribution
+/// whenever the cache lagged the queue. Keep blame reading events only — see
+/// `crate::blame::blame_file` (it reads `change.patch_id` off the event payload).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedDiffFileChange {
     pub path: String,
@@ -240,6 +249,8 @@ pub struct IndexedDiffFileChange {
     pub change_kind: DiffFileChangeKind,
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<DiffHunk>,
 }
 
 /// Indexed session log view for content-addressed log bytes.

@@ -22,6 +22,7 @@ mod claude_hook;
 mod commands;
 mod context;
 mod db;
+mod defaults;
 mod history;
 mod inspect;
 mod mcp;
@@ -83,6 +84,7 @@ fn main() -> Result<()> {
         | Command::Metadata { .. }
         | Command::McpServe
         | Command::Announce { .. }
+        | Command::Blame { .. }
         | Command::Agent { .. } => None,
         _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
@@ -196,6 +198,12 @@ fn main() -> Result<()> {
         Command::History { command } => handle_history(command, &source_profiles, &store)?,
         Command::Metadata { command } => handle_metadata(command, &source_profiles, &store)?,
         Command::McpServe => mcp::serve(&source_profiles, &store)?,
+        Command::Blame {
+            path,
+            line_start,
+            line_end,
+            format,
+        } => handle_blame(&store, &path, line_start, line_end, format)?,
         Command::Announce { command } => handle_announce(
             command,
             cli.source.as_deref(),
@@ -220,6 +228,41 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prints line-level AI blame for `path` as JSON. Resolves the repo root from
+/// the current directory, then maps each current line to its producing session.
+fn handle_blame(
+    store: &LocalStore,
+    path: &str,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    format: args::HistoryFormatArg,
+) -> Result<()> {
+    history::ensure_json(format);
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd)?;
+    let rel_path = match std::path::Path::new(path).strip_prefix(&repo_root) {
+        Ok(stripped) => stripped.to_string_lossy().into_owned(),
+        Err(_) => path.trim_start_matches("./").to_string(),
+    };
+    let mut lines = brick_core::blame_file(store, &repo_root, &rel_path)?;
+    if let Some(start) = line_start {
+        lines.retain(|line| line.line_no as usize >= start);
+    }
+    if let Some(end) = line_end {
+        lines.retain(|line| line.line_no as usize <= end);
+    }
+    let attributed = lines
+        .iter()
+        .filter(|line| line.session_id.is_some() || line.actor_id.is_some())
+        .count();
+    history::print_json(&serde_json::json!({
+        "path": rel_path,
+        "line_count": lines.len(),
+        "attributed_lines": attributed,
+        "lines": lines,
+    }))
 }
 
 fn init_source_discovery(source_profiles: &SourceProfileStore) -> Result<()> {

@@ -21,7 +21,7 @@ use crate::history::{
 };
 
 /// Refresh ceiling shared with `brick history`: index all sessions before query.
-const QUERY_REFRESH_LIMIT: usize = 100_000;
+const QUERY_REFRESH_LIMIT: usize = crate::defaults::SOURCE_REFRESH_LIMIT;
 
 /// Entry point for `brick metadata <subcommand>`.
 pub fn handle_metadata(
@@ -127,8 +127,11 @@ fn render_hook_context(recall: &MetadataRecallResponse) -> String {
         let tool = session.source_id.as_deref().unwrap_or("unknown");
         let intent = session.intent.as_deref().unwrap_or("(no recorded intent)");
         out.push_str(&format!("\n- [{tool}] {}", truncate(intent, 140)));
-        if let Some(hint) = session.recall_chunks_hint.as_deref() {
-            out.push_str(&format!("\n  full transcript: {hint}"));
+        if let Some(transcript_ref) = session.transcript_ref.as_ref() {
+            out.push_str(&format!(
+                "\n  full transcript: {}",
+                transcript_ref.cli_command()
+            ));
         }
     }
     out
@@ -161,8 +164,38 @@ pub struct RecallSession {
     pub lines_added: Option<u64>,
     pub lines_removed: Option<u64>,
     pub confidence: Option<String>,
-    /// How to retrieve the full transcript for this session.
-    pub recall_chunks_hint: Option<String>,
+    /// Surface-neutral pointer to this session's full transcript. Renders to a
+    /// CLI command or an MCP `read_session` hint at the consuming surface.
+    pub transcript_ref: Option<TranscriptRef>,
+}
+
+/// A surface-neutral pointer to a session transcript. Serialized as structured
+/// `{source, session_id}` data so neither the CLI command form nor the MCP tool
+/// form leaks across domains — a hint returned through the MCP server must not
+/// tell an agent (which has no shell) to run a `brick` CLI command. Each surface
+/// renders it with the appropriate method instead.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct TranscriptRef {
+    pub source: String,
+    pub session_id: String,
+}
+
+impl TranscriptRef {
+    /// Drill-down command for `brick` shell users and the Claude PreToolUse hook.
+    pub fn cli_command(&self) -> String {
+        format!(
+            "brick history chunks --source {} --session-id {} --format json",
+            self.source, self.session_id
+        )
+    }
+
+    /// Drill-down hint for MCP agents: call the `read_session` tool, not a shell.
+    pub fn mcp_hint(&self) -> String {
+        format!(
+            "Call read_session with source={} and session_id={} to read this transcript.",
+            self.source, self.session_id
+        )
+    }
 }
 
 pub(crate) fn build_recall_response(
@@ -184,13 +217,13 @@ pub(crate) fn build_recall_response(
             row.source_id.as_deref(),
             row.external_session_id.as_deref(),
         );
-        let recall_chunks_hint =
-            match (row.source_id.as_deref(), row.external_session_id.as_deref()) {
-                (Some(source_id), Some(session_id)) => Some(format!(
-                "brick history chunks --source {source_id} --session-id {session_id} --format json"
-            )),
-                _ => None,
-            };
+        let transcript_ref = match (row.source_id.as_deref(), row.external_session_id.as_deref()) {
+            (Some(source_id), Some(session_id)) => Some(TranscriptRef {
+                source: source_id.to_string(),
+                session_id: session_id.to_string(),
+            }),
+            _ => None,
+        };
         sessions.push(RecallSession {
             source_id: row.source_id.clone(),
             external_session_id: row.external_session_id.clone(),
@@ -200,7 +233,7 @@ pub(crate) fn build_recall_response(
             lines_added: row.lines_added,
             lines_removed: row.lines_removed,
             confidence: row.confidence.clone(),
-            recall_chunks_hint,
+            transcript_ref,
         });
     }
 
@@ -243,8 +276,8 @@ pub struct QueryMatch {
     pub last_seen_at: String,
     pub files_changed: Option<u64>,
     pub touched_files: Vec<String>,
-    /// How to retrieve the full transcript for this session.
-    pub recall_chunks_hint: String,
+    /// Surface-neutral pointer to this session's full transcript.
+    pub transcript_ref: TranscriptRef,
 }
 
 pub(crate) fn build_query_response(
@@ -321,12 +354,12 @@ fn query_match_from_record(record: SourceSessionRecord) -> QueryMatch {
                 .collect()
         })
         .unwrap_or_default();
-    let recall_chunks_hint = format!(
-        "brick history chunks --source {} --session-id {} --format json",
-        record.source_id, record.external_session_id
-    );
+    let transcript_ref = TranscriptRef {
+        source: record.source_id.clone(),
+        session_id: record.external_session_id.clone(),
+    };
     QueryMatch {
-        recall_chunks_hint,
+        transcript_ref,
         intent: record
             .title
             .filter(|title| !title.is_empty())
@@ -346,28 +379,93 @@ fn summarize_query(query: &str, matches: &[QueryMatch]) -> String {
     if matches.is_empty() {
         return format!("No indexed sessions match \"{}\".", truncate(query, 80));
     }
-    let mut tools: Vec<&str> = matches
-        .iter()
-        .map(|entry| entry.source_id.as_str())
-        .collect();
-    tools.sort_unstable();
-    tools.dedup();
+    let parts = SummaryParts::from_items(matches);
     let count = matches.len();
     let (session_word, verb) = if count == 1 {
         ("session", "matches")
     } else {
         ("sessions", "match")
     };
-    let latest_intent = matches
-        .iter()
-        .find_map(|entry| entry.intent.as_deref())
-        .map(|intent| format!(" Most recent: \"{}\".", truncate(intent, 120)))
-        .unwrap_or_default();
     format!(
-        "{count} {session_word} {verb} \"{}\" (via {}).{latest_intent}",
+        "{count} {session_word} {verb} \"{}\" (via {}).{}",
         truncate(query, 80),
-        tools.join(", ")
+        parts.tools_label,
+        parts.latest_intent
     )
+}
+
+/// Builds a one-line natural-language summary of the recall result.
+fn summarize(file_path: &str, sessions: &[RecallSession], truncated: bool) -> String {
+    let name = file_path.rsplit('/').next().unwrap_or(file_path);
+    if sessions.is_empty() {
+        return format!("No prior indexed sessions touched {name}.");
+    }
+    let parts = SummaryParts::from_items(sessions);
+    let count = sessions.len();
+    let session_word = if count == 1 { "session" } else { "sessions" };
+    let truncated_hint = if truncated {
+        " Results are limited; increase --limit for more."
+    } else {
+        ""
+    };
+    format!(
+        "{count} prior {session_word} touched {name} (via {}).{}{truncated_hint}",
+        parts.tools_label, parts.latest_intent
+    )
+}
+
+/// Read access shared by the recall and query summary items so the dedup +
+/// latest-intent logic lives in one place (`SummaryParts`).
+trait SummaryItem {
+    fn source_id(&self) -> Option<&str>;
+    fn intent(&self) -> Option<&str>;
+}
+
+impl SummaryItem for QueryMatch {
+    fn source_id(&self) -> Option<&str> {
+        Some(self.source_id.as_str())
+    }
+    fn intent(&self) -> Option<&str> {
+        self.intent.as_deref()
+    }
+}
+
+impl SummaryItem for RecallSession {
+    fn source_id(&self) -> Option<&str> {
+        self.source_id.as_deref()
+    }
+    fn intent(&self) -> Option<&str> {
+        self.intent.as_deref()
+    }
+}
+
+/// The two pieces both summaries compute identically: a deduped, sorted list of
+/// the tools involved and a clause naming the most recent intent.
+struct SummaryParts {
+    tools_label: String,
+    latest_intent: String,
+}
+
+impl SummaryParts {
+    fn from_items<T: SummaryItem>(items: &[T]) -> Self {
+        let mut tools: Vec<&str> = items.iter().filter_map(SummaryItem::source_id).collect();
+        tools.sort_unstable();
+        tools.dedup();
+        let tools_label = if tools.is_empty() {
+            "unknown tools".to_string()
+        } else {
+            tools.join(", ")
+        };
+        let latest_intent = items
+            .iter()
+            .find_map(SummaryItem::intent)
+            .map(|intent| format!(" Most recent: \"{}\".", truncate(intent, 120)))
+            .unwrap_or_default();
+        SummaryParts {
+            tools_label,
+            latest_intent,
+        }
+    }
 }
 
 /// Looks up a session's title/name as its recall "intent".
@@ -386,38 +484,6 @@ fn lookup_intent(
         .title
         .filter(|title| !title.is_empty())
         .or_else(|| record.name.filter(|name| !name.is_empty()))
-}
-
-/// Builds a one-line natural-language summary of the recall result.
-fn summarize(file_path: &str, sessions: &[RecallSession], truncated: bool) -> String {
-    let name = file_path.rsplit('/').next().unwrap_or(file_path);
-    if sessions.is_empty() {
-        return format!("No prior indexed sessions touched {name}.");
-    }
-    let mut tools: Vec<&str> = sessions
-        .iter()
-        .filter_map(|session| session.source_id.as_deref())
-        .collect();
-    tools.sort_unstable();
-    tools.dedup();
-    let tools_label = if tools.is_empty() {
-        "unknown tools".to_string()
-    } else {
-        tools.join(", ")
-    };
-    let count = sessions.len();
-    let session_word = if count == 1 { "session" } else { "sessions" };
-    let latest_intent = sessions
-        .iter()
-        .find_map(|session| session.intent.as_deref())
-        .map(|intent| format!(" Most recent: \"{}\".", truncate(intent, 120)))
-        .unwrap_or_default();
-    let truncated_hint = if truncated {
-        " Results are limited; increase --limit for more."
-    } else {
-        ""
-    };
-    format!("{count} prior {session_word} touched {name} (via {tools_label}).{latest_intent}{truncated_hint}")
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -443,7 +509,7 @@ mod tests {
             lines_added: Some(10),
             lines_removed: Some(1),
             confidence: Some("metadata_only".to_string()),
-            recall_chunks_hint: None,
+            transcript_ref: None,
         }
     }
 
@@ -497,7 +563,10 @@ mod tests {
             last_seen_at: "2026-06-19T00:00:00+00:00".to_string(),
             files_changed: Some(2),
             touched_files: vec!["src/lib.rs".to_string()],
-            recall_chunks_hint: "brick history chunks …".to_string(),
+            transcript_ref: TranscriptRef {
+                source: "claude_code".to_string(),
+                session_id: "sess-1".to_string(),
+            },
         }
     }
 

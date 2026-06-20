@@ -26,7 +26,7 @@ The thirteen tools group into three jobs an agent needs across a task:
 
 | Capability | Tools | Question it answers |
 | --- | --- | --- |
-| **Memory** | `explore_memory`, `recall_file`, `search_sessions`, `read_session` | "What happened before?" |
+| **Memory** | `explore_memory`, `recall_file`, `blame_file`, `search_sessions`, `read_session` | "What happened before?" |
 | **Planning & work-item management** | `current_context`, `list_missions`, `show_mission`, `manage_mission`, `record_artifact`, `attach_evidence` | "What am I doing, and what did I produce?" |
 | **Coordination & awareness** | `live_sessions`, `announce_work`, `list_announcements` | "Who else is working, and on what?" |
 
@@ -75,6 +75,27 @@ machine. Call before editing a file.
 - **Output**: a one-line summary plus per-session intent and change size. The payload may also include:
   - `live_broadcast` — a session running *right now* that touches this path.
   - `active_claims` — `announce_work` heads-up notes from other sessions covering this path (`{ count, message, claims[] }`).
+
+### `blame_file`
+
+Line-level AI blame: for each current line of a file, which AI agent / session /
+mission produced it. Where `recall_file` answers "who touched this file", `blame_file`
+answers "who wrote *this line*". Attribution is reconstructed from the append-only
+event log (the source of truth), so it is provenance, not a similarity guess.
+
+- **Input**: `path` (string, required) — repo-relative file path; optional `line_start` / `line_end` to clip the range.
+- **Output**: `{ path, line_count, attributed_lines, lines[] }` where each line carries `line_no`, `session_id`, `actor_type`, `actor_id`, `mission_id`, `commit`, `occurred_at`, `source_event_id`, and a `confidence` of:
+  - `working` — attributed via a working-tree diff hunk in current line coordinates (uncommitted change).
+  - `commit` — attributed via `git blame` mapping the line's commit to a Brick `diff.captured` event.
+  - `unattributed` — no Brick diff event covers this line.
+
+How it survives line drift: `git blame` maps each current line to the commit that
+last touched it (git already solves commit-level drift), and Brick maps that commit
+to the session/actor that recorded the corresponding `diff.captured` event.
+Uncommitted edits are attributed directly from the most recent working-diff hunk,
+whose line ranges are already in current-file coordinates.
+
+The same data is available from the CLI: `brick blame <path> [--line-start N] [--line-end M]`.
 
 ### `search_sessions`
 

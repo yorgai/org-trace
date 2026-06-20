@@ -95,6 +95,17 @@ pub enum Command {
     },
     /// Run as an MCP server over stdio so any MCP-capable agent can query Brick.
     McpServe,
+    /// Show line-level AI blame for a file: who (agent/session/mission) produced each line.
+    Blame {
+        /// Repo-relative or absolute file path to blame.
+        path: String,
+        #[arg(long)]
+        line_start: Option<usize>,
+        #[arg(long)]
+        line_end: Option<usize>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     /// Publish, list, or clear active-work announcements (the bulletin board).
     Announce {
         #[command(subcommand)]
@@ -266,7 +277,7 @@ pub enum ArtifactCommand {
         mission: Option<String>,
         #[arg(long)]
         session: Option<String>,
-        #[arg(long, value_enum, default_value_t = ArtifactKindArg::Decision)]
+        #[arg(long, value_enum, default_value_t = crate::defaults::ARTIFACT_KIND)]
         kind: ArtifactKindArg,
         title: String,
         #[arg(long)]

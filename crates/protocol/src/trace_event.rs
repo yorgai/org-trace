@@ -330,8 +330,9 @@ mod tests {
     use crate::{
         ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactId, ArtifactKind,
         ArtifactUpdatedPayload, AttachmentId, DiffCapturedPayload, DiffFileChange,
-        DiffFileChangeKind, DiffTarget, EventType, EvidenceAvailability, LogRefId, SessionId,
-        SessionLogFormat, SessionLogUploadedPayload, SessionSource, SessionStartedPayload,
+        DiffFileChangeKind, DiffHunk, DiffTarget, EventType, EvidenceAvailability, LogRefId,
+        SessionId, SessionLogFormat, SessionLogUploadedPayload, SessionSource,
+        SessionStartedPayload,
     };
 
     use super::*;
@@ -420,6 +421,14 @@ mod tests {
                     change_kind: DiffFileChangeKind::Modified,
                     additions: Some(3),
                     deletions: Some(1),
+                    hunks: vec![DiffHunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 3,
+                        header: None,
+                    }],
+                    patch_id: None,
                 }],
                 repo_context_id: None,
             },

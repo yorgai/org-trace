@@ -186,7 +186,22 @@ pub struct RepoContextCapturedPayload {
     pub context_mode: ContextMode,
 }
 
-/// Per-path summary for a captured diff without line-level blame.
+/// A single hunk's line ranges within a captured diff, mirroring the unified
+/// `@@ -old_start,old_lines +new_start,new_lines @@` header. Only line numbers
+/// and the optional section header are stored — never the changed content — so
+/// line-level blame stays metadata, not a code copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub old_start: u64,
+    pub old_lines: u64,
+    pub new_start: u64,
+    pub new_lines: u64,
+    pub header: Option<String>,
+}
+
+/// Per-path summary for a captured diff, with optional hunk-level line ranges
+/// that drive line-level blame. `hunks` is additive: events recorded before
+/// line-level capture deserialize with an empty vec and behave as file-level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffFileChange {
     pub path: String,
@@ -194,6 +209,16 @@ pub struct DiffFileChange {
     pub change_kind: DiffFileChangeKind,
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<DiffHunk>,
+    /// Stable `git patch-id` of *this file's* slice of the diff. Recorded so
+    /// blame can bridge a working-tree capture to the commit that later lands
+    /// it: a commit usually touches several files, so the whole-commit patch-id
+    /// differs from a single-file capture, but `git show <commit> -- <path>`
+    /// reproduces exactly this per-file id. Additive: older events deserialize
+    /// to `None` and fall back to the file-level / hunk path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_id: Option<String>,
 }
 
 /// Payload for patch provenance captured as diff statistics and file summaries.

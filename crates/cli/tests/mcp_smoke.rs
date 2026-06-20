@@ -586,3 +586,493 @@ fn cross_client_announcement_visibility_and_retirement() {
     drop(client_b);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// End-to-end line-level AI blame: an agent session captures a working diff that
+/// adds two lines to a file, then `blame_file` (over the real mcp-serve binary)
+/// must attribute exactly those current line numbers to that session/actor/
+/// mission, while untouched lines stay unattributed. Proves the whole chain —
+/// unified hunk capture → event log → blame replay — closes the provenance loop.
+#[test]
+fn blame_file_attributes_changed_lines_to_agent_session() {
+    let root = unique_tmp("blame");
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+
+    // A real git repo with a committed baseline file.
+    assert!(git(&repo, &["init", "-q"]).success());
+    assert!(git(&repo, &["config", "user.email", "t@t.com"]).success());
+    assert!(git(&repo, &["config", "user.name", "t"]).success());
+    std::fs::write(repo.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+    assert!(git(&repo, &["add", "-A"]).success());
+    assert!(git(&repo, &["commit", "-qm", "init"]).success());
+
+    brick(&home, &repo, &["init"]);
+    let org = extract(
+        &brick(&home, &repo, &["org", "create", "BlameOrg"]),
+        "org_id",
+    )
+    .expect("org id");
+    let project = extract(
+        &brick(
+            &home,
+            &repo,
+            &["project", "create", "--org", &org, "BlameProj"],
+        ),
+        "project_id",
+    )
+    .expect("project id");
+    let mission = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "mission",
+                "create",
+                "--project",
+                &project,
+                "Add y",
+                "--status",
+                "active",
+            ],
+        ),
+        "mission_id",
+    )
+    .expect("mission id");
+    let session = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "session",
+                "start",
+                "--mission",
+                &mission,
+                "--name",
+                "s1",
+            ],
+        ),
+        "session_id",
+    )
+    .expect("session id");
+    let artifact = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "artifact",
+                "create",
+                "--mission",
+                &mission,
+                "--kind",
+                "patch",
+                "y patch",
+            ],
+        ),
+        "artifact_id",
+    )
+    .expect("artifact id");
+
+    // The agent edits the file (adds lines 3 and 4) and captures a working diff
+    // bound to its session — this is the line-level provenance event.
+    std::fs::write(
+        repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+    let captured = brick(
+        &home,
+        &repo,
+        &[
+            "--actor-type",
+            "agent",
+            "--actor-id",
+            "codex-bot",
+            "evidence",
+            "diff",
+            "--artifact",
+            &artifact,
+            "--session",
+            &session,
+            "--mission",
+            &mission,
+            "--target",
+            "working",
+        ],
+    );
+    assert!(
+        captured.status.success(),
+        "evidence diff failed: {}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+
+    // Blame over the real mcp-serve binary, cwd = repo.
+    let mut m = Mcp::spawn(&home, &repo);
+    let blame = m.call("blame_file", json!({"path": "src/main.rs"}));
+    let lines = blame["lines"].as_array().expect("lines array");
+    // Owner mode: line_count is the whole file, but only owned lines are returned.
+    assert_eq!(blame["line_count"], json!(5), "file has 5 lines: {blame}");
+    assert_eq!(blame["mode"], json!("owner"), "default owner mode: {blame}");
+
+    let owned =
+        |n: u64| -> Option<&Value> { lines.iter().find(|line| line["line_no"] == json!(n)) };
+    // Lines 3 and 4 are the agent's additions → attributed to its session.
+    for n in [3u64, 4] {
+        let line = owned(n).unwrap_or_else(|| panic!("owned line {n} missing: {blame}"));
+        assert_eq!(
+            line["session_id"],
+            json!(session),
+            "line {n} should attribute to the capturing session: {line}"
+        );
+        assert_eq!(
+            line["actor_id"],
+            json!("codex-bot"),
+            "line {n} actor: {line}"
+        );
+        assert_eq!(
+            line["mission_id"],
+            json!(mission),
+            "line {n} mission: {line}"
+        );
+        assert_eq!(
+            line["confidence"],
+            json!("working"),
+            "line {n} confidence: {line}"
+        );
+    }
+    // Line 1 (`fn main() {`) was untouched → not an owned line, so it is absent
+    // from the owner-mode response (collapsed into skipped_lines).
+    assert!(
+        owned(1).is_none(),
+        "untouched line 1 must not appear in owner mode: {blame}"
+    );
+    assert_eq!(
+        blame["owner_lines"],
+        json!(2),
+        "exactly 2 owner lines: {blame}"
+    );
+    assert_eq!(
+        blame["skipped_lines"],
+        json!(3),
+        "remaining 3 lines skipped: {blame}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Runs a git subcommand in `repo`, returning its exit status.
+fn git(repo: &Path, args: &[&str]) -> std::process::ExitStatus {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .expect("run git")
+}
+
+/// Bootstraps a git repo + brick home + an active agent mission/session/artifact
+/// for blame tests. Returns `(root, home, repo, session, mission, artifact)`.
+fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
+    let root = unique_tmp(tag);
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    assert!(git(&repo, &["init", "-q"]).success());
+    assert!(git(&repo, &["config", "user.email", "t@t.com"]).success());
+    assert!(git(&repo, &["config", "user.name", "t"]).success());
+    for (path, body) in seed_files {
+        std::fs::write(repo.join(path), body).unwrap();
+    }
+    assert!(git(&repo, &["add", "-A"]).success());
+    assert!(git(&repo, &["commit", "-qm", "init"]).success());
+
+    brick(&home, &repo, &["init"]);
+    let org = extract(&brick(&home, &repo, &["org", "create", "O"]), "org_id").expect("org");
+    let project = extract(
+        &brick(&home, &repo, &["project", "create", "--org", &org, "P"]),
+        "project_id",
+    )
+    .expect("project");
+    let mission = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "mission",
+                "create",
+                "--project",
+                &project,
+                "m",
+                "--status",
+                "active",
+            ],
+        ),
+        "mission_id",
+    )
+    .expect("mission");
+    let session = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "session",
+                "start",
+                "--mission",
+                &mission,
+                "--name",
+                "s1",
+            ],
+        ),
+        "session_id",
+    )
+    .expect("session");
+    let artifact = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "artifact",
+                "create",
+                "--mission",
+                &mission,
+                "--kind",
+                "patch",
+                "p",
+            ],
+        ),
+        "artifact_id",
+    )
+    .expect("artifact");
+    BlameWorld {
+        root,
+        home,
+        repo,
+        session,
+        mission,
+        artifact,
+    }
+}
+
+struct BlameWorld {
+    root: PathBuf,
+    home: PathBuf,
+    repo: PathBuf,
+    session: String,
+    mission: String,
+    artifact: String,
+}
+
+impl BlameWorld {
+    /// Captures a working diff for the whole tree, bound to the agent session.
+    fn capture_working(&self) {
+        let out = brick(
+            &self.home,
+            &self.repo,
+            &[
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "evidence",
+                "diff",
+                "--artifact",
+                &self.artifact,
+                "--session",
+                &self.session,
+                "--mission",
+                &self.mission,
+                "--target",
+                "working",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "capture failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn blame(&self, path: &str) -> Value {
+        let mut m = Mcp::spawn(&self.home, &self.repo);
+        let v = m.call("blame_file", json!({ "path": path }));
+        drop(m);
+        v
+    }
+}
+
+/// Returns the actor_id attributed to a given line, or None.
+fn line_actor(blame: &Value, line_no: u64) -> Option<String> {
+    blame["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["line_no"] == json!(line_no))
+        .and_then(|l| l["actor_id"].as_str().map(str::to_string))
+}
+
+fn line_confidence(blame: &Value, line_no: u64) -> Option<String> {
+    blame["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["line_no"] == json!(line_no))
+        .and_then(|l| l["confidence"].as_str().map(str::to_string))
+}
+
+/// Real-workflow regression: after the agent's change is COMMITTED, blame must
+/// still attribute the agent's lines — now via the commit → per-file patch-id
+/// path (confidence "commit"), not the stale working overlay. Guards the bug
+/// where post-commit attribution was silently lost.
+#[test]
+fn blame_survives_commit_via_per_file_patch_id() {
+    let w = blame_world(
+        "blame-commit",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "add y"]).success());
+
+    let blame = w.blame("src/main.rs");
+    for n in [3u64, 4] {
+        assert_eq!(
+            line_actor(&blame, n).as_deref(),
+            Some("codex-bot"),
+            "line {n}: {blame}"
+        );
+        assert_eq!(
+            line_confidence(&blame, n).as_deref(),
+            Some("commit"),
+            "line {n}: {blame}"
+        );
+    }
+    assert_eq!(blame["owner_lines"], json!(2), "{blame}");
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// Real-workflow regression: a LATER unrelated edit inserts a line above the
+/// agent's committed change, shifting its line numbers. Blame must follow the
+/// drift (git blame maps current lines to commits) and must NOT mis-attribute
+/// the inserted line or the shifted-but-unrelated lines. Guards the stale
+/// working-hunk-coordinate bug found in live testing.
+#[test]
+fn blame_follows_line_drift_after_later_edit() {
+    let w = blame_world(
+        "blame-drift",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "A: add y"]).success());
+
+    // A different later commit inserts a comment near the top → agent's lines
+    // shift from 3,4 down to 4,5.
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    // inserted later\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "B: insert comment"]).success());
+
+    let blame = w.blame("src/main.rs");
+    // Agent's real lines are now 4 and 5.
+    assert_eq!(
+        line_actor(&blame, 4).as_deref(),
+        Some("codex-bot"),
+        "drifted line 4: {blame}"
+    );
+    assert_eq!(
+        line_actor(&blame, 5).as_deref(),
+        Some("codex-bot"),
+        "drifted line 5: {blame}"
+    );
+    // The inserted comment (line 2) and the original code must NOT be attributed.
+    assert!(
+        line_actor(&blame, 2).is_none(),
+        "inserted comment must be unattributed: {blame}"
+    );
+    assert!(
+        line_actor(&blame, 3).is_none(),
+        "shifted `let x` must be unattributed: {blame}"
+    );
+    assert_eq!(blame["owner_lines"], json!(2), "{blame}");
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// Real-workflow regression: the agent edits TWO files and lands them in ONE
+/// multi-file commit (plus brick's own .gitignore). Per-file patch-id must
+/// attribute each file independently — the whole-commit patch-id matches
+/// neither file's captured slice. Guards the multi-file-commit bug.
+#[test]
+fn blame_attributes_each_file_in_a_multi_file_commit() {
+    let w = blame_world(
+        "blame-multi",
+        &[("src/a.rs", "fn a() {\n}\n"), ("src/b.rs", "fn b() {\n}\n")],
+    );
+    std::fs::write(
+        w.repo.join("src/a.rs"),
+        "fn a() {\n    let ax = 1;\n    let ay = 2;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(w.repo.join("src/b.rs"), "fn b() {\n    let bx = 9;\n}\n").unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "feat: both files"]).success());
+
+    let blame_a = w.blame("src/a.rs");
+    assert_eq!(
+        line_actor(&blame_a, 2).as_deref(),
+        Some("codex-bot"),
+        "a.rs L2: {blame_a}"
+    );
+    assert_eq!(
+        line_actor(&blame_a, 3).as_deref(),
+        Some("codex-bot"),
+        "a.rs L3: {blame_a}"
+    );
+    assert_eq!(blame_a["owner_lines"], json!(2), "a.rs: {blame_a}");
+
+    let blame_b = w.blame("src/b.rs");
+    assert_eq!(
+        line_actor(&blame_b, 2).as_deref(),
+        Some("codex-bot"),
+        "b.rs L2: {blame_b}"
+    );
+    assert_eq!(blame_b["owner_lines"], json!(1), "b.rs: {blame_b}");
+    let _ = std::fs::remove_dir_all(&w.root);
+}

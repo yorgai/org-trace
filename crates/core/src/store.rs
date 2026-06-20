@@ -461,10 +461,22 @@ impl LocalStore {
         Ok(Some(index))
     }
 
-    /// Loads the inspection index, rebuilding it when the cache is absent.
+    /// Loads the inspection index, rebuilding it when the cache is absent OR
+    /// stale. Staleness is detected by comparing the cached `event_count` against
+    /// the live event count in the queue + inbound logs: if the queue has grown
+    /// (or shrunk) since the cache was written, the cache is rebuilt. Without this
+    /// check a present-but-outdated `index.json` would be returned silently,
+    /// hiding events that callers (e.g. MCP reads) just appended.
     pub fn load_or_rebuild_index(&self) -> Result<TraceIndex> {
         match self.read_index()? {
-            Some(index) => Ok(index),
+            Some(index) => {
+                let live_count = self.read_all_events()?.len();
+                if index.event_count == live_count {
+                    Ok(index)
+                } else {
+                    self.rebuild_index()
+                }
+            }
             None => self.rebuild_index(),
         }
     }
@@ -751,6 +763,47 @@ mod tests {
         assert!(store.index_path().exists());
         assert!(index.missions.contains_key(mission_id.as_str()));
         assert_eq!(store.index_status().expect("index status").event_count, 1);
+    }
+
+    #[test]
+    fn load_or_rebuild_index_detects_stale_cache() {
+        let repo_root = temp_repo_root("index-stale");
+        let store = LocalStore::new(&repo_root);
+        let make_mission = || {
+            TraceEvent::mission_created(
+                ActorRef {
+                    actor_type: ActorType::Human,
+                    actor_id: "tester".to_string(),
+                    display_name: None,
+                },
+                MissionId::new(),
+                MissionCreatedPayload {
+                    project_id: ProjectId::new(),
+                    title: "m".to_string(),
+                    description: None,
+                    status: MissionStatus::Planned,
+                    repo_context_id: None,
+                },
+            )
+            .expect("build event")
+        };
+
+        // Build the cache with one event.
+        store.append_event(&make_mission()).expect("append 1");
+        let index = store.rebuild_index().expect("rebuild");
+        assert_eq!(index.event_count, 1);
+
+        // Append a second event WITHOUT rebuilding: cache is now stale.
+        store.append_event(&make_mission()).expect("append 2");
+
+        // load_or_rebuild_index must notice the count mismatch and rebuild,
+        // returning the up-to-date index rather than the stale single-event cache.
+        let loaded = store.load_or_rebuild_index().expect("load or rebuild");
+        assert_eq!(
+            loaded.event_count, 2,
+            "stale cache must be rebuilt to include the appended event"
+        );
+        assert_eq!(loaded.missions.len(), 2);
     }
 
     #[test]

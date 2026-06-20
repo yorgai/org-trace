@@ -5,9 +5,10 @@ use std::fs;
 use brick_protocol::{
     ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload,
     ArtifactFileRefRecordedPayload, ArtifactId, ArtifactKind, ArtifactUpdatedPayload, AttachmentId,
-    DiffCapturedPayload, DiffFileChange, DiffFileChangeKind, DiffTarget, EvidenceAvailability,
-    FileRefId, LogRefId, MissionCreatedPayload, MissionId, MissionStatus, ProjectId, SessionId,
-    SessionLogFormat, SessionLogUploadedPayload, SessionSource, SessionStartedPayload, TraceEvent,
+    DiffCapturedPayload, DiffFileChange, DiffFileChangeKind, DiffHunk, DiffTarget,
+    EvidenceAvailability, FileRefId, LogRefId, MissionCreatedPayload, MissionId, MissionStatus,
+    ProjectId, SessionId, SessionLogFormat, SessionLogUploadedPayload, SessionSource,
+    SessionStartedPayload, TraceEvent,
 };
 use chrono::Utc;
 
@@ -175,6 +176,14 @@ fn rebuilds_and_queries_sqlite_cache() {
                     change_kind: DiffFileChangeKind::Modified,
                     additions: Some(12),
                     deletions: Some(3),
+                    hunks: vec![DiffHunk {
+                        old_start: 10,
+                        old_lines: 3,
+                        new_start: 10,
+                        new_lines: 12,
+                        header: None,
+                    }],
+                    patch_id: None,
                 }],
                 repo_context_id: None,
             },

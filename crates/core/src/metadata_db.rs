@@ -385,15 +385,15 @@ impl MetadataDb {
     ) -> Result<Vec<SourceSessionRecord>> {
         // Trigram cannot index terms under three chars; those are covered by the
         // substring `survives` check below. FTS only ranks among the long terms.
-        let long_terms: Vec<&String> =
-            terms.iter().filter(|term| term.chars().count() >= 3).collect();
+        let long_terms: Vec<&String> = terms
+            .iter()
+            .filter(|term| term.chars().count() >= 3)
+            .collect();
 
         // Every term must still match as a substring somewhere (correctness +
         // short-term handling); FTS only decides ranking among the survivors.
         let survives = |record: &SourceSessionRecord| {
-            terms
-                .iter()
-                .all(|term| record_field_contains(record, term))
+            terms.iter().all(|term| record_field_contains(record, term))
         };
 
         // All terms too short for trigram: no FTS signal, fall back to a plain
@@ -1889,7 +1889,12 @@ mod tests {
         );
     }
 
-    fn upsert_with(external_id: &str, title: &str, touched: serde_json::Value, offset: i64) -> SourceSessionUpsert {
+    fn upsert_with(
+        external_id: &str,
+        title: &str,
+        touched: serde_json::Value,
+        offset: i64,
+    ) -> SourceSessionUpsert {
         let mut upsert = sample_upsert(title, offset);
         upsert.external_session_id = external_id.to_string();
         upsert.touched_files_json = Some(touched);
@@ -1925,8 +1930,13 @@ mod tests {
     fn text_search_requires_all_terms_and() {
         let path = temp_home("search-and").join(crate::METADATA_DB_FILE);
         let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
-        db.upsert_source_session(&upsert_with("s1", "Add OAuth login", json!(["src/auth.rs"]), 0))
-            .expect("insert s1");
+        db.upsert_source_session(&upsert_with(
+            "s1",
+            "Add OAuth login",
+            json!(["src/auth.rs"]),
+            0,
+        ))
+        .expect("insert s1");
 
         // One term matches, the other does not → no result (AND semantics).
         let none = db
@@ -2005,10 +2015,20 @@ mod tests {
     fn text_search_short_terms_use_substring_fallback() {
         let path = temp_home("search-short").join(crate::METADATA_DB_FILE);
         let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
-        db.upsert_source_session(&upsert_with("s1", "Add Go module support", json!(["go.mod"]), 0))
-            .expect("insert s1");
-        db.upsert_source_session(&upsert_with("s2", "Rust refactor", json!(["src/lib.rs"]), 1))
-            .expect("insert s2");
+        db.upsert_source_session(&upsert_with(
+            "s1",
+            "Add Go module support",
+            json!(["go.mod"]),
+            0,
+        ))
+        .expect("insert s1");
+        db.upsert_source_session(&upsert_with(
+            "s2",
+            "Rust refactor",
+            json!(["src/lib.rs"]),
+            1,
+        ))
+        .expect("insert s2");
 
         // "go" is shorter than a trigram; it must still match via substring.
         let hits = db
@@ -2018,8 +2038,14 @@ mod tests {
                 limit: 10,
             })
             .expect("search");
-        let ids: Vec<&str> = hits.iter().map(|h| h.external_session_id.as_str()).collect();
-        assert!(ids.contains(&"s1"), "short term should match via substring: {ids:?}");
+        let ids: Vec<&str> = hits
+            .iter()
+            .map(|h| h.external_session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"s1"),
+            "short term should match via substring: {ids:?}"
+        );
         assert!(!ids.contains(&"s2"));
     }
 
@@ -2027,8 +2053,13 @@ mod tests {
     fn text_search_mixed_short_and_long_terms() {
         let path = temp_home("search-mixed").join(crate::METADATA_DB_FILE);
         let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
-        db.upsert_source_session(&upsert_with("s1", "Go oauth integration", json!(["src/oauth.rs"]), 0))
-            .expect("insert s1");
+        db.upsert_source_session(&upsert_with(
+            "s1",
+            "Go oauth integration",
+            json!(["src/oauth.rs"]),
+            0,
+        ))
+        .expect("insert s1");
         db.upsert_source_session(&upsert_with("s2", "Go home", json!(["home.rs"]), 1))
             .expect("insert s2");
 

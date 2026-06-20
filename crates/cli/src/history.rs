@@ -31,7 +31,7 @@ use crate::args::{
 const HISTORY_EXPORT_SCHEMA_AUDIT_V1: &str = "audit-v1";
 const HISTORY_EXPORT_SCHEMA_SOURCE_METADATA_V1: &str = "source-metadata-v1";
 const EXPORT_AVAILABILITY_METADATA_ONLY: &str = "metadata_only";
-const SOURCE_INDEX_REFRESH_LIMIT: usize = 100_000;
+const SOURCE_INDEX_REFRESH_LIMIT: usize = crate::defaults::SOURCE_REFRESH_LIMIT;
 const EXPORT_REFRESH_LIMIT: usize = SOURCE_INDEX_REFRESH_LIMIT;
 
 /// Version of the `brick history` adapter contract this binary implements.
@@ -797,7 +797,12 @@ pub(crate) fn collect_live_sessions(
     window_secs: u64,
     limit: usize,
 ) -> Vec<NativeSourceSession> {
-    let _ = window_secs; // window is enforced inside the core liveness probe.
+    // `window_secs` is currently vestigial at this layer: the liveness window is
+    // enforced inside the core probe (`brick_core::is_active`), so this value is
+    // intentionally ignored here. Kept in the signature because it is still part
+    // of the `history live` CLI contract; remove both together if the product
+    // decides the per-call window is not needed (see plan Open Questions).
+    let _ = window_secs;
     let mut live: Vec<NativeSourceSession> = Vec::new();
     for profile in profiles {
         let Ok(sessions) = list_source_sessions(profile, Some(limit.max(50))) else {

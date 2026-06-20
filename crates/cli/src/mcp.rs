@@ -15,8 +15,8 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    list_source_sessions, AnnouncementStore, ClaimValidity, LocalStore, NewAnnouncement,
-    SourceProfileStore,
+    blame_file, discover_repo_root, list_source_sessions, AnnouncementStore, ClaimValidity,
+    LocalStore, NewAnnouncement, SourceProfileStore,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -35,11 +35,11 @@ use crate::metadata::{build_query_response, build_recall_response};
 /// MCP protocol revision this server speaks.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Default source scope for tools: search every indexed tool's history.
-const DEFAULT_SOURCE: &str = "all";
+const DEFAULT_SOURCE: &str = crate::defaults::SOURCE_ALL;
 /// Default recall/query result cap, kept small so tool output stays triage-sized.
-const DEFAULT_LIMIT: usize = 10;
+const DEFAULT_LIMIT: usize = crate::defaults::RESULT_LIMIT;
 /// Default per-field truncation for `read_session`, matching the CLI default.
-const DEFAULT_MAX_FIELD_BYTES: usize = 2000;
+const DEFAULT_MAX_FIELD_BYTES: usize = crate::defaults::MAX_FIELD_BYTES;
 
 /// Runs the stdio JSON-RPC loop until stdin closes. Never returns an error to the
 /// caller for per-request failures — those become JSON-RPC error responses; only
@@ -156,6 +156,40 @@ fn tools_list_result() -> Value {
                         "path": {
                             "type": "string",
                             "description": "Repo-relative or absolute file path."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "blame_file",
+                "description": "Owner provenance for a file: returns the lines \
+    attributable to an AI agent in THIS machine's local session history (which \
+    agent / session / mission produced them), anchored to git commits and the \
+    append-only event log. This is deliberately NOT whole-file authorship — lines \
+    changed by others, edited by hand, or never captured are reported as a \
+    skipped count, not guessed. Use it to find which lines are AI-owned and by \
+    whom before changing them. Optionally restrict to a line range, or pass \
+    include_unattributed=true to get every line verbatim.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repo-relative file path to blame."
+                        },
+                        "line_start": {
+                            "type": "integer",
+                            "description": "Optional 1-based first line to include."
+                        },
+                        "line_end": {
+                            "type": "integer",
+                            "description": "Optional 1-based last line to include."
+                        },
+                        "include_unattributed": {
+                            "type": "boolean",
+                            "description": "Return every line verbatim (including \
+    non-owned ones) instead of only AI-owned lines plus a skipped count. Default false."
                         }
                     },
                     "required": ["path"]
@@ -455,9 +489,14 @@ fn handle_tool_call(
             let recall =
                 build_recall_response(store, profiles, &path, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
             let mut value = serde_json::to_value(recall)?;
-            // Tiered live-awareness: if another running session collides with this
-            // file or its work scope, attach a broadcast so the agent can avoid a
-            // cross-session edit conflict. Silent when there is no overlap.
+            // MCP-ONLY enrichment (not produced by the CLI `metadata recall`):
+            // the MCP surface adds real-time coordination signals on top of the
+            // shared recall payload. Tiered live-awareness — if another running
+            // session collides with this file or its work scope, attach a
+            // broadcast so the agent can avoid a cross-session edit conflict.
+            // Silent when there is no overlap. This asymmetry is deliberate: it
+            // is a coordination capability that only makes sense for a live agent,
+            // so it lives on the MCP path, not in the CLI's batch output.
             if let Ok(all_profiles) = profiles.list_profiles() {
                 if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
                     if let Value::Object(map) = &mut value {
@@ -495,6 +534,16 @@ fn handle_tool_call(
             let query = str_arg(&args, "query")?;
             let response = build_query_response(profiles, &query, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
             serde_json::to_value(response)?
+        }
+        "blame_file" => {
+            let path = str_arg(&args, "path")?;
+            let line_start = usize_arg(&args, "line_start");
+            let line_end = usize_arg(&args, "line_end");
+            let include_unattributed = args
+                .get("include_unattributed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            blame_response(store, &path, line_start, line_end, include_unattributed)?
         }
         "read_session" => {
             let source = str_arg(&args, "source")?;
@@ -580,9 +629,11 @@ fn handle_tool_call(
             json!({ "count": claims.len(), "announcements": claims })
         }
         "current_context" => {
-            // Rebuild (not load) so reads reflect events just written by other MCP
-            // calls — the cached index goes stale the moment append_event runs.
-            let index = store.rebuild_index()?;
+            // Load-or-rebuild: the staleness check rebuilds only when the queue
+            // grew since the cache was written (e.g. events just appended by
+            // other MCP calls), so back-to-back reads in one flow don't each pay
+            // a full rebuild + disk rewrite.
+            let index = store.load_or_rebuild_index()?;
             let context = store.read_current_context().ok().flatten();
             let current_mission = context
                 .as_ref()
@@ -603,7 +654,7 @@ fn handle_tool_call(
             })
         }
         "list_missions" => {
-            let index = store.rebuild_index()?;
+            let index = store.load_or_rebuild_index()?;
             let status_filter = args
                 .get("status")
                 .and_then(Value::as_str)
@@ -632,7 +683,7 @@ fn handle_tool_call(
         }
         "show_mission" => {
             let mission = str_arg(&args, "mission")?;
-            let index = store.rebuild_index()?;
+            let index = store.load_or_rebuild_index()?;
             let item = index
                 .missions
                 .get(&mission)
@@ -807,7 +858,7 @@ fn explore_summary(question: &str, query: &crate::metadata::MetadataQueryRespons
                 "when": m.last_seen_at,
                 "repo": m.repo_path,
                 "branch": m.branch,
-                "read_session_hint": m.recall_chunks_hint,
+                "read_session_hint": m.transcript_ref.mcp_hint(),
             })
         })
         .collect();
@@ -832,6 +883,74 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
+}
+
+/// Builds the `blame_file` tool response as **owner provenance**: the lines this
+/// machine's local AI session history can attribute to an agent, plus a count of
+/// the lines it deliberately does not claim. By default only attributed (owner)
+/// lines are returned; the rest collapse into `skipped_lines` so the agent gets a
+/// precise, honest answer instead of a wall of `unattributed` noise. Pass
+/// `include_unattributed=true` to get every line verbatim (debugging). Resolves
+/// the repo root from the current working directory (where `brick mcp-serve` ran).
+fn blame_response(
+    store: &LocalStore,
+    path: &str,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    include_unattributed: bool,
+) -> Result<Value> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd)?;
+    let rel_path = normalize_repo_relative(&repo_root, path);
+    let mut lines = blame_file(store, &repo_root, &rel_path)?;
+    if let Some(start) = line_start {
+        lines.retain(|line| line.line_no as usize >= start);
+    }
+    if let Some(end) = line_end {
+        lines.retain(|line| line.line_no as usize <= end);
+    }
+    let total = lines.len();
+    let is_owned =
+        |line: &brick_core::BlameLine| line.session_id.is_some() || line.actor_id.is_some();
+    let attributed = lines.iter().filter(|line| is_owned(line)).count();
+    let skipped = total - attributed;
+
+    if include_unattributed {
+        return Ok(json!({
+            "path": rel_path,
+            "mode": "full",
+            "line_count": total,
+            "owner_lines": attributed,
+            "skipped_lines": skipped,
+            "lines": lines,
+        }));
+    }
+
+    let owner_lines: Vec<_> = lines.into_iter().filter(is_owned).collect();
+    Ok(json!({
+        "path": rel_path,
+        "mode": "owner",
+        "line_count": total,
+        "owner_lines": attributed,
+        "skipped_lines": skipped,
+        "note": format!(
+            "Owner provenance: {attributed} line(s) attributable to an AI agent in this \
+    machine's local session history; {skipped} line(s) are not in local records (changed by \
+    others, edited by hand, or never captured) and are not guessed. Pass \
+    include_unattributed=true to see every line."
+        ),
+        "lines": owner_lines,
+    }))
+}
+
+/// Strips a leading `repo_root` prefix so blame always queries a repo-relative
+/// path, accepting either absolute or already-relative input.
+fn normalize_repo_relative(repo_root: &std::path::Path, path: &str) -> String {
+    let candidate = std::path::Path::new(path);
+    if let Ok(stripped) = candidate.strip_prefix(repo_root) {
+        return stripped.to_string_lossy().into_owned();
+    }
+    path.trim_start_matches("./").to_string()
 }
 
 /// Returns a trimmed non-empty string argument, or None.

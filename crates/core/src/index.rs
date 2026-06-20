@@ -456,6 +456,7 @@ impl TraceIndex {
                 change_kind: change.change_kind,
                 additions: change.additions,
                 deletions: change.deletions,
+                hunks: change.hunks.clone(),
             })
             .collect::<Vec<_>>();
         let additions = payload
