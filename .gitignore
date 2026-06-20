@@ -7,3 +7,6 @@
 .orgii/
 *.local.md
 philosophy.md
+
+# Python bytecode cache (smoke driver)
+__pycache__/
