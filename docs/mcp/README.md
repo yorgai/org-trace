@@ -178,6 +178,13 @@ git repo (the `cwd=/` case), `explain` does **not** fail — it returns an empty
 chain with an actionable `note` telling the caller to pass an absolute anchor or
 set the working directory, and the agent falls back to git there.
 
+The **planning surface** (missions / artifacts) has no path anchor to resolve a
+repo from, and its records are cross-repo by nature. So when the server is
+started outside a git repo, the planning tools fall back to a store rooted at
+`BRICK_HOME` (default `~/.brick`, overridable via the env var) instead of
+failing — writes and reads land in that same store, so a mission created over
+MCP lists straight back.
+
 ## Verifying
 
 `crates/cli/tests/mcp_smoke.rs` spawns the real `brick mcp-serve` binary and
@@ -188,4 +195,5 @@ causal chain (including across commit + line drift), `link` records both a
 standalone rationale and a cross-event edge, `explain` surfaces a live session
 on the anchor file, and — spawning the server with an unrelated working
 directory — an absolute anchor still recovers the WHO/WHY while a relative
-anchor degrades to the actionable note.
+anchor degrades to the actionable note, and the planning surface still creates
+and lists a mission via its `BRICK_HOME` fallback.

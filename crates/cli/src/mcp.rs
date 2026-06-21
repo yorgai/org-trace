@@ -656,6 +656,16 @@ fn capture_working_diff_event(
 
 /// Planning-surface dispatch (mission / artifact tools).
 fn dispatch_planning(store: &LocalStore, name: &str, args: &Value) -> Result<Value> {
+    // Planning records (missions / artifacts) have no path anchor, so they can't
+    // resolve a repo from their arguments the way explain/link do. When the
+    // server was spawned outside a git repo (the universal `cwd=/` MCP-client
+    // case) the cwd-derived store points at an unwritable root and every
+    // append_event/init crashes with "failed to create provenance queue
+    // directory". Fall back to a BRICK_HOME-rooted store, which is always
+    // writable and is the natural home for cross-repo planning state anyway.
+    let fallback = planning_store_fallback(store);
+    let store = fallback.as_ref().unwrap_or(store);
+
     let payload = match name {
         "mission_list" => {
             let index = store.load_or_rebuild_index()?;
@@ -918,6 +928,21 @@ fn store_for_anchor(default: &LocalStore, anchor: &str) -> Option<LocalStore> {
     } else {
         None
     }
+}
+
+/// Picks a writable store for the anchorless planning surface (missions /
+/// artifacts) when the cwd-derived `default` store is rooted outside a git repo
+/// (the `cwd=/` MCP-client case). Returns a `BRICK_HOME`-rooted store — always
+/// writable, and the natural home for cross-repo planning state. Returns `None`
+/// when the default store is already a real repo (use it as-is) or when no Brick
+/// home can be resolved (let the original path surface its own error).
+fn planning_store_fallback(default: &LocalStore) -> Option<LocalStore> {
+    if discover_repo_root(default.repo_root()).is_ok() {
+        return None;
+    }
+    brick_core::resolve_brick_home()
+        .ok()
+        .map(LocalStore::new)
 }
 
 /// Resolves any anchor (file:line, artifact/mission/event id) to a single event

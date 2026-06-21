@@ -388,6 +388,65 @@ fn planning_loop_mission_artifact_attach() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Regression from live ORGII testing: MCP clients spawn the stdio server with
+/// `cwd=/`. Planning records (missions / artifacts) have no path anchor, so
+/// unlike explain/link they can't recover a repo from their arguments — at
+/// `cwd=/` the cwd-derived store pointed at an unwritable root and every
+/// `mission`/`artifact_add` crashed on `init()` ("failed to create provenance
+/// queue directory"). The fix falls back to a BRICK_HOME-rooted store. This
+/// spawns the planning server with an unrelated cwd and asserts create + list +
+/// show all work (write/read land in the same fallback store).
+#[test]
+fn planning_survives_unrelated_cwd_via_brick_home_fallback() {
+    let (root, home, repo, _codex_dir, _claude_dir) = setup_world("planning-cwd-robust");
+    let org = extract(&brick(&home, &repo, &["org", "create", "O"]), "org_id").expect("org");
+    let project = extract(
+        &brick(&home, &repo, &["project", "create", "--org", &org, "P"]),
+        "project_id",
+    )
+    .expect("project");
+
+    // A non-repo directory standing in for the `cwd=/` an MCP client would use.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut m = Mcp::spawn_planning(&home, &elsewhere);
+
+    let created = m.call(
+        "mission",
+        json!({"action":"create","project":project,"title":"Survives cwd=/","status":"active","source":"codex_app"}),
+    );
+    assert_eq!(
+        created["created"],
+        json!(true),
+        "mission create must not crash at unrelated cwd: {created}"
+    );
+    let mid = created["mission_id"].as_str().expect("mission_id").to_string();
+
+    // Write/read land in the same fallback store — the mission lists back.
+    let listed = m.call("mission_list", json!({"status":"active"}));
+    assert!(
+        listed["missions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["title"] == "Survives cwd=/"),
+        "mission written at unrelated cwd must list back: {listed}"
+    );
+
+    let art = m.call(
+        "artifact_add",
+        json!({"title":"PR: x","kind":"patch","mission":mid,"source":"codex_app"}),
+    );
+    assert_eq!(
+        art["recorded"],
+        json!(true),
+        "artifact_add must not crash at unrelated cwd: {art}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---------------------------------------------------------------------------
 // explain end-to-end: file:line → blame → causal chain with WHO + WHY.
 // ---------------------------------------------------------------------------
