@@ -250,7 +250,7 @@ fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
 
 /// External session ids visible in a `live_sessions` response.
 fn live_ids(m: &mut Mcp) -> Vec<String> {
-    let live = m.call("live_sessions", json!({}));
+    let live = m.call("sessions", json!({}));
     live["sessions"]
         .as_array()
         .cloned()
@@ -262,7 +262,7 @@ fn live_ids(m: &mut Mcp) -> Vec<String> {
 
 /// Active-claim scopes visible in a `list_announcements` response.
 fn claim_scopes(m: &mut Mcp) -> Vec<String> {
-    let la = m.call("list_announcements", json!({}));
+    let la = m.call("claims", json!({}));
     la["announcements"]
         .as_array()
         .cloned()
@@ -300,22 +300,23 @@ fn mcp_capability_kit_end_to_end() {
 
     let mut m = Mcp::spawn(&home, &repo);
 
-    // ---- tools/list: all 13 present ----
+    // ---- tools/list: all 14 present ----
     let tools = m.tool_names();
     for want in [
-        "explore_memory",
-        "recall_file",
-        "search_sessions",
-        "read_session",
-        "current_context",
-        "list_missions",
+        "log_file",
+        "blame",
+        "log_line",
+        "search",
+        "show_session",
+        "status",
+        "mission_list",
         "show_mission",
-        "manage_mission",
-        "record_artifact",
-        "attach_evidence",
-        "live_sessions",
-        "announce_work",
-        "list_announcements",
+        "mission",
+        "artifact_add",
+        "artifact_attach",
+        "sessions",
+        "claim",
+        "claims",
     ] {
         assert!(
             tools.contains(&want.to_string()),
@@ -324,7 +325,7 @@ fn mcp_capability_kit_end_to_end() {
     }
 
     // ---- live_sessions: sees running Codex, not the finished Claude ----
-    let live = m.call("live_sessions", json!({}));
+    let live = m.call("sessions", json!({}));
     let sessions = live["sessions"].as_array().cloned().unwrap_or_default();
     let live_ids: Vec<&str> = sessions
         .iter()
@@ -350,19 +351,19 @@ fn mcp_capability_kit_end_to_end() {
     );
 
     // ---- search_sessions: FTS5 tokenized (out-of-order) + substring ----
-    let sr = m.call("search_sessions", json!({"query": "git status cache"}));
+    let sr = m.call("search", json!({"query": "git status cache"}));
     assert!(
         sr["match_count"].as_u64().unwrap_or(0) >= 1,
         "out-of-order query failed: {sr}"
     );
-    let sr2 = m.call("search_sessions", json!({"query": "commands_git"}));
+    let sr2 = m.call("search", json!({"query": "commands_git"}));
     assert!(
         sr2["match_count"].as_u64().unwrap_or(0) >= 1,
         "substring file query failed: {sr2}"
     );
 
     // ---- recall_file / read_session / explore_memory ----
-    let rc = m.call("recall_file", json!({"path": file_codex}));
+    let rc = m.call("log_file", json!({"path": file_codex}));
     assert!(
         rc["session_count"].as_u64().unwrap_or(0) >= 1
             || rc.to_string().to_lowercase().contains("commands_git"),
@@ -380,18 +381,18 @@ fn mcp_capability_kit_end_to_end() {
     assert!(em.get("_error").is_none(), "explore_memory error: {em}");
 
     // ---- planning loop ----
-    let cc = m.call("current_context", json!({}));
+    let cc = m.call("status", json!({}));
     assert!(
         cc.get("counts").is_some(),
         "current_context missing counts: {cc}"
     );
-    let created = m.call("manage_mission", json!({"action":"create","project":proj,"title":"Cache git status","status":"active","source":"codex_app"}));
+    let created = m.call("mission", json!({"action":"create","project":proj,"title":"Cache git status","status":"active","source":"codex_app"}));
     let mid = created["mission_id"]
         .as_str()
         .expect("mission_id")
         .to_string();
     assert_eq!(created["created"], json!(true));
-    let lm = m.call("list_missions", json!({"status":"active"}));
+    let lm = m.call("mission_list", json!({"status":"active"}));
     assert!(
         lm["missions"]
             .as_array()
@@ -401,7 +402,7 @@ fn mcp_capability_kit_end_to_end() {
         "mission not listed: {lm}"
     );
     let art = m.call(
-        "record_artifact",
+        "artifact_add",
         json!({"title":"PR: cache","kind":"patch","mission":mid,"source":"codex_app"}),
     );
     let aid = art["artifact_id"]
@@ -410,7 +411,7 @@ fn mcp_capability_kit_end_to_end() {
         .to_string();
     assert_eq!(art["recorded"], json!(true));
     let ev = m.call(
-        "attach_evidence",
+        "artifact_attach",
         json!({"artifact":aid,"path":file_codex,"source":"codex_app"}),
     );
     assert_eq!(ev["attached"], json!(true));
@@ -430,13 +431,13 @@ fn mcp_capability_kit_end_to_end() {
     assert_eq!(upd["updated"], json!(true));
 
     // ---- announce_work + liveness-aware retirement ----
-    m.call("announce_work", json!({"scope":file_codex,"message":"editing","source":"codex_app","session_id":"codex-live-001"}));
+    m.call("claim", json!({"scope":file_codex,"message":"editing","source":"codex_app","session_id":"codex-live-001"}));
     m.call(
         "announce_work",
         json!({"scope":"src/ghost.rs","message":"bare mcp","source":"mcp","session_id":"ghost"}),
     );
-    m.call("announce_work", json!({"scope":file_claude,"message":"reviewing","source":"claude_code","session_id":"claude-done-002"}));
-    let la = m.call("list_announcements", json!({}));
+    m.call("claim", json!({"scope":file_claude,"message":"reviewing","source":"claude_code","session_id":"claude-done-002"}));
+    let la = m.call("claims", json!({}));
     let scopes: Vec<&str> = la["announcements"]
         .as_array()
         .unwrap()
@@ -455,7 +456,7 @@ fn mcp_capability_kit_end_to_end() {
         !scopes.contains(&file_claude),
         "dead claude-session claim should be retired: {scopes:?}"
     );
-    let rc2 = m.call("recall_file", json!({"path": file_codex}));
+    let rc2 = m.call("log_file", json!({"path": file_codex}));
     assert!(
         rc2.to_string().contains("active_claims"),
         "recall_file should surface active_claims: {rc2}"
@@ -548,11 +549,11 @@ fn cross_client_announcement_visibility_and_retirement() {
     let mut client_b = Mcp::spawn(&home, &repo); // pretend: Claude Code's MCP client
 
     // Client A announces work tied to its live Codex session.
-    client_a.call("announce_work", json!({
+    client_a.call("claim", json!({
         "scope": codex_file, "message": "refactoring", "source": "codex_app", "session_id": "codex-A"
     }));
     // Client B announces work tied to its live Claude session.
-    client_b.call("announce_work", json!({
+    client_b.call("claim", json!({
         "scope": "src/commands_memory.rs", "message": "reviewing", "source": "claude_code", "session_id": "claude-B"
     }));
 
@@ -724,7 +725,7 @@ fn blame_file_attributes_changed_lines_to_agent_session() {
 
     // Blame over the real mcp-serve binary, cwd = repo.
     let mut m = Mcp::spawn(&home, &repo);
-    let blame = m.call("blame_file", json!({"path": "src/main.rs"}));
+    let blame = m.call("blame", json!({"path": "src/main.rs"}));
     let lines = blame["lines"].as_array().expect("lines array");
     // Owner mode: line_count is the whole file, but only owned lines are returned.
     assert_eq!(blame["line_count"], json!(5), "file has 5 lines: {blame}");
@@ -950,7 +951,7 @@ impl BlameWorld {
 
     fn blame(&self, path: &str) -> Value {
         let mut m = Mcp::spawn(&self.home, &self.repo);
-        let v = m.call("blame_file", json!({ "path": path }));
+        let v = m.call("blame", json!({ "path": path }));
         drop(m);
         v
     }
@@ -958,7 +959,7 @@ impl BlameWorld {
     fn blame_history(&self, path: &str, line_start: u64, line_end: u64) -> Value {
         let mut m = Mcp::spawn(&self.home, &self.repo);
         let v = m.call(
-            "blame_history",
+            "log_line",
             json!({ "path": path, "line_start": line_start, "line_end": line_end }),
         );
         drop(m);
@@ -1208,14 +1209,14 @@ fn free_tools_work_without_login() {
 
     let mut m = Mcp::spawn(&home, &repo);
     for (tool, args) in [
-        ("recall_file", json!({ "path": "src/commands_git.rs" })),
+        ("log_file", json!({ "path": "src/commands_git.rs" })),
         (
-            "explore_memory",
-            json!({ "question": "git status caching" }),
+            "search",
+            json!({ "query": "git status caching" }),
         ),
-        ("search_sessions", json!({ "query": "cache" })),
-        ("live_sessions", json!({})),
-        ("list_announcements", json!({})),
+        ("search", json!({ "query": "cache" })),
+        ("sessions", json!({})),
+        ("claims", json!({})),
     ] {
         let resp = m.call(tool, args);
         assert!(
@@ -1241,7 +1242,7 @@ fn line_blame_requires_login_under_sync() {
     remove_login(&w.home);
     let denied = {
         let mut m = Mcp::spawn(&w.home, &w.repo);
-        let v = m.call("blame_file", json!({ "path": "src/main.rs" }));
+        let v = m.call("blame", json!({ "path": "src/main.rs" }));
         drop(m);
         v
     };

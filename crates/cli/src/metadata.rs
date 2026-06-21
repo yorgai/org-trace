@@ -188,14 +188,6 @@ impl TranscriptRef {
             self.source, self.session_id
         )
     }
-
-    /// Drill-down hint for MCP agents: call the `read_session` tool, not a shell.
-    pub fn mcp_hint(&self) -> String {
-        format!(
-            "Call read_session with source={} and session_id={} to read this transcript.",
-            self.source, self.session_id
-        )
-    }
 }
 
 pub(crate) fn build_recall_response(

@@ -422,6 +422,7 @@ pub fn handle_mission(
             println!("mission_id={mission_id}");
         }
         MissionCommand::Show { .. } => {}
+        MissionCommand::List { .. } => {}
     }
     Ok(())
 }
@@ -1023,6 +1024,7 @@ pub fn handle_artifact(
             println!("artifact_id={artifact_id}");
         }
         ArtifactCommand::Show { .. } => {}
+        ArtifactCommand::Attach { .. } => {}
     }
     Ok(())
 }
@@ -1073,7 +1075,7 @@ fn infer_session_log_format(path: &std::path::Path) -> SessionLogFormat {
     }
 }
 
-fn mission_status_from_arg(status: MissionStatusArg) -> MissionStatus {
+pub(crate) fn mission_status_from_arg(status: MissionStatusArg) -> MissionStatus {
     match status {
         MissionStatusArg::Planned => MissionStatus::Planned,
         MissionStatusArg::Active => MissionStatus::Active,

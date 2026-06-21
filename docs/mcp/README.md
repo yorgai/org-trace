@@ -22,32 +22,38 @@ CLI never drift.
 
 ## The three capabilities
 
-The thirteen tools group into three jobs an agent needs across a task:
+The fourteen tools group into three jobs an agent needs across a task:
 
 | Capability | Tools | Question it answers |
 | --- | --- | --- |
-| **Memory** | `explore_memory`, `recall_file`, `blame_file`, `search_sessions`, `read_session` | "What happened before?" |
-| **Planning & work-item management** | `current_context`, `list_missions`, `show_mission`, `manage_mission`, `record_artifact`, `attach_evidence` | "What am I doing, and what did I produce?" |
-| **Coordination & awareness** | `live_sessions`, `announce_work`, `list_announcements` | "Who else is working, and on what?" |
+| **Memory** | `search`, `log_file`, `blame`, `log_line`, `show_session` | "What happened before?" |
+| **Planning & work-item management** | `status`, `mission_list`, `show_mission`, `mission`, `artifact_add`, `artifact_attach` | "What am I doing, and what did I produce?" |
+| **Coordination & awareness** | `sessions`, `claim`, `claims` | "Who else is working, and on what?" |
+
+> The MCP tool names mirror the `brick` CLI verbs one-for-one (`log_file` ↔
+> `brick log file`, `blame` ↔ `brick blame`, …). The previous names
+> (`recall_file`, `explore_memory`, `search_sessions`, `read_session`,
+> `current_context`, `list_missions`, `manage_mission`, `record_artifact`,
+> `attach_evidence`, `live_sessions`, `announce_work`, `list_announcements`,
+> `blame_file`, `blame_history`) still resolve as aliases for one release.
 
 ## Recommended flow
 
 A natural end-to-end flow chains all three capabilities:
 
 ```text
-current_context        # where am I (org / project / mission / counts)
-  → list_missions      # what work is already in flight
-  → manage_mission     # action="create": turn the request into a tracked goal
-  → announce_work      # claim the files/area before editing
+status                 # where am I (org / project / mission / counts)
+  → mission_list       # what work is already in flight
+  → mission            # action="create": turn the request into a tracked goal
+  → claim              # claim the files/area before editing
   → (do the work)
-  → record_artifact    # log the deliverable, linked to the mission
-  → attach_evidence    # point the artifact at the files that back it
-  → manage_mission     # action="update", status="completed": close the loop
+  → artifact_add       # log the deliverable, linked to the mission
+  → artifact_attach    # point the artifact at the files that back it
+  → mission            # action="update", status="completed": close the loop
 ```
 
-Memory tools (`recall_file`, `explore_memory`, …) are called opportunistically —
-typically `recall_file` right before editing a file, and `explore_memory` /
-`search_sessions` when you need prior context.
+Memory tools are called opportunistically — typically `log_file` right before
+editing a file, and `search` when you need prior context by topic.
 
 ---
 
@@ -56,17 +62,7 @@ typically `recall_file` right before editing a file, and `explore_memory` /
 Read-only queries over cross-tool session history on this machine. They never
 write events.
 
-### `explore_memory`
-
-Answer an open question about past AI coding work. Searches cross-tool session
-history and returns a synthesized summary of the most relevant prior sessions
-(intent, tool, when, transcript pointer). Use it first when you want context but
-have no specific file path.
-
-- **Input**: `question` (string, required) — natural language, e.g. `"how did we fix the auth token race"`.
-- **Output**: a synthesized summary plus the matched sessions, each with a transcript pointer for `read_session`.
-
-### `recall_file`
+### `log_file`
 
 Recall who previously changed a file and why, across every coding tool on this
 machine. Call before editing a file.
@@ -74,12 +70,12 @@ machine. Call before editing a file.
 - **Input**: `path` (string, required) — repo-relative or absolute file path.
 - **Output**: a one-line summary plus per-session intent and change size. The payload may also include:
   - `live_broadcast` — a session running *right now* that touches this path.
-  - `active_claims` — `announce_work` heads-up notes from other sessions covering this path (`{ count, message, claims[] }`).
+  - `active_claims` — `claim` heads-up notes from other sessions covering this path (`{ count, message, claims[] }`).
 
-### `blame_file`
+### `blame`
 
 Line-level AI blame: for each current line of a file, which AI agent / session /
-mission produced it. Where `recall_file` answers "who touched this file", `blame_file`
+mission produced it. Where `log_file` answers "who touched this file", `blame`
 answers "who wrote *this line*". Attribution is reconstructed from the append-only
 event log (the source of truth), so it is provenance, not a similarity guess.
 
@@ -97,7 +93,7 @@ whose line ranges are already in current-file coordinates.
 
 The same data is available from the CLI: `brick blame <path> [--line-start N] [--line-end M]`.
 
-### `search_sessions`
+### `search`
 
 Full-text search over session metadata (title/intent, touched files, repo,
 branch, model) to find past sessions by topic. Backed by SQLite **FTS5** with a
@@ -115,14 +111,14 @@ branch, model) to find past sessions by topic. Backed by SQLite **FTS5** with a
 - **Input**: `query` (string, required) — one or more keywords; order does not matter.
 - **Output**: matches ranked by relevance, each with a transcript pointer. Result cap defaults to 10.
 
-### `read_session`
+### `show_session`
 
 Page through one session's full transcript chunks. Supports pagination and
 per-field truncation so large tool outputs don't overflow context.
 
 - **Input**:
   - `source` (string, required) — source id, e.g. `claude_code`, `codex_app`, `cursor_ide`, `orgii`.
-  - `session_id` (string, required) — external session id from a search/recall hit.
+  - `session_id` (string, required) — external session id from a `search` or `log_file` hit.
   - `offset` (integer, default `0`) — chunk offset.
   - `limit` (integer, default `50`) — max chunks.
   - `max_field_bytes` (integer, default `2000`) — truncate string values over this many bytes; `0` disables truncation.
@@ -138,9 +134,9 @@ tools rebuild the derived index so they always reflect just-written events.
 
 > **Identity for MCP writes.** MCP has no logged-in human, so the author of a
 > write is the calling tool: the `actor_id`/`source` argument if supplied, else
-> `"mcp"`. This mirrors how `announce_work` attributes claims.
+> `"mcp"`. This mirrors how `claim` attributes claims.
 
-### `current_context`
+### `status`
 
 Report the active org, project, mission, and session Brick has on record. Call
 at the start of a task to know what you're working on and where new work should
@@ -151,9 +147,9 @@ be filed.
   - `current` — the persisted current context (or `null`).
   - `current_mission` — the full mission object the context points at, if any.
   - `counts` — `{ orgs, projects, missions, sessions, artifacts }`.
-  - `note` — a one-line pointer to `list_missions` / `manage_mission` / `record_artifact`.
+  - `note` — a one-line pointer to `mission_list` / `mission` / `artifact_add`.
 
-### `list_missions`
+### `mission_list`
 
 List missions (work items / goals), newest activity first. Use it to see what's
 in flight, find an existing mission to attach output to, or pick up unfinished
@@ -173,7 +169,7 @@ linked to it.
 - **Input**: `mission` (string, required) — the mission id.
 - **Output**: the full mission object, including `artifact_ids`, `session_ids`, status, and timestamps. Errors if the id is unknown.
 
-### `manage_mission`
+### `mission`
 
 Create or update a mission — Brick's planning primitive.
 
@@ -185,7 +181,7 @@ Create or update a mission — Brick's planning primitive.
   - `session_id`, `source` (strings, optional) — author attribution.
 - **Output**: `{ created: true, mission_id, note }` on create, or `{ updated: true, mission_id }` on update.
 
-### `record_artifact`
+### `artifact_add`
 
 Record a deliverable you produced (a PR, a design doc, a decision, a test
 result) and link it to a mission. This closes the planning loop: a mission
@@ -199,18 +195,18 @@ states the goal, an artifact is the proof of work.
   - `session_id`, `source` (strings, optional) — author attribution.
 - **Output**: `{ recorded: true, artifact_id, note }`.
 
-### `attach_evidence`
+### `artifact_attach`
 
 Attach a file-path piece of evidence to an artifact — the concrete file(s) that
-back a deliverable, forming an auditable trail. Call after `record_artifact`.
+back a deliverable, forming an auditable trail. Call after `artifact_add`.
 
 - **Input**:
-  - `artifact` (string, required) — artifact id from `record_artifact`.
+  - `artifact` (string, required) — artifact id from `artifact_add`.
   - `path` (string, required) — file path the artifact represents or touched.
   - `session_id`, `source` (strings, optional) — author attribution.
 - **Output**: `{ attached: true, artifact_id }`.
 
-#### Why `record_artifact` + `attach_evidence`
+#### Why `artifact_add` + `artifact_attach`
 
 Together they answer "what did this goal actually produce, and how do I prove
 it?" Without them a mission only says it is `active`; with them, anyone (or
@@ -230,7 +226,7 @@ That goal → deliverable → file trail is the core of Brick's provenance value
 
 These help concurrent sessions avoid stepping on each other.
 
-### `live_sessions`
+### `sessions`
 
 List AI coding sessions that appear to be running right now across every tool on
 this machine. Liveness is recomputed per call from each source's own signals; it
@@ -239,10 +235,10 @@ is never persisted.
 - **Input**: `scope` (string, optional) — path prefix; only sessions whose work scope is at or under this path are returned.
 - **Output**: `{ count, sessions[], note }`. Each row includes the session's work scope and recently touched files.
 
-### `announce_work`
+### `claim`
 
 Post a heads-up on the cross-session bulletin board *before* you start editing:
-"I'm changing X, hold off." Other sessions calling `recall_file` on a matching
+"I'm changing X, hold off." Other sessions calling `log_file` on a matching
 path see your note (as `active_claims`).
 
 - **Input**:
@@ -256,7 +252,7 @@ path see your note (as `active_claims`).
 > **Lifecycle note.** A claim is retired on whichever comes first:
 > 1. **Session ended** — when the publishing session can be matched to a native
 >    source session that is no longer active, the claim is dropped (and deleted)
->    on the next `recall_file` / `list_announcements` read. This is the common
+>    on the next `log_file` / `claims` read. This is the common
 >    case: the moment an agent exits, its claims stop misleading others.
 > 2. **TTL expiry** — claims whose publisher cannot be probed (a CLI claim, a
 >    bare `mcp` publisher with no matching native session) fall back to the TTL
@@ -268,7 +264,7 @@ path see your note (as `active_claims`).
 > `[…]`), bare basename, relative/absolute path-suffix equivalence, and
 > directory-prefix all match.
 
-### `list_announcements`
+### `claims`
 
 List active bulletin-board claims (other sessions' "I'm working on X" notes).
 Call before editing to check nobody has claimed the area you're about to touch.
@@ -304,12 +300,12 @@ throwaway git repo. It never touches your real Brick home or working tree.
 
 It is four tests, split the way a capability kit must be proven:
 
-- **`mcp_capability_kit_end_to_end`** — all 13 tools across the three
+- **`mcp_capability_kit_end_to_end`** — all 14 tools across the three
   capabilities, plus the cross-tool flow where a Claude-side `show_mission` reads
   a Codex-authored mission/artifact.
 - **`liveness_flips_when_turn_completes_same_process`** — proves liveness is
   recomputed every call, not cached: on one long-lived server, a session that is
-  live with an open turn drops out of `live_sessions` the instant its transcript
+  live with an open turn drops out of `sessions` the instant its transcript
   gains a completion marker.
 - **`liveness_respects_active_window_same_process`** — proves the 120s
   ACTIVE_WINDOW gates before turn signals: the same open-turn transcript, aged

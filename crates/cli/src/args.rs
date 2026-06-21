@@ -89,6 +89,68 @@ pub enum Command {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    /// Git-style alias for `context show`: the current org/project/mission/session.
+    Status,
+    /// Git-style view of sessions that appear to be running right now (alias for
+    /// `history live`).
+    Sessions {
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 120)]
+        window_secs: u64,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    /// List active work claims (alias for `announce list`).
+    Claims {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    /// Publish or release a work claim (alias for `announce claim`/`release`).
+    Claim {
+        /// File path or glob being claimed.
+        scope: String,
+        /// One-line note; required unless --release is set.
+        #[arg(long)]
+        message: Option<String>,
+        /// Release the claim instead of publishing it.
+        #[arg(long)]
+        release: bool,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        work_dir: Option<String>,
+        #[arg(long)]
+        ttl_minutes: Option<i64>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    /// Git-style history views (alias for `metadata recall`).
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
+    /// Git-style detail views (alias for `mission show` / session projection).
+    Show {
+        #[command(subcommand)]
+        command: ShowCommand,
+    },
+    /// Free-text search over past sessions (alias for `metadata query`).
+    Search {
+        query: String,
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -103,6 +165,19 @@ pub enum Command {
         line_start: Option<usize>,
         #[arg(long)]
         line_end: Option<usize>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+    /// Full change history of a line range (like `git log -L`): every commit that
+    /// touched lines [line_start, line_end], each tagged with its AI session.
+    #[command(name = "log-line")]
+    LogLine {
+        /// Repo-relative or absolute file path.
+        path: String,
+        #[arg(long)]
+        line_start: usize,
+        #[arg(long)]
+        line_end: usize,
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
@@ -210,6 +285,15 @@ pub enum MissionCommand {
         #[arg(long, value_enum)]
         status: Option<MissionStatusArg>,
     },
+    /// List tracked missions, newest activity first; optional status/project filter.
+    List {
+        #[arg(long, value_enum)]
+        status: Option<MissionStatusArg>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     Show {
         mission: String,
     },
@@ -286,6 +370,8 @@ pub enum ArtifactKindArg {
 
 #[derive(Debug, Subcommand)]
 pub enum ArtifactCommand {
+    /// Record a deliverable (PR, decision, test result). Git-style alias: `add`.
+    #[command(visible_alias = "add")]
     Create {
         #[arg(long)]
         mission: Option<String>,
@@ -296,6 +382,22 @@ pub enum ArtifactCommand {
         title: String,
         #[arg(long)]
         body: Option<String>,
+    },
+    /// Attach a file as evidence to an artifact (alias for `evidence attach`).
+    Attach {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Copy the file into the store instead of referencing it in place.
+        #[arg(long)]
+        copy: bool,
     },
     Link {
         #[arg(long)]
@@ -385,6 +487,30 @@ pub enum EvidenceCommand {
 #[derive(Debug, Subcommand)]
 pub enum ContextCommand {
     Show,
+}
+
+/// `brick log <subcommand>` — Git-style history views.
+#[derive(Debug, Subcommand)]
+pub enum LogCommand {
+    /// Who changed a file across past sessions and why (alias for `metadata recall`).
+    File {
+        path: String,
+        #[arg(long, default_value = "all")]
+        source: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
+}
+
+/// `brick show <subcommand>` — Git-style detail views.
+#[derive(Debug, Subcommand)]
+pub enum ShowCommand {
+    /// Show one mission in detail (alias for `mission show`).
+    Mission { mission: String },
+    /// Show one session projection in detail (alias for `session show`).
+    Session { session: String },
 }
 
 #[cfg(feature = "sync")]

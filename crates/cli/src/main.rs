@@ -71,7 +71,16 @@ fn main() -> Result<()> {
         _ => {}
     }
     let work_dir = std::env::current_dir().context("failed to read current directory")?;
-    let repo_root = discover_repo_root(&work_dir)?;
+    // `mcp-serve` is a long-lived server an MCP client (ORGII, Claude, …) may
+    // launch from any working directory, including one outside a git repo. It
+    // must not hard-fail on startup: the tools that actually need a repo (e.g.
+    // blame) resolve it lazily per call and error gracefully there. So fall back
+    // to the working dir as the root rather than aborting initialization.
+    let repo_root = match discover_repo_root(&work_dir) {
+        Ok(root) => root,
+        Err(_) if matches!(cli.command, Command::McpServe) => work_dir.clone(),
+        Err(err) => return Err(err),
+    };
     let source_profiles = SourceProfileStore::new(repo_root.clone());
     let brick_config = source_profiles.read_config()?;
     let mut command = cli.command;
@@ -96,6 +105,12 @@ fn main() -> Result<()> {
         | Command::McpServe
         | Command::Announce { .. }
         | Command::Blame { .. }
+        | Command::LogLine { .. }
+        | Command::Sessions { .. }
+        | Command::Claims { .. }
+        | Command::Claim { .. }
+        | Command::Log { .. }
+        | Command::Search { .. }
         | Command::Agent { .. } => None,
         _ if upload_log_uses_global_source => source_profiles.selected_profile(None)?,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
@@ -140,6 +155,16 @@ fn main() -> Result<()> {
         },
         Command::Mission { command } => match command {
             args::MissionCommand::Show { mission } => show_mission(mission, &store)?,
+            args::MissionCommand::List {
+                status,
+                project,
+                limit,
+            } => inspect::list_missions(
+                status.map(commands::mission_status_from_arg),
+                project,
+                limit,
+                &store,
+            )?,
             command => handle_mission(
                 command,
                 &cli.identity,
@@ -171,6 +196,29 @@ fn main() -> Result<()> {
         },
         Command::Artifact { command } => match command {
             args::ArtifactCommand::Show { artifact } => show_artifact(artifact, &store)?,
+            args::ArtifactCommand::Attach {
+                artifact,
+                session,
+                path,
+                name,
+                content_type,
+                copy,
+            } => handle_evidence(
+                args::EvidenceCommand::Attach {
+                    artifact,
+                    session,
+                    path,
+                    name,
+                    content_type,
+                    copy,
+                },
+                &cli.identity,
+                &store,
+                &repo_root,
+                &work_dir,
+                selected_source_profile.as_ref(),
+                &brick_config,
+            )?,
             command => handle_artifact(
                 command,
                 &cli.identity,
@@ -198,6 +246,105 @@ fn main() -> Result<()> {
             &store,
             selected_source_profile.as_ref(),
         )?,
+        Command::Status => handle_context(
+            args::ContextCommand::Show,
+            &cli.identity,
+            &store,
+            selected_source_profile.as_ref(),
+        )?,
+        Command::Sessions {
+            source,
+            limit,
+            window_secs,
+            format,
+        } => handle_history(
+            args::HistoryCommand::Live {
+                source,
+                limit,
+                window_secs,
+                format,
+            },
+            &source_profiles,
+            &store,
+        )?,
+        Command::Claims { path, format } => handle_announce(
+            args::AnnounceCommand::List { path, format },
+            cli.source.as_deref(),
+            cli.identity.session.as_deref(),
+        )?,
+        Command::Claim {
+            scope,
+            message,
+            release,
+            source,
+            session,
+            work_dir,
+            ttl_minutes,
+            format,
+        } => {
+            let command = if release {
+                args::AnnounceCommand::Release {
+                    scope: Some(scope),
+                    source,
+                    session,
+                    format,
+                }
+            } else {
+                let message = message.context(
+                    "`brick claim` requires --message unless --release is set",
+                )?;
+                args::AnnounceCommand::Claim {
+                    scope,
+                    message,
+                    source,
+                    session,
+                    work_dir,
+                    ttl_minutes,
+                    format,
+                }
+            };
+            handle_announce(
+                command,
+                cli.source.as_deref(),
+                cli.identity.session.as_deref(),
+            )?
+        }
+        Command::Log { command } => match command {
+            args::LogCommand::File {
+                path,
+                source,
+                limit,
+                format,
+            } => handle_metadata(
+                args::MetadataCommand::Recall {
+                    path,
+                    source,
+                    limit,
+                    format,
+                },
+                &source_profiles,
+                &store,
+            )?,
+        },
+        Command::Show { command } => match command {
+            args::ShowCommand::Mission { mission } => show_mission(mission, &store)?,
+            args::ShowCommand::Session { session } => show_session(session, &store)?,
+        },
+        Command::Search {
+            query,
+            source,
+            limit,
+            format,
+        } => handle_metadata(
+            args::MetadataCommand::Query {
+                query,
+                source,
+                limit,
+                format,
+            },
+            &source_profiles,
+            &store,
+        )?,
         Command::Agent { command } => handle_agent(command)?,
         Command::Source { command } => handle_source(command, &source_profiles)?,
         Command::Import { command } => handle_import(
@@ -215,6 +362,12 @@ fn main() -> Result<()> {
             line_end,
             format,
         } => handle_blame(&store, &path, line_start, line_end, format)?,
+        Command::LogLine {
+            path,
+            line_start,
+            line_end,
+            format,
+        } => handle_log_line(&store, &path, line_start, line_end, format)?,
         Command::Announce { command } => handle_announce(
             command,
             cli.source.as_deref(),
@@ -284,6 +437,45 @@ fn handle_blame(
         "line_count": lines.len(),
         "attributed_lines": attributed,
         "lines": lines,
+    }))
+}
+
+/// Prints the full change history of a line range as JSON (like `git log -L`):
+/// every commit that touched `[line_start, line_end]`, each tagged with its AI
+/// session when locally attributable. Shares the soft login gate with `blame`.
+fn handle_log_line(
+    store: &LocalStore,
+    path: &str,
+    line_start: usize,
+    line_end: usize,
+    format: args::HistoryFormatArg,
+) -> Result<()> {
+    #[cfg(feature = "sync")]
+    if !brick_sync::is_logged_in() {
+        anyhow::bail!("line-level history needs a Brick account. Run `brick login` first.");
+    }
+    history::ensure_json(format);
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd)?;
+    let rel_path = match std::path::Path::new(path).strip_prefix(&repo_root) {
+        Ok(stripped) => stripped.to_string_lossy().into_owned(),
+        Err(_) => path.trim_start_matches("./").to_string(),
+    };
+    let touches = brick_core::blame_line_range_history(
+        store,
+        &repo_root,
+        &rel_path,
+        line_start as u64,
+        line_end as u64,
+    )?;
+    let attributed = touches.iter().filter(|touch| touch.attributed).count();
+    history::print_json(&serde_json::json!({
+        "path": rel_path,
+        "line_start": line_start,
+        "line_end": line_end,
+        "commit_count": touches.len(),
+        "attributed_commits": attributed,
+        "history": touches,
     }))
 }
 

@@ -38,7 +38,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_SOURCE: &str = crate::defaults::SOURCE_ALL;
 /// Default recall/query result cap, kept small so tool output stays triage-sized.
 const DEFAULT_LIMIT: usize = crate::defaults::RESULT_LIMIT;
-/// Default per-field truncation for `read_session`, matching the CLI default.
+/// Default per-field truncation for `show_session`, matching the CLI default.
 const DEFAULT_MAX_FIELD_BYTES: usize = crate::defaults::MAX_FIELD_BYTES;
 
 /// Runs the stdio JSON-RPC loop until stdin closes. Never returns an error to the
@@ -110,17 +110,17 @@ fn initialize_result() -> Value {
         },
         "instructions": "Brick gives any agent a shared work surface across tools: \
     memory, planning, and coordination. \
-    MEMORY — explore_memory for an open question, recall_file before editing a file, \
-    search_sessions to find past work by topic, read_session to page through a \
+    MEMORY — search for an open question or to find past work by topic, log_file before \
+    editing a file to see who changed it and why, show_session to page through a \
     session's transcript. \
-    PLANNING — at the start of a task call current_context (what am I working on) and \
-    list_missions (what's in flight); turn a request into a tracked goal with \
-    manage_mission action='create'; as work moves, manage_mission action='update' its \
-    status; log deliverables with record_artifact and back them with attach_evidence. \
-    COORDINATION — before a non-trivial edit call announce_work so other sessions hold \
-    off, and recall_file surfaces any active claims on the file you ask about. \
-    A natural flow: current_context → list_missions → manage_mission(create) → work → \
-    record_artifact → attach_evidence → announce_work."
+    PLANNING — at the start of a task call status (what am I working on) and \
+    mission_list (what's in flight); turn a request into a tracked goal with \
+    mission action='create'; as work moves, mission action='update' its \
+    status; log deliverables with artifact_add and back them with artifact_attach. \
+    COORDINATION — before a non-trivial edit call claim so other sessions hold \
+    off, and log_file surfaces any active claims on the file you ask about. \
+    A natural flow: status → mission_list → mission(create) → work → \
+    artifact_add → artifact_attach → claim."
     })
 }
 
@@ -128,25 +128,7 @@ fn tools_list_result() -> Value {
     json!({
         "tools": [
             {
-                "name": "explore_memory",
-                "description": "Answer an open question about past AI coding work \
-    by searching cross-tool session history and returning a synthesized summary of \
-    the most relevant prior sessions (intent, tool, when, transcript pointer). Use \
-    this first when you want context but don't have a specific file path.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "Natural-language question or topic, e.g. \
-    'how did we fix the auth token race' or 'pagination work in the CLI'."
-                        }
-                    },
-                    "required": ["question"]
-                }
-            },
-            {
-                "name": "recall_file",
+                "name": "log_file",
                 "description": "Recall who previously changed a file and why, across \
     every coding tool on this machine. Returns a one-line summary plus per-session \
     intent and change size. Call before editing a file.",
@@ -162,7 +144,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "blame_file",
+                "name": "blame",
                 "description": "Owner provenance for a file: returns the lines \
     attributable to an AI agent in THIS machine's local session history (which \
     agent / session / mission produced them), anchored to git commits and the \
@@ -196,11 +178,11 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "blame_history",
+                "name": "log_line",
                 "description": "Full change history of a line range: every commit \
     that touched lines [line_start, line_end] of a file (newest first), each \
     tagged with the AI session that produced it when this machine's local history \
-    can attribute it. Unlike blame_file (which only resolves the single LAST \
+    can attribute it. Unlike blame (which only resolves the single LAST \
     commit per line), this lists ALL the sessions that ever changed this code. \
     Commits not in local records (others' commits, hand edits, or \
     squash/rebase-rewritten history) are listed with attributed=false, not \
@@ -225,7 +207,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "search_sessions",
+                "name": "search",
                 "description": "Free-text search over session metadata (title, \
     intent, touched files, repo, branch) to find past sessions by topic. Returns \
     matches newest-first, each with a transcript pointer.",
@@ -241,7 +223,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "read_session",
+                "name": "show_session",
                 "description": "Page through one session's full transcript chunks. \
     Supports offset/limit pagination and per-field truncation so large tool outputs \
     don't overflow context; set max_field_bytes to 0 to fetch one chunk untruncated.",
@@ -254,7 +236,7 @@ fn tools_list_result() -> Value {
                         },
                         "session_id": {
                             "type": "string",
-                            "description": "External session id from a search/recall hit."
+                            "description": "External session id from a search hit."
                         },
                         "offset": { "type": "integer", "description": "Chunk offset (default 0)." },
                         "limit": { "type": "integer", "description": "Max chunks (default 50)." },
@@ -267,7 +249,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "live_sessions",
+                "name": "sessions",
                 "description": "List AI coding sessions that appear to be running \
     RIGHT NOW across every tool on this machine (Claude Code, Codex, Cursor, …). \
     Each result includes its work scope (repo or working dir), the file(s) it \
@@ -285,10 +267,10 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "announce_work",
+                "name": "claim",
                 "description": "Post a heads-up on the cross-session bulletin board \
     BEFORE you start editing: 'I'm changing X, hold off'. Other sessions calling \
-    recall_file on a matching path will see your note and avoid clobbering your \
+    log_file on a matching path will see your note and avoid clobbering your \
     work. The claim auto-expires (default 4h) so you don't have to remember to \
     clear it. Call this when you begin a non-trivial change to a file or area.",
                 "inputSchema": {
@@ -323,7 +305,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "list_announcements",
+                "name": "claims",
                 "description": "List active bulletin-board claims (other sessions' \
     'I'm working on X' notes). With `path`, only claims covering that path. Call \
     before editing to check nobody has claimed the area you're about to touch.",
@@ -339,15 +321,15 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "current_context",
+                "name": "status",
                 "description": "Report your current work context: the active org, \
     project, mission (work item), and session Brick has on record. Call this at the \
     START of a task to know what you're working on and where new work should be \
-    filed. Pairs with list_missions to see what's in flight.",
+    filed. Pairs with mission_list to see what's in flight.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
-                "name": "list_missions",
+                "name": "mission_list",
                 "description": "List missions (work items / goals) Brick is tracking, \
     newest first. Use this to see 'what is in flight' before starting work, to find \
     an existing mission to attach output to, or to pick up an unfinished task. \
@@ -388,7 +370,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "manage_mission",
+                "name": "mission",
                 "description": "Create or update a mission (work item / goal) — Brick's \
     planning primitive. action='create' opens a new work item under a project; \
     action='update' changes its title/description/status as work progresses \
@@ -433,7 +415,7 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "record_artifact",
+                "name": "artifact_add",
                 "description": "Record a deliverable you produced (a PR, a design doc, a \
     decision, a test result) and link it to a mission. This closes the planning \
     loop: a mission states the goal, an artifact is the proof of work. Call after \
@@ -467,16 +449,16 @@ fn tools_list_result() -> Value {
                 }
             },
             {
-                "name": "attach_evidence",
+                "name": "artifact_attach",
                 "description": "Attach a file-path piece of evidence to an artifact — the \
     concrete file(s) that back up a deliverable, forming an auditable trail. Call \
-    after record_artifact to point at the files the work touched.",
+    after artifact_add to point at the files the work touched.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "artifact": {
                             "type": "string",
-                            "description": "Artifact id the evidence belongs to (from record_artifact)."
+                            "description": "Artifact id the evidence belongs to (from artifact_add)."
                         },
                         "path": {
                             "type": "string",
@@ -499,7 +481,7 @@ fn tools_list_result() -> Value {
 fn tool_requires_login(name: &str) -> bool {
     matches!(
         name,
-        "blame_file" | "blame_history" | "manage_mission" | "record_artifact" | "attach_evidence"
+        "blame" | "log_line" | "mission" | "artifact_add" | "artifact_attach"
     )
 }
 
@@ -526,16 +508,42 @@ fn login_required_error(_name: &str) -> Option<Value> {
     None
 }
 
+/// Maps a retired tool name onto its current Git-aligned name. Unknown names
+/// pass through unchanged. Kept for one transition cycle so agents with the old
+/// names baked into memory files / MCP configs keep working.
+fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "recall_file" => "log_file",
+        "blame_file" => "blame",
+        "blame_history" => "log_line",
+        "explore_memory" | "search_sessions" => "search",
+        "read_session" => "show_session",
+        "live_sessions" => "sessions",
+        "current_context" => "status",
+        "announce_work" => "claim",
+        "list_announcements" => "claims",
+        "list_missions" => "mission_list",
+        "manage_mission" => "mission",
+        "record_artifact" => "artifact_add",
+        "attach_evidence" => "artifact_attach",
+        other => other,
+    }
+}
+
 fn handle_tool_call(
     profiles: &SourceProfileStore,
     store: &LocalStore,
     request: &Value,
 ) -> Result<Value> {
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-    let name = params
+    let raw_name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
+    // Old tool names are accepted for one transition cycle and mapped onto the
+    // current Git-aligned names so already-installed agent memory / MCP configs
+    // keep working. Everything below operates on the canonical (new) name.
+    let name = canonical_tool_name(raw_name);
     let args = params
         .get("arguments")
         .cloned()
@@ -557,13 +565,19 @@ fn handle_tool_call(
         denial
     } else {
         match name {
-            "explore_memory" => {
-                let question = str_arg(&args, "question")?;
-                let query =
-                    build_query_response(profiles, &question, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-                explore_summary(&question, &query)
+            "search" => {
+                let query = args
+                    .get("query")
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("missing required string argument: query"))?
+                    .to_string();
+                let response =
+                    build_query_response(profiles, &query, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
+                serde_json::to_value(response)?
             }
-            "recall_file" => {
+            "log_file" => {
                 let path = str_arg(&args, "path")?;
                 let recall =
                     build_recall_response(store, profiles, &path, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
@@ -609,13 +623,7 @@ fn handle_tool_call(
                 }
                 value
             }
-            "search_sessions" => {
-                let query = str_arg(&args, "query")?;
-                let response =
-                    build_query_response(profiles, &query, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-                serde_json::to_value(response)?
-            }
-            "blame_file" => {
+            "blame" => {
                 let path = str_arg(&args, "path")?;
                 let line_start = usize_arg(&args, "line_start");
                 let line_end = usize_arg(&args, "line_end");
@@ -625,15 +633,15 @@ fn handle_tool_call(
                     .unwrap_or(false);
                 blame_response(store, &path, line_start, line_end, include_unattributed)?
             }
-            "blame_history" => {
+            "log_line" => {
                 let path = str_arg(&args, "path")?;
                 let line_start = usize_arg(&args, "line_start")
-                    .ok_or_else(|| anyhow::anyhow!("blame_history requires line_start"))?;
+                    .ok_or_else(|| anyhow::anyhow!("log_line requires line_start"))?;
                 let line_end = usize_arg(&args, "line_end")
-                    .ok_or_else(|| anyhow::anyhow!("blame_history requires line_end"))?;
+                    .ok_or_else(|| anyhow::anyhow!("log_line requires line_end"))?;
                 blame_history_response(store, &path, line_start as u64, line_end as u64)?
             }
-            "read_session" => {
+            "show_session" => {
                 let source = str_arg(&args, "source")?;
                 let session_id = str_arg(&args, "session_id")?;
                 let offset = usize_arg(&args, "offset").unwrap_or(0);
@@ -651,7 +659,7 @@ fn handle_tool_call(
                 )?;
                 serde_json::to_value(response)?
             }
-            "live_sessions" => {
+            "sessions" => {
                 let scope = args.get("scope").and_then(Value::as_str);
                 let all_profiles = profiles.list_profiles()?;
                 let live = collect_live_sessions(&all_profiles, 0, 50);
@@ -669,10 +677,10 @@ fn handle_tool_call(
                     "count": rows.len(),
                     "sessions": rows,
                     "note": "These sessions appear to be running now. Avoid editing files \
-                they recently touched; call read_session to see what one is doing."
+                they recently touched; call show_session to see what one is doing."
                 })
             }
-            "announce_work" => {
+            "claim" => {
                 let scope = str_arg(&args, "scope")?;
                 let message = str_arg(&args, "message")?;
                 let session_id = args
@@ -703,11 +711,11 @@ fn handle_tool_call(
                 })?;
                 json!({
                     "published": announcement,
-                    "note": "Heads-up posted. Other sessions calling recall_file on a \
+                    "note": "Heads-up posted. Other sessions calling log_file on a \
                 matching path will see it. It auto-expires; no need to clear it manually."
                 })
             }
-            "list_announcements" => {
+            "claims" => {
                 let announce_store = AnnouncementStore::open_global()?;
                 let validity = build_claim_validity(profiles);
                 let claims = match args.get("path").and_then(Value::as_str) {
@@ -718,7 +726,7 @@ fn handle_tool_call(
                 };
                 json!({ "count": claims.len(), "announcements": claims })
             }
-            "current_context" => {
+            "status" => {
                 // Load-or-rebuild: the staleness check rebuilds only when the queue
                 // grew since the cache was written (e.g. events just appended by
                 // other MCP calls), so back-to-back reads in one flow don't each pay
@@ -739,11 +747,11 @@ fn handle_tool_call(
                         "sessions": index.sessions.len(),
                         "artifacts": index.artifacts.len(),
                     },
-                    "note": "Use list_missions to see in-flight work, manage_mission to \
-                open or update a goal, and record_artifact to log deliverables."
+                    "note": "Use mission_list to see in-flight work, mission to \
+                open or update a goal, and artifact_add to log deliverables."
                 })
             }
-            "list_missions" => {
+            "mission_list" => {
                 let index = store.load_or_rebuild_index()?;
                 let status_filter = args
                     .get("status")
@@ -780,7 +788,7 @@ fn handle_tool_call(
                     .ok_or_else(|| anyhow::anyhow!("mission not found: {mission}"))?;
                 serde_json::to_value(item)?
             }
-            "manage_mission" => {
+            "mission" => {
                 let action = str_arg(&args, "action")?;
                 let actor = mcp_actor(&args);
                 match action.as_str() {
@@ -808,7 +816,7 @@ fn handle_tool_call(
                             "created": true,
                             "mission_id": mission_id.to_string(),
                             "note": "Mission opened. Record deliverables against it with \
-                        record_artifact, and update its status with manage_mission action='update'."
+                        artifact_add, and update its status with mission action='update'."
                         })
                     }
                     "update" => {
@@ -834,7 +842,7 @@ fn handle_tool_call(
                             && status.is_none()
                         {
                             return Err(anyhow::anyhow!(
-                            "manage_mission update needs at least one of project, title, description, or status"
+                            "mission update needs at least one of project, title, description, or status"
                         ));
                         }
                         let event = TraceEvent::mission_updated(
@@ -853,12 +861,12 @@ fn handle_tool_call(
                     }
                     other => {
                         return Err(anyhow::anyhow!(
-                        "unknown manage_mission action: {other} (expected 'create' or 'update')"
+                        "unknown mission action: {other} (expected 'create' or 'update')"
                     ))
                     }
                 }
             }
-            "record_artifact" => {
+            "artifact_add" => {
                 let title = str_arg(&args, "title")?;
                 let actor = mcp_actor(&args);
                 let mission_id = match args.get("mission").and_then(Value::as_str) {
@@ -894,10 +902,10 @@ fn handle_tool_call(
                 json!({
                     "recorded": true,
                     "artifact_id": artifact_id.to_string(),
-                    "note": "Deliverable logged. Attach the backing files with attach_evidence."
+                    "note": "Deliverable logged. Attach the backing files with artifact_attach."
                 })
             }
-            "attach_evidence" => {
+            "artifact_attach" => {
                 let artifact = str_arg(&args, "artifact")?;
                 let path = str_arg(&args, "path")?;
                 let actor = mcp_actor(&args);
@@ -936,34 +944,7 @@ fn handle_tool_call(
     }))
 }
 
-/// Synthesizes a compact, agent-ready summary from a query result — this is the
-/// "coarse-grained, agent-like" tool: it does the search-and-condense work inside
-/// Brick so the caller gets conclusions, not raw rows.
-fn explore_summary(question: &str, query: &crate::metadata::MetadataQueryResponse) -> Value {
-    let findings: Vec<Value> = query
-        .matches
-        .iter()
-        .take(5)
-        .map(|m| {
-            json!({
-                "tool": m.source_id,
-                "intent": m.intent,
-                "when": m.last_seen_at,
-                "repo": m.repo_path,
-                "branch": m.branch,
-                "read_session_hint": m.transcript_ref.mcp_hint(),
-            })
-        })
-        .collect();
-    json!({
-        "question": question,
-        "summary": query.summary,
-        "match_count": query.match_count,
-        "top_findings": findings,
-        "next_step": "Call read_session with a finding's source + session_id to read its transcript."
-    })
-}
-
+/// Returns a required non-empty string argument, or an error.
 fn str_arg(args: &Value, key: &str) -> Result<String> {
     args.get(key)
         .and_then(Value::as_str)

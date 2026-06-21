@@ -75,6 +75,45 @@ pub fn show_mission(mission: String, store: &LocalStore) -> Result<()> {
     Ok(())
 }
 
+/// Lists tracked missions, newest activity first, with optional filters.
+///
+/// Reuses the same index path as the `list_missions` MCP tool so the CLI and
+/// agent surfaces agree on ordering and filtering.
+pub fn list_missions(
+    status: Option<MissionStatus>,
+    project: Option<String>,
+    limit: usize,
+    store: &LocalStore,
+) -> Result<()> {
+    let index = store.load_or_rebuild_index()?;
+    let mut missions: Vec<&IndexedMission> = index
+        .missions
+        .values()
+        .filter(|mission| match status {
+            Some(want) => mission.status == want,
+            None => true,
+        })
+        .filter(|mission| match project.as_deref() {
+            Some(project) => mission.project_id.as_deref() == Some(project),
+            None => true,
+        })
+        .collect();
+    missions.sort_by_key(|mission| std::cmp::Reverse(mission.last_event_at));
+    missions.truncate(limit);
+    println!("mission_count={}", missions.len());
+    for mission in missions {
+        println!(
+            "mission_id={} status={} project_id={} last_event_at={} title={}",
+            mission.mission_id,
+            format_mission_status(mission.status),
+            mission.project_id.as_deref().unwrap_or(""),
+            mission.last_event_at,
+            mission.title.as_deref().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
 /// Prints a local Session projection by ID.
 pub fn show_session(session: String, store: &LocalStore) -> Result<()> {
     let index = store.load_or_rebuild_index()?;
