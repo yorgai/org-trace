@@ -415,13 +415,29 @@ fn explain_tool_call(
     let anchor_input = str_arg(args, "anchor")?;
     let depth = usize_arg(args, "depth").unwrap_or(DEFAULT_EXPLAIN_DEPTH);
 
+    // Resolve the store from the anchor so a server spawned with an unrelated
+    // cwd (the universal `cwd=/` MCP-client behavior) still reads the right
+    // repo. No repo for this anchor → a clean no-record response, never a crash.
+    let Some(store) = store_for_anchor(store, &anchor_input) else {
+        return Ok(json!({
+            "anchor": { "input": anchor_input, "kind": "unknown", "resolved_events": [] },
+            "causal_chain": [],
+            "forward": [],
+            "truncated": false,
+            "note": "No Brick repo resolved for this anchor (the MCP server was \
+likely started outside a git repo, e.g. cwd=/). Pass an absolute path anchor, \
+or set the server's working directory to the workspace. Falling back to git/grep \
+is fine here."
+        }));
+    };
+    let store = &store;
+
     let events = store.read_all_events()?;
     let index = store.load_or_rebuild_index()?;
 
     // file:line anchors need git + the working tree; direct ids do not.
     let (anchor, anchored_path) = if let Some((path, line)) = parse_file_line(&anchor_input) {
-        let cwd = std::env::current_dir()?;
-        let repo_root = discover_repo_root(&cwd)?;
+        let repo_root = store.repo_root().to_path_buf();
         let rel_path = normalize_repo_relative(&repo_root, &path);
         let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
         (anchor, Some(rel_path))
@@ -429,11 +445,7 @@ fn explain_tool_call(
         // A whole-file anchor (no `:line`) — agents very often ask about a file,
         // not a line. Match the file's change events directly instead of treating
         // the path as an opaque id (which wrongly reported "no record").
-        let rel_path = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| discover_repo_root(&cwd).ok())
-            .map(|repo_root| normalize_repo_relative(&repo_root, &anchor_input))
-            .unwrap_or_else(|| anchor_input.clone());
+        let rel_path = normalize_repo_relative(store.repo_root(), &anchor_input);
         (resolve_file_anchor(&events, &rel_path), Some(rel_path))
     } else {
         (resolve_direct_anchor(&events, &anchor_input), None)
@@ -482,6 +494,14 @@ more changes flow through Brick, explain gets richer."),
 /// `link` dispatch: write a `causal.linked` event. Supports a standalone
 /// rationale (note only) or a cross-event edge (cause anchor + relation).
 fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
+    // Resolve the store from the effect anchor (or cause) so a server spawned
+    // with `cwd=/` still writes into the agent's actual repo, not `/.brick`.
+    let anchor_hint = opt_str_arg(args, "effect")
+        .or_else(|| opt_str_arg(args, "cause"))
+        .unwrap_or_default();
+    let resolved_store = store_for_anchor(store, &anchor_hint);
+    let store = resolved_store.as_ref().unwrap_or(store);
+
     let events = store.read_all_events()?;
 
     // Track whether we synthesized a diff so the response can tell the agent
@@ -860,6 +880,44 @@ fn looks_like_path(input: &str) -> bool {
         return false;
     }
     s.contains('/') || s.contains('.')
+}
+
+/// Resolves the `LocalStore` to use for an anchor, making the MCP server robust
+/// to being spawned with an unrelated process cwd.
+///
+/// MCP clients (Claude Code, Codex, ORGII, …) routinely spawn a stdio server
+/// with `cwd=/` — the agent's workspace is NOT the server's cwd. The default
+/// `store` is built from process cwd in `main.rs`, so with `cwd=/` it points at
+/// `/.brick` (unwritable) and every read explodes on `init()`.
+///
+/// When the anchor is an **absolute** path, its own repo root is authoritative —
+/// derive the store from there instead of process cwd. Returns `None` when no
+/// git repo can be found for the anchor (the honest "Brick has no repo here"
+/// case, which the caller renders as a clean no-record result rather than a
+/// hard error). For non-path anchors (ids) the default store is used as-is.
+fn store_for_anchor(default: &LocalStore, anchor: &str) -> Option<LocalStore> {
+    let path_part = parse_file_line(anchor)
+        .map(|(p, _)| p)
+        .unwrap_or_else(|| anchor.to_string());
+    let candidate = std::path::Path::new(&path_part);
+    if candidate.is_absolute() {
+        // Walk up from the anchor's directory to find its repo root.
+        let start = if candidate.is_dir() {
+            candidate.to_path_buf()
+        } else {
+            candidate.parent().unwrap_or(candidate).to_path_buf()
+        };
+        return discover_repo_root(&start)
+            .ok()
+            .map(|repo_root| LocalStore::new(repo_root));
+    }
+    // Relative anchor: fall back to the default (cwd-derived) store only when its
+    // repo root is a real git repo — otherwise there is nothing to read.
+    if discover_repo_root(default.repo_root()).is_ok() {
+        Some(LocalStore::new(default.repo_root().to_path_buf()))
+    } else {
+        None
+    }
 }
 
 /// Resolves any anchor (file:line, artifact/mission/event id) to a single event

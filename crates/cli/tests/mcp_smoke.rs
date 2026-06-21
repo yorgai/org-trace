@@ -541,10 +541,68 @@ fn explain_file_line_resolves_who_via_blame() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
-/// Regression for live Claude testing: an agent very often anchors on a whole
-/// file (no `:line`) — `explain src/main.rs`. That must resolve to the file's
-/// change events with the WHO + `mission_title`, NOT report "No Brick record"
-/// (which wrongly pushed the agent back to git), and the chain must not be empty.
+/// Regression from live ORGII testing: MCP clients (Claude Code, Codex, ORGII)
+/// spawn the stdio server with `cwd=/` — NOT the agent's workspace. The store is
+/// otherwise derived from process cwd, so `cwd=/` made every `explain` crash on
+/// `init()` trying to create `/.brick/queue` ("failed to create provenance queue
+/// directory"). The fix resolves the store from an absolute-path anchor instead.
+/// This spawns the server with a non-repo cwd and asserts an ABSOLUTE anchor
+/// still recovers the WHO/WHY, while a RELATIVE anchor degrades to a clean note
+/// (never a crash).
+#[test]
+fn explain_resolves_store_from_absolute_anchor_when_cwd_is_unrelated() {
+    let w = world(
+        "explain-cwd-robust",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+
+    // A non-repo directory standing in for the `cwd=/` an MCP client would use.
+    let elsewhere = w.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let abs_anchor = format!("{}/src/main.rs", w.repo.display());
+    let mut m = Mcp::spawn(&w.home, &elsewhere);
+
+    // Absolute whole-file anchor → store resolved from the anchor's repo, the
+    // file's change events (and their WHO) recovered despite the unrelated cwd.
+    let chain = m.call("explain", json!({ "anchor": abs_anchor }));
+    assert!(
+        !chain["anchor"]["resolved_events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "absolute anchor must resolve despite unrelated cwd: {chain}"
+    );
+    assert!(
+        step_for_actor(&chain, "codex-bot").is_some(),
+        "absolute anchor must recover the WHO despite unrelated cwd: {chain}"
+    );
+
+    // Relative anchor → no repo from this cwd → clean note, NOT a crash.
+    let rel = m.call("explain", json!({ "anchor": "src/main.rs:3" }));
+    assert!(
+        rel.get("_rpc_error").is_none(),
+        "relative anchor with unrelated cwd must not hard-error: {rel}"
+    );
+    assert!(
+        rel["causal_chain"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "relative anchor with no repo resolves to an empty chain: {rel}"
+    );
+    assert!(
+        rel["note"].as_str().unwrap_or_default().contains("No Brick repo resolved"),
+        "relative anchor with no repo must carry the actionable note: {rel}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 #[test]
 fn explain_whole_file_anchor_resolves_without_no_record() {
     let w = world(
