@@ -54,8 +54,10 @@ Input:
 `artifact_*` id, a `mission_*` id, or an event id. The path may be repo-relative
 or **absolute**; an absolute path is the most robust because it lets the server
 locate the repo regardless of its own working directory (see
-[Working directory](#working-directory-and-anchors)). `depth` is the causal hops
-to walk back (default 3, max 8).
+[Working directory](#working-directory-and-anchors)). The tool schema steers
+agents toward absolute anchors for exactly this reason, so the default agent
+behavior succeeds even when the client spawned the server with `cwd=/`. `depth`
+is the causal hops to walk back (default 3, max 8).
 
 Output (abridged):
 
@@ -163,7 +165,9 @@ This matters because **MCP clients routinely spawn the stdio server with
 directory. Two ways to make `explain`/`link` resolve the right repo:
 
 - **Pass absolute path anchors** (recommended for agents): always works,
-  independent of how the client launched the server.
+  independent of how the client launched the server. The `explain`/`link` tool
+  schemas already steer agents to do this, so it is the default path — no client
+  config needed.
 - **Set the server's `cwd` to the workspace** in the MCP client config, e.g.
 
   ```json

@@ -139,14 +139,18 @@ be read from the code), what was derived from / triggered by it, each step's \
 confidence (explicit > observed > inferred), a transcript pointer per step, and \
 a `live` field warning if another session is editing the same file right now. \
 This subsumes line-level blame (WHO) into the WHY answer. Anchor can be a \
-`path:line` (e.g. `crates/core/src/auth.rs:42`), an `artifact_*` id, a \
-`mission_*` id, or an event id.",
+`path:line` (e.g. `/abs/workspace/src/auth.rs:42`), an `artifact_*` id, a \
+`mission_*` id, or an event id. Prefer an ABSOLUTE path — the server may run \
+from a different working directory than your workspace, and an absolute anchor \
+always resolves the right repo.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "anchor": {
                     "type": "string",
-                    "description": "What to explain: `path:line`, an artifact id, a \
+                    "description": "What to explain: a `path:line` or whole-file \
+`path` (use an ABSOLUTE path, e.g. `/abs/workspace/src/auth.rs:42`, so it \
+resolves regardless of the server's working directory), an artifact id, a \
 mission id, or an event id."
                 },
                 "depth": {
@@ -181,17 +185,18 @@ edits, commit (or link) between them so each reason binds to the right files.",
                 "effect": {
                     "type": "string",
                     "description": "Anchor for the change you just made: a file \
-`path`, a `path:line`, or an event id. Omit to auto-capture your current \
+`path`, a `path:line` (prefer an ABSOLUTE path so it resolves regardless of the \
+server's working directory), or an event id. Omit to auto-capture your current \
 uncommitted changes (all touched files) and bind the reason to them."
                 },
                 "cause": {
                     "type": "string",
                     "description": "Optional anchor that caused/motivated this \
-change: a `path`, `path:line`, artifact, mission, or event id. If you are \
-implementing a planned work item, pass that `mission_…` id here (with \
-relation='derived_from') so the planning record links to the actual code — do \
-NOT just mention the mission in `note`, that leaves the graph disconnected. \
-Omit for a standalone rationale."
+change: a `path`, `path:line` (prefer an ABSOLUTE path), artifact, mission, or \
+event id. If you are implementing a planned work item, pass that `mission_…` id \
+here (with relation='derived_from') so the planning record links to the actual \
+code — do NOT just mention the mission in `note`, that leaves the graph \
+disconnected. Omit for a standalone rationale."
                 },
                 "relation": {
                     "type": "string",
