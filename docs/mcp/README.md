@@ -51,8 +51,11 @@ Input:
 ```
 
 `anchor` is a `path:line` (resolved through line-level blame, drift-aware), an
-`artifact_*` id, a `mission_*` id, or an event id. `depth` is the causal hops to
-walk back (default 3, max 8).
+`artifact_*` id, a `mission_*` id, or an event id. The path may be repo-relative
+or **absolute**; an absolute path is the most robust because it lets the server
+locate the repo regardless of its own working directory (see
+[Working directory](#working-directory-and-anchors)). `depth` is the causal hops
+to walk back (default 3, max 8).
 
 Output (abridged):
 
@@ -144,6 +147,37 @@ index. Deleting the derived index or the SQLite `causal_edges` table and
 rebuilding from JSONL reproduces every causal edge exactly — JSONL is the source
 of truth.
 
+## Working directory and anchors
+
+A Brick repo is located by walking up from a path to its git root. The server
+resolves that path in one of two ways, in order:
+
+1. **From the anchor**, when it is an absolute path (`/abs/workspace/src/x.rs`
+   or `/abs/workspace/src/x.rs:42`). The repo is discovered from the anchor
+   itself, so the server reads the right repo no matter where it was started.
+2. **From the server's working directory**, when the anchor is repo-relative
+   (`src/x.rs:42`).
+
+This matters because **MCP clients routinely spawn the stdio server with
+`cwd=/`** — the agent's workspace is *not* inherited as the server's working
+directory. Two ways to make `explain`/`link` resolve the right repo:
+
+- **Pass absolute path anchors** (recommended for agents): always works,
+  independent of how the client launched the server.
+- **Set the server's `cwd` to the workspace** in the MCP client config, e.g.
+
+  ```json
+  { "mcpServers": { "brick": {
+      "command": "brick", "args": ["mcp-serve"],
+      "cwd": "/abs/path/to/workspace"
+  } } }
+  ```
+
+When a repo-relative anchor is used and the working directory is not inside a
+git repo (the `cwd=/` case), `explain` does **not** fail — it returns an empty
+chain with an actionable `note` telling the caller to pass an absolute anchor or
+set the working directory, and the agent falls back to git there.
+
 ## Verifying
 
 `crates/cli/tests/mcp_smoke.rs` spawns the real `brick mcp-serve` binary and
@@ -151,5 +185,7 @@ drives it over stdio: it asserts the main surface is exactly `explain` + `link`,
 the planning surface exposes the five planning tools, retired names return a
 migration hint, `explain` resolves a `path:line` through blame and walks the
 causal chain (including across commit + line drift), `link` records both a
-standalone rationale and a cross-event edge, and `explain` surfaces a live
-session on the anchor file.
+standalone rationale and a cross-event edge, `explain` surfaces a live session
+on the anchor file, and — spawning the server with an unrelated working
+directory — an absolute anchor still recovers the WHO/WHY while a relative
+anchor degrades to the actionable note.
