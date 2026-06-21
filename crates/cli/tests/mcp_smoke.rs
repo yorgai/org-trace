@@ -788,6 +788,58 @@ fn link_without_effect_auto_captures_the_edited_file() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// Regression from live Codex testing: an agent edits a file then calls `link`
+/// with `effect: "src/cache.rs:1"` — a perfectly reasonable anchor on the line
+/// it just changed. That line has no Brick event yet (the edit is uncommitted),
+/// so the blame-based resolver finds nothing. `link` must NOT hard-error; it
+/// should fall back to capturing the working diff, exactly like the no-effect
+/// path. (Codex recovered by retrying without effect, but a lesser agent fails.)
+#[test]
+fn link_with_unresolvable_file_effect_falls_back_to_working_capture() {
+    let w = world(
+        "link-effect-fallback",
+        &[("src/cache.rs", "fn get() {}\n")],
+    );
+    // Agent edits cache.rs with its own tools; no Brick event exists for it.
+    std::fs::write(
+        w.repo.join("src/cache.rs"),
+        "fn get() -> Option<String> {\n    None\n}\n",
+    )
+    .unwrap();
+
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let linked = m.call(
+        "link",
+        json!({"effect":"src/cache.rs:1","relation":"rationale","note":"get() now enforces TTL expiry","source":"codex_app"}),
+    );
+    assert_eq!(
+        linked["linked"],
+        json!(true),
+        "a file:line effect with no event must fall back, not error: {linked}"
+    );
+    assert_eq!(
+        linked["captured_files"],
+        json!(["src/cache.rs"]),
+        "fallback must capture the edited file: {linked}"
+    );
+
+    let chain = m.call("explain", json!({"anchor":"src/cache.rs"}));
+    let has_why = chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("TTL expiry"))
+                .unwrap_or(false)
+        });
+    assert!(has_why, "rationale must be recoverable: {chain}");
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 #[test]
 fn link_cross_event_edge_shows_as_forward_effect() {
     let w = world(

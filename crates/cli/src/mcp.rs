@@ -485,8 +485,28 @@ fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
     let mut captured_files: Vec<String> = Vec::new();
 
     let effect_event = match opt_str_arg(args, "effect") {
-        Some(anchor) => resolve_anchor_to_event(store, &events, &anchor)?
-            .ok_or_else(|| anyhow::anyhow!("could not resolve effect anchor: {anchor}"))?,
+        Some(anchor) => match resolve_anchor_to_event(store, &events, &anchor)? {
+            Some(event_id) => event_id,
+            // The anchor resolved to nothing. If it's a file path, the agent is
+            // pointing at code it JUST edited with its own tools (no Brick event
+            // yet) — capture the working diff and bind to that, exactly like the
+            // no-effect path, instead of hard-erroring on a perfectly reasonable
+            // anchor. Only a non-path anchor (a stale id) is a real error.
+            None if looks_like_path(&anchor) => {
+                match capture_working_diff_event(store, args, &mut captured_files)? {
+                    Some(event_id) => event_id,
+                    None => latest_diff_event(&events).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "effect anchor '{anchor}' has no Brick event and there are no \
+uncommitted changes to capture"
+                        )
+                    })?,
+                }
+            }
+            None => {
+                return Err(anyhow::anyhow!("could not resolve effect anchor: {anchor}"));
+            }
+        },
         // No explicit effect: the agent just changed code with its own edit tools
         // (which produce no Brick event), so capture the current working diff and
         // bind the rationale to THAT — the files actually touched — instead of
