@@ -199,6 +199,12 @@ started outside a git repo, the planning tools fall back to a store rooted at
 failing — writes and reads land in that same store, so a mission created over
 MCP lists straight back.
 
+The **`live` field** reads source profiles from `<repo>/.brick/sources`. Because
+the server is spawned with `cwd=/`, those profiles are resolved from the repo
+the *anchor* points at — not the process cwd — so cross-session awareness fires
+on the default absolute-anchor path. With a relative anchor and no repo from
+cwd, there is nothing to resolve and `live` is simply absent (never a crash).
+
 ## Verifying
 
 `crates/cli/tests/mcp_smoke.rs` spawns the real `brick mcp-serve` binary and
@@ -208,7 +214,8 @@ migration hint, `explain` resolves a `path:line` through blame and walks the
 causal chain (including across commit + line drift), `link` records both a
 standalone rationale and a cross-event edge, `explain` surfaces a live session
 on the anchor file while excluding a finished (Idle) session from the `live`
-field, and — spawning the server with an unrelated working
+field (and still firing for a live session via an absolute anchor when the
+server's cwd is unrelated), and — spawning the server with an unrelated working
 directory — an absolute anchor still recovers the WHO/WHY while a relative
 anchor degrades to the actionable note, and the planning surface still creates
 and lists a mission via its `BRICK_HOME` fallback.

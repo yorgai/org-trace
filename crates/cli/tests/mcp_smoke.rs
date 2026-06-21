@@ -1200,6 +1200,37 @@ fn explain_live_excludes_finished_session_but_keeps_active() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Regression from live ORGII testing: the `live` field must fire even when the
+/// MCP server was spawned with an unrelated cwd (the universal `cwd=/` client
+/// behavior). Source profiles live under `<repo>/.brick/sources`, so a server
+/// rooted at `/` reads none and `live` silently never fires — exactly the gap
+/// that made cross-session awareness dead on arrival in real deployments. The
+/// fix rebuilds the profile store from the repo the anchor resolved to. This
+/// spawns from a non-repo dir and asserts an ABSOLUTE anchor on a file a live
+/// session is editing still surfaces the collision.
+#[test]
+fn explain_live_fires_with_absolute_anchor_when_cwd_is_unrelated() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-live-cwd");
+    // A live Codex session is editing commands_git.rs right now.
+    write_codex(&codex_dir, "codex-live-cwd-001", &repo, "src/commands_git.rs");
+
+    // Spawn the server with a cwd OUTSIDE the repo — the cwd-derived profile
+    // store would find nothing here.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let abs_anchor = format!("{}/src/commands_git.rs:1", repo.display());
+    let mut m = Mcp::spawn(&home, &elsewhere);
+
+    let chain = m.call("explain", json!({ "anchor": abs_anchor }));
+    assert!(
+        chain.get("live").is_some(),
+        "live must fire from the anchor-resolved repo's profiles despite cwd=/: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn explain_is_honest_when_no_record_exists() {
     let (root, home, repo, _codex_dir, _claude_dir) = setup_world("explain-empty");

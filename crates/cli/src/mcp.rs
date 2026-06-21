@@ -464,8 +464,22 @@ is fine here."
     // right now, surface it so the agent avoids a cross-session edit conflict.
     // This is what replaced the standalone `sessions`/`claims` coordination tools.
     if let Some(path) = anchored_path {
-        if let Ok(all_profiles) = profiles.list_profiles() {
-            if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
+        // Source profiles live under `<repo>/.brick/sources`. The `profiles`
+        // handed in here was built from the server's process cwd, which under
+        // the universal `cwd=/` MCP-client spawn resolves to `/` and finds
+        // nothing — so `live` would silently never fire. Rebuild the profile
+        // store from the SAME repo the anchor resolved to (see `store_for_anchor`
+        // above), and only fall back to the cwd-derived `profiles` when that
+        // store has no profiles of its own. This makes `live` work for the
+        // default agent path (absolute anchor + cwd=/), exactly like explain's
+        // store resolution.
+        let anchor_profiles = SourceProfileStore::new(store.repo_root().to_path_buf());
+        let live_profiles = match anchor_profiles.list_profiles() {
+            Ok(found) if !found.is_empty() => found,
+            _ => profiles.list_profiles().unwrap_or_default(),
+        };
+        if !live_profiles.is_empty() {
+            if let Some(broadcast) = build_live_broadcast(&live_profiles, &path, None) {
                 if let Value::Object(map) = &mut value {
                     map.insert("live".to_string(), serde_json::to_value(broadcast)?);
                 }
