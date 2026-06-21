@@ -706,6 +706,88 @@ fn link_rationale_then_explain_reads_the_why() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// Regression from live Claude testing: an agent edits a file with its own
+/// tools (no Brick diff event), then calls `link` with no `effect`. The
+/// rationale must bind to the file it actually changed — `link` auto-captures
+/// the working diff — NOT mis-attribute to some unrelated prior diff. This is
+/// the bug where a cache.rs rationale landed on auth.rs's event.
+#[test]
+fn link_without_effect_auto_captures_the_edited_file() {
+    let w = world(
+        "link-autocapture",
+        &[
+            ("src/auth.rs", "fn refresh() {\n    token();\n}\n"),
+            ("src/cache.rs", "fn get() {}\n"),
+        ],
+    );
+    // A prior, unrelated diff exists on auth.rs (committed) — the old code would
+    // wrongly bind a new rationale to THIS.
+    std::fs::write(
+        w.repo.join("src/auth.rs"),
+        "fn refresh() {\n    lock();\n    token();\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-q", "-m", "auth"]).success());
+
+    // Now the agent edits cache.rs with its own tools — no Brick event for it.
+    std::fs::write(
+        w.repo.join("src/cache.rs"),
+        "fn get() -> Option<String> {\n    None\n}\n",
+    )
+    .unwrap();
+
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let linked = m.call(
+        "link",
+        json!({"relation":"rationale","note":"get() now expires stale entries via a TTL check","source":"claude_code"}),
+    );
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+    assert_eq!(
+        linked["captured_files"],
+        json!(["src/cache.rs"]),
+        "link must auto-capture the edited file, not an unrelated diff: {linked}"
+    );
+
+    // The rationale must be readable from cache.rs...
+    let cache_chain = m.call("explain", json!({"anchor":"src/cache.rs"}));
+    let cache_has_why = cache_chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("TTL check"))
+                .unwrap_or(false)
+        });
+    assert!(
+        cache_has_why,
+        "cache.rs must carry its own rationale: {cache_chain}"
+    );
+
+    // ...and must NOT have leaked onto auth.rs.
+    let auth_chain = m.call("explain", json!({"anchor":"src/auth.rs"}));
+    let auth_polluted = auth_chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("TTL check"))
+                .unwrap_or(false)
+        });
+    assert!(
+        !auth_polluted,
+        "cache.rs rationale must not pollute auth.rs: {auth_chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 #[test]
 fn link_cross_event_edge_shows_as_forward_effect() {
     let w = world(

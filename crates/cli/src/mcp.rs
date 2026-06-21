@@ -14,13 +14,13 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    discover_repo_root, explain_from_events, resolve_direct_anchor, resolve_file_anchor,
-    resolve_file_line_anchor, AnnouncementStore, CausalChain, LocalStore,
-    SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
+    capture_diff, discover_repo_root, explain_from_events, resolve_direct_anchor,
+    resolve_file_anchor, resolve_file_line_anchor, AnnouncementStore, CausalChain,
+    DiffCaptureRequest, LocalStore, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
-    ArtifactKind, CausalLinkedPayload, CausalRelation, ConfidenceLevel, FileRefId,
+    ArtifactKind, CausalLinkedPayload, CausalRelation, ConfidenceLevel, DiffTarget, FileRefId,
     MissionCreatedPayload, MissionId, MissionStatus, MissionUpdatedPayload, ProjectId, SessionId,
     TraceEvent,
 };
@@ -475,12 +475,28 @@ more changes flow through Brick, explain gets richer."),
 fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
     let events = store.read_all_events()?;
 
+    // Track whether we synthesized a diff so the response can tell the agent
+    // which files the rationale was bound to (otherwise it silently binds to
+    // whatever it could resolve, which used to be an unrelated stale diff).
+    let mut captured_files: Vec<String> = Vec::new();
+
     let effect_event = match opt_str_arg(args, "effect") {
         Some(anchor) => resolve_anchor_to_event(store, &events, &anchor)?
             .ok_or_else(|| anyhow::anyhow!("could not resolve effect anchor: {anchor}"))?,
-        // No explicit effect: bind to the most recent captured diff event.
-        None => latest_diff_event(&events)
-            .ok_or_else(|| anyhow::anyhow!("no effect given and no recent diff to bind to"))?,
+        // No explicit effect: the agent just changed code with its own edit tools
+        // (which produce no Brick event), so capture the current working diff and
+        // bind the rationale to THAT — the files actually touched — instead of
+        // guessing at the most recent prior diff (which mis-attributed the note).
+        None => match capture_working_diff_event(store, args, &mut captured_files)? {
+            Some(event_id) => event_id,
+            // Working tree clean (e.g. already committed) — fall back to the most
+            // recent captured diff so a follow-up rationale still lands somewhere.
+            None => latest_diff_event(&events).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no effect given, no uncommitted changes to capture, and no recent diff to bind to"
+                )
+            })?,
+        },
     };
 
     let cause_anchor = opt_str_arg(args, "cause");
@@ -522,8 +538,47 @@ fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
         "cause_events": cause_events.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "relation": relation_wire(relation),
         "note": note,
+        "captured_files": captured_files,
         "note_hint": "Recorded. The next agent can recover this with `explain`."
     }))
+}
+
+/// When `link` is called with no `effect`, the agent has just edited code with
+/// its own tools (which leave no Brick event). Capture the current working diff
+/// so the rationale binds to the files actually touched, and return the new
+/// `diff.captured` event id. Returns `None` when the working tree is clean.
+fn capture_working_diff_event(
+    store: &LocalStore,
+    args: &Value,
+    captured_files: &mut Vec<String>,
+) -> Result<Option<uuid::Uuid>> {
+    let cwd = std::env::current_dir()?;
+    let Ok(repo_root) = discover_repo_root(&cwd) else {
+        return Ok(None);
+    };
+    let payload = capture_diff(
+        &repo_root,
+        DiffCaptureRequest {
+            target: DiffTarget::Working,
+            base_commit: None,
+            head_commit: None,
+            repo_context_id: None,
+        },
+    )?;
+    if payload.file_changes.is_empty() {
+        return Ok(None);
+    }
+    captured_files.extend(payload.file_changes.iter().map(|change| change.path.clone()));
+    let event = TraceEvent::diff_captured(
+        mcp_actor(args),
+        ArtifactId::new(),
+        None,
+        None,
+        payload,
+    )?;
+    let event_id = event.event_id;
+    store.append_event(&event)?;
+    Ok(Some(event_id))
 }
 
 /// Planning-surface dispatch (mission / artifact tools).
