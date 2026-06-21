@@ -16,6 +16,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
+uuid.workspace = true
 dialoguer = "0.12.0"
 
 [dev-dependencies]

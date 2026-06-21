@@ -1,12 +1,11 @@
 # MCP capability kit
 
 `brick mcp-serve` runs Brick as a [Model Context Protocol](https://modelcontextprotocol.io)
-server over stdio, turning one install into a shared work surface that any
-MCP-capable agent (Claude Code, Cursor, ORGII, …) can call. `brick agent install`
-registers it automatically.
+server over stdio. `brick agent install` registers it automatically.
 
 This surface is fully open-source and independent of the proprietary sync layer:
-none of these tools require `--features sync` or a running `brick-server`.
+nothing here requires `--features sync` or a running `brick-server`. Local
+`explain` is free — the membership wall is on cross-machine sync.
 
 ## Transport
 
@@ -17,304 +16,140 @@ text content block whose body is a JSON string — clients parse that JSON for t
 structured payload documented below.
 
 All tool logic reuses the same `brick-core` primitives the CLI uses
-(`TraceEvent::*` constructors, `store.append_event`, index rebuilds), so MCP and
-CLI never drift.
+(`explain_from_events`, `TraceEvent::*` constructors, `store.append_event`), so
+MCP and CLI never drift.
 
-## The three capabilities
+## Two surfaces
 
-The fourteen tools group into three jobs an agent needs across a task:
+`brick mcp-serve` exposes a deliberately tiny surface, because every extra tool
+dilutes the model's attention and eats context. Anything an agent will not
+reliably reach for on its own is pushed via hooks or kept off the agent surface.
 
-| Capability | Tools | Question it answers |
+| Surface | How to start | Tools |
 | --- | --- | --- |
-| **Memory** | `search`, `log_file`, `blame`, `log_line`, `show_session` | "What happened before?" |
-| **Planning & work-item management** | `status`, `mission_list`, `show_mission`, `mission`, `artifact_add`, `artifact_attach` | "What am I doing, and what did I produce?" |
-| **Coordination & awareness** | `sessions`, `claim`, `claims` | "Who else is working, and on what?" |
+| **Main (coding agent)** | `brick mcp-serve` | `explain`, `link` |
+| **Planning agent** | `brick mcp-serve --planning` | `mission`, `mission_list`, `show_mission`, `artifact_add`, `artifact_attach` |
 
-> The MCP tool names mirror the `brick` CLI verbs one-for-one (`log_file` ↔
-> `brick log file`, `blame` ↔ `brick blame`, …). The previous names
-> (`recall_file`, `explore_memory`, `search_sessions`, `read_session`,
-> `current_context`, `list_missions`, `manage_mission`, `record_artifact`,
-> `attach_evidence`, `live_sessions`, `announce_work`, `list_announcements`,
-> `blame_file`, `blame_history`) still resolve as aliases for one release.
+The planning surface is for a *dedicated planning custom agent* (a Claude
+subagent, a Codex/Cursor mode, or an ORGII custom agent). When a user asks to
+plan, the main agent spawns the planning agent; the coding agent's own tool list
+stays at two.
 
-## Recommended flow
+## Main surface
 
-A natural end-to-end flow chains all three capabilities:
+### `explain`
 
-```text
-status                 # where am I (org / project / mission / counts)
-  → mission_list       # what work is already in flight
-  → mission            # action="create": turn the request into a tracked goal
-  → claim              # claim the files/area before editing
-  → (do the work)
-  → artifact_add       # log the deliverable, linked to the mission
-  → artifact_attach    # point the artifact at the files that back it
-  → mission            # action="update", status="completed": close the loop
+Your single entry point into existing code. When you locate a file or code you
+are about to change or reason about, call `explain` **before** drawing
+conclusions from the code alone — prefer it over `grep` and `git log`, which are
+a fallback used only when Brick has no record.
+
+Input:
+
+```json
+{ "anchor": "crates/core/src/auth.rs:42", "depth": 3 }
 ```
 
-Memory tools are called opportunistically — typically `log_file` right before
-editing a file, and `search` when you need prior context by topic.
+`anchor` is a `path:line` (resolved through line-level blame, drift-aware), an
+`artifact_*` id, a `mission_*` id, or an event id. `depth` is the causal hops to
+walk back (default 3, max 8).
 
----
+Output (abridged):
 
-## Memory
-
-Read-only queries over cross-tool session history on this machine. They never
-write events.
-
-### `log_file`
-
-Recall who previously changed a file and why, across every coding tool on this
-machine. Call before editing a file.
-
-- **Input**: `path` (string, required) — repo-relative or absolute file path.
-- **Output**: a one-line summary plus per-session intent and change size. The payload may also include:
-  - `live_broadcast` — a session running *right now* that touches this path.
-  - `active_claims` — `claim` heads-up notes from other sessions covering this path (`{ count, message, claims[] }`).
-
-### `blame`
-
-Line-level AI blame: for each current line of a file, which AI agent / session /
-mission produced it. Where `log_file` answers "who touched this file", `blame`
-answers "who wrote *this line*". Attribution is reconstructed from the append-only
-event log (the source of truth), so it is provenance, not a similarity guess.
-
-- **Input**: `path` (string, required) — repo-relative file path; optional `line_start` / `line_end` to clip the range.
-- **Output**: `{ path, line_count, attributed_lines, lines[] }` where each line carries `line_no`, `session_id`, `actor_type`, `actor_id`, `mission_id`, `commit`, `occurred_at`, `source_event_id`, and a `confidence` of:
-  - `working` — attributed via a working-tree diff hunk in current line coordinates (uncommitted change).
-  - `commit` — attributed via `git blame` mapping the line's commit to a Brick `diff.captured` event.
-  - `unattributed` — no Brick diff event covers this line.
-
-How it survives line drift: `git blame` maps each current line to the commit that
-last touched it (git already solves commit-level drift), and Brick maps that commit
-to the session/actor that recorded the corresponding `diff.captured` event.
-Uncommitted edits are attributed directly from the most recent working-diff hunk,
-whose line ranges are already in current-file coordinates.
-
-The same data is available from the CLI: `brick blame <path> [--line-start N] [--line-end M]`.
-
-### `search`
-
-Full-text search over session metadata (title/intent, touched files, repo,
-branch, model) to find past sessions by topic. Backed by SQLite **FTS5** with a
-`trigram` tokenizer:
-
-- **Tokenized & order-independent** — the query is split into terms matched
-  AND-wise, so `git status cache` finds an intent of "Cache git status lookups".
-- **Substring matching** — a term like `auth` still matches a file named
-  `oauth.rs`; `commands_git` matches `src/commands_git.rs`.
-- **Relevance ranked** — `bm25()` weights intent matches far above file/repo
-  hits, so the most on-topic session sorts first regardless of recency.
-- Terms shorter than three characters fall back to a plain substring check
-  (trigram cannot index them), so a query like `go` still works.
-
-- **Input**: `query` (string, required) — one or more keywords; order does not matter.
-- **Output**: matches ranked by relevance, each with a transcript pointer. Result cap defaults to 10.
-
-### `show_session`
-
-Page through one session's full transcript chunks. Supports pagination and
-per-field truncation so large tool outputs don't overflow context.
-
-- **Input**:
-  - `source` (string, required) — source id, e.g. `claude_code`, `codex_app`, `cursor_ide`, `orgii`.
-  - `session_id` (string, required) — external session id from a `search` or `log_file` hit.
-  - `offset` (integer, default `0`) — chunk offset.
-  - `limit` (integer, default `50`) — max chunks.
-  - `max_field_bytes` (integer, default `2000`) — truncate string values over this many bytes; `0` disables truncation.
-- **Output**: the requested transcript chunks for that session.
-
----
-
-## Planning & work-item management
-
-These turn a request into a tracked goal and record the proof of work against
-it. The write tools append immutable `TraceEvent`s to the local store; the read
-tools rebuild the derived index so they always reflect just-written events.
-
-> **Identity for MCP writes.** MCP has no logged-in human, so the author of a
-> write is the calling tool: the `actor_id`/`source` argument if supplied, else
-> `"mcp"`. This mirrors how `claim` attributes claims.
-
-### `status`
-
-Report the active org, project, mission, and session Brick has on record. Call
-at the start of a task to know what you're working on and where new work should
-be filed.
-
-- **Input**: none.
-- **Output**:
-  - `current` — the persisted current context (or `null`).
-  - `current_mission` — the full mission object the context points at, if any.
-  - `counts` — `{ orgs, projects, missions, sessions, artifacts }`.
-  - `note` — a one-line pointer to `mission_list` / `mission` / `artifact_add`.
-
-### `mission_list`
-
-List missions (work items / goals), newest activity first. Use it to see what's
-in flight, find an existing mission to attach output to, or pick up unfinished
-work.
-
-- **Input**:
-  - `status` (string, optional) — `planned | active | blocked | completed | archived`.
-  - `project` (string, optional) — filter to one project id.
-  - `limit` (integer, default `50`).
-- **Output**: `{ count, missions[] }`, missions sorted by most recent activity.
-
-### `show_mission`
-
-Show one mission in detail: status, description, and the sessions and artifacts
-linked to it.
-
-- **Input**: `mission` (string, required) — the mission id.
-- **Output**: the full mission object, including `artifact_ids`, `session_ids`, status, and timestamps. Errors if the id is unknown.
-
-### `mission`
-
-Create or update a mission — Brick's planning primitive.
-
-- **Input**:
-  - `action` (string, required) — `"create"` or `"update"`.
-  - **create** requires `project` (string) and `title` (string); accepts `description` (string) and `status` (default `planned`).
-  - **update** requires `mission` (string); accepts any of `title`, `description`, `status`, `project` (at least one). `project` on update moves the mission to another project.
-  - `status` enum: `planned | active | blocked | completed | archived`.
-  - `session_id`, `source` (strings, optional) — author attribution.
-- **Output**: `{ created: true, mission_id, note }` on create, or `{ updated: true, mission_id }` on update.
-
-### `artifact_add`
-
-Record a deliverable you produced (a PR, a design doc, a decision, a test
-result) and link it to a mission. This closes the planning loop: a mission
-states the goal, an artifact is the proof of work.
-
-- **Input**:
-  - `title` (string, required) — what the artifact is, e.g. `"PR #42: OAuth login"`.
-  - `kind` (string, default `note`) — `decision | file_ref | patch | review | test_result | acceptance | note`.
-  - `body` (string, optional) — details / link / summary.
-  - `mission` (string, optional but recommended) — mission to link to, so the work item shows its outputs.
-  - `session_id`, `source` (strings, optional) — author attribution.
-- **Output**: `{ recorded: true, artifact_id, note }`.
-
-### `artifact_attach`
-
-Attach a file-path piece of evidence to an artifact — the concrete file(s) that
-back a deliverable, forming an auditable trail. Call after `artifact_add`.
-
-- **Input**:
-  - `artifact` (string, required) — artifact id from `artifact_add`.
-  - `path` (string, required) — file path the artifact represents or touched.
-  - `session_id`, `source` (strings, optional) — author attribution.
-- **Output**: `{ attached: true, artifact_id }`.
-
-#### Why `artifact_add` + `artifact_attach`
-
-Together they answer "what did this goal actually produce, and how do I prove
-it?" Without them a mission only says it is `active`; with them, anyone (or
-another agent) calling `show_mission` sees a full chain:
-
-```text
-mission "Add OAuth login" (completed)
-  └── artifact "PR #42: OAuth login" (patch)
-        └── evidence src/auth/oauth.rs
+```json
+{
+  "anchor": { "kind": "file_line", "input": "…:42",
+              "resolved_events": ["<event-id>"], "blame_confidence": "commit" },
+  "causal_chain": [
+    { "event_id": "…", "event_type": "diff.captured",
+      "what": "changed auth.rs", "actor_id": "claude",
+      "session_id": "session_…", "mission_id": "mission_…",
+      "occurred_at": "…", "relation": null,
+      "note": "token refresh had a concurrency race; serialized it",
+      "confidence": "observed", "depth": 0,
+      "transcript": { "source": null, "session_id": "session_…" } }
+  ],
+  "forward": [
+    { "event_id": "…", "what": "added test_auth.rs",
+      "relation_to_anchor": "derived_from" }
+  ],
+  "truncated": false,
+  "live": { "…": "another session is editing this file" }
+}
 ```
 
-That goal → deliverable → file trail is the core of Brick's provenance value.
+- `causal_chain` walks **backward** from the anchor (newest first). Each step
+  carries WHO (`actor_id` / `session_id` / `mission_id`), WHY (`note` +
+  `relation`), and a `confidence` of `explicit` > `observed` > `inferred`.
+- `forward` is what was derived from / triggered by the anchor.
+- `live` appears only when another running session is touching the anchored file
+  — this replaces the old standalone `sessions` / `claims` tools.
+- When the anchor has no causal record, `resolved_events` is empty, `causal_chain`
+  is empty (never guessed), and a `note` says so — fall back to git there.
 
----
+`explain` subsumes line-level **blame** (WHO) into the WHY answer.
 
-## Coordination & awareness
+### `link`
 
-These help concurrent sessions avoid stepping on each other.
+Record WHY after a non-trivial change so the next agent can recover your
+reasoning with `explain`. Two forms:
 
-### `sessions`
+```json
+{ "note": "token refresh had a concurrency race; serialized it" }
+```
 
-List AI coding sessions that appear to be running right now across every tool on
-this machine. Liveness is recomputed per call from each source's own signals; it
-is never persisted.
+```json
+{ "effect": "src/test_auth.rs:2", "cause": "src/auth.rs:2",
+  "relation": "derived_from", "note": "covers the race fix" }
+```
 
-- **Input**: `scope` (string, optional) — path prefix; only sessions whose work scope is at or under this path are returned.
-- **Output**: `{ count, sessions[], note }`. Each row includes the session's work scope and recently touched files.
+- `effect` is the change you just made (`path:line` or event id); omit it to bind
+  to your most recent captured diff.
+- `cause` is the anchor that prompted the change; omit it for a standalone
+  rationale.
+- `relation` is one of `triggered_by`, `derived_from`, `supersedes`,
+  `responds_to`, `rationale` (defaults to `derived_from` with a cause, else
+  `rationale`).
+- **Invariant:** at least one of `cause` or `note` must be present.
 
-### `claim`
+Edges recorded via `link` carry `confidence: explicit`.
 
-Post a heads-up on the cross-session bulletin board *before* you start editing:
-"I'm changing X, hold off." Other sessions calling `log_file` on a matching
-path see your note (as `active_claims`).
+## Planning surface (`--planning`)
 
-- **Input**:
-  - `scope` (string, required) — file path or glob you are claiming, e.g. `crates/core/src/auth.rs` or `crates/cli/src/**/*.rs`. A bare filename like `auth.rs` matches that file anywhere.
-  - `message` (string, required) — one line: what you're doing and any warning.
-  - `session_id` (string, optional) — your session id, so others know who to coordinate with.
-  - `source` (string, optional) — your tool/app id.
-  - `ttl_minutes` (integer, default `240`) — minutes until the claim auto-expires.
-- **Output**: `{ published: <claim>, note }`.
+- `mission` — `action="create"` opens a tracked goal under a project;
+  `action="update"` changes its title / description / status.
+- `mission_list` — in-flight missions, newest first, optional status/project filter.
+- `show_mission` — one mission's detail, with linked sessions and artifacts.
+- `artifact_add` — record a deliverable (PR, design doc, decision, test result).
+- `artifact_attach` — attach the files that back an artifact.
 
-> **Lifecycle note.** A claim is retired on whichever comes first:
-> 1. **Session ended** — when the publishing session can be matched to a native
->    source session that is no longer active, the claim is dropped (and deleted)
->    on the next `log_file` / `claims` read. This is the common
->    case: the moment an agent exits, its claims stop misleading others.
-> 2. **TTL expiry** — claims whose publisher cannot be probed (a CLI claim, a
->    bare `mcp` publisher with no matching native session) fall back to the TTL
->    (default 4h), swept on the next read or write.
->
-> Liveness only ever retires a claim we can positively confirm is dead; an
-> unidentifiable publisher is always kept until its TTL, so the check never
-> over-deletes. Scope matching is generous: exact path, glob (`*`, `**`, `?`,
-> `[…]`), bare basename, relative/absolute path-suffix equivalence, and
-> directory-prefix all match.
+## Retired tools
 
-### `claims`
+The previous query/coordination tools are gone from the agent surface; their
+capability is folded into `explain` (WHO + WHY + `live`) or moved to the planning
+surface. A `tools/call` for any retired name returns an actionable migration hint
+for one release rather than a bare error:
 
-List active bulletin-board claims (other sessions' "I'm working on X" notes).
-Call before editing to check nobody has claimed the area you're about to touch.
-
-- **Input**: `path` (string, optional) — only claims whose scope covers this path. Omit to list every active claim.
-- **Output**: `{ count, announcements[] }`, newest-first.
-
----
+| Retired | Replacement |
+| --- | --- |
+| `log_file`, `recall_file`, `blame`, `blame_file`, `log_line`, `blame_history`, `search`, `explore_memory`, `search_sessions`, `show_session`, `read_session` | `explain` (WHO + WHY + transcript pointer) |
+| `sessions`, `live_sessions`, `claim`, `announce_work`, `claims`, `list_announcements`, `status`, `current_context` | the `live` field of an `explain` response |
+| `mission`, `mission_list`, `show_mission`, `artifact_add`, `artifact_attach` (and aliases `manage_mission`, `list_missions`, `record_artifact`, `attach_evidence`) | the planning surface (`brick mcp-serve --planning`) |
 
 ## Storage
 
-Planning writes land in the same append-only event log as the CLI
-(`.brick/provenance/queue/*.jsonl` by default; see the storage-root resolution
-order in [`../architecture/README.md`](../architecture/README.md)). Missions,
-artifacts, and evidence are events, not mutable rows — `mission.created`,
-`mission.updated`, `artifact.created`, `artifact.file_ref_recorded`, and so on.
-See [`../protocol/README.md`](../protocol/README.md) for the event families.
-
-Announcements are deliberately **not** in the rebuildable event log. They are
-authored intent with a TTL, stored in their own additive-only
-`<BRICK_HOME>/announcements.sqlite` so a schema bump to the metadata cache never
-wipes them.
-
----
+Writes (`link`, and the planning tools) append `TraceEvent`s to the local JSONL
+log under `.brick/provenance/`; reads project that log into the rebuildable
+index. Deleting the derived index or the SQLite `causal_edges` table and
+rebuilding from JSONL reproduces every causal edge exactly — JSONL is the source
+of truth.
 
 ## Verifying
 
-`cargo test -p brick --test mcp_smoke` exercises the whole kit end to end with no
-external dependencies — it spawns the real `brick mcp-serve` binary and speaks the
-real stdio JSON-RPC protocol, with two native source profiles (codex_app +
-claude_code) backed by real transcript files under a temp `BRICK_HOME` and a
-throwaway git repo. It never touches your real Brick home or working tree.
-
-It is four tests, split the way a capability kit must be proven:
-
-- **`mcp_capability_kit_end_to_end`** — all 14 tools across the three
-  capabilities, plus the cross-tool flow where a Claude-side `show_mission` reads
-  a Codex-authored mission/artifact.
-- **`liveness_flips_when_turn_completes_same_process`** — proves liveness is
-  recomputed every call, not cached: on one long-lived server, a session that is
-  live with an open turn drops out of `sessions` the instant its transcript
-  gains a completion marker.
-- **`liveness_respects_active_window_same_process`** — proves the 120s
-  ACTIVE_WINDOW gates before turn signals: the same open-turn transcript, aged
-  past the window, reads as not-live.
-- **`cross_client_announcement_visibility_and_retirement`** — two independent
-  mcp-serve processes (modeling Codex and Claude Code side by side) over one
-  `BRICK_HOME`: work announced by one is immediately visible to the other, and a
-  claim is retired on the peer's next read once its owning session ends.
-
-The two liveness flips are behavioral contracts, not snapshots — they were
-validated by mutation testing (breaking the window gate or the turn-complete
-parser turns them red).
+`crates/cli/tests/mcp_smoke.rs` spawns the real `brick mcp-serve` binary and
+drives it over stdio: it asserts the main surface is exactly `explain` + `link`,
+the planning surface exposes the five planning tools, retired names return a
+migration hint, `explain` resolves a `path:line` through blame and walks the
+causal chain (including across commit + line drift), `link` records both a
+standalone rationale and a cross-event edge, and `explain` surfaces a live
+session on the anchor file.

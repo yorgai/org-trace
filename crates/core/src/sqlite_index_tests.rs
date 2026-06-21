@@ -294,3 +294,75 @@ fn rebuilds_and_queries_sqlite_cache() {
     .expect("query folder boundary blame");
     assert!(boundary_blame.is_empty());
 }
+
+#[test]
+fn causal_edges_survive_sqlite_rebuild() {
+    use brick_protocol::{CausalLinkedPayload, CausalRelation, ConfidenceLevel};
+    use uuid::Uuid;
+
+    let path = temp_sqlite_path("causal");
+    let e2 = Uuid::new_v4();
+    let e4 = Uuid::new_v4();
+    let events = vec![
+        TraceEvent::causal_linked(
+            actor(),
+            ConfidenceLevel::Observed,
+            CausalLinkedPayload {
+                effect_event: e2,
+                cause_events: vec![],
+                relation: CausalRelation::Rationale,
+                note: Some("token refresh race".to_string()),
+                repo_context_id: None,
+            },
+        )
+        .expect("rationale edge"),
+        TraceEvent::causal_linked(
+            actor(),
+            ConfidenceLevel::Explicit,
+            CausalLinkedPayload {
+                effect_event: e4,
+                cause_events: vec![e2],
+                relation: CausalRelation::DerivedFrom,
+                note: Some("covers the race fix".to_string()),
+                repo_context_id: None,
+            },
+        )
+        .expect("derived edge"),
+    ];
+    let index = TraceIndex::build(&events).expect("build trace index");
+    rebuild_sqlite_index(&path, &events, &index).expect("rebuild sqlite index");
+
+    // The derived data must be fully reconstructible from the event stream: open
+    // the rebuilt DB and read the causal_edges table straight back.
+    let connection = rusqlite::Connection::open(&path).expect("open sqlite");
+    let mut stmt = connection
+        .prepare(
+            "SELECT effect_event, cause_event, relation, note, confidence \
+             FROM causal_edges ORDER BY relation",
+        )
+        .expect("prepare causal query");
+    let rows: Vec<(String, Option<String>, String, Option<String>, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query causal edges")
+        .map(|row| row.expect("row"))
+        .collect();
+
+    assert_eq!(rows.len(), 2);
+    // derived_from sorts before rationale.
+    assert_eq!(rows[0].0, e4.to_string());
+    assert_eq!(rows[0].1, Some(e2.to_string()));
+    assert_eq!(rows[0].2, "derived_from");
+    assert_eq!(rows[0].4, "explicit");
+    assert_eq!(rows[1].0, e2.to_string());
+    assert_eq!(rows[1].1, None);
+    assert_eq!(rows[1].2, "rationale");
+    assert_eq!(rows[1].4, "observed");
+}

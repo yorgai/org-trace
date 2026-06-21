@@ -26,7 +26,7 @@ use crate::mcp_config;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 4;
+const TEMPLATE_VERSION: u32 = 5;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -41,28 +41,39 @@ fn managed_block() -> String {
 /// The agent-directed instructions. Command-first and short so agents reliably
 /// act on it. Update `TEMPLATE_VERSION` when this changes.
 const BLOCK_BODY: &str = "\
-## Brick — cross-tool session metadata
+## Brick — causal memory of this codebase
 
-Brick is a local metadata index of past AI coding sessions across every tool on this
-machine. Use it to recall prior decisions instead of rediscovering them.
+Brick answers WHY code looks the way it does, across every AI tool that has
+touched this repo. It is the causal layer git does not have.
 
-### Workflow
+### When you investigate existing code
 
-- Before editing a file, recall who changed it and why in one call:
-  `brick metadata recall --path <file> --format json`
-  This returns a one-line summary plus per-session intent, change size, and a
-  `transcript_ref` ({source, session_id}) for the full transcript when you need
-  detail — drill in with `brick history chunks --source <source> --session-id <id>`.
-- To find past sessions by topic (not a specific file), search the metadata index:
-  `brick metadata query --query \"<keywords>\" --format json`
-  Matches session intent, touched files, repo, and branch; each hit includes a
-  `transcript_ref` ({source, session_id}) for the full transcript.
-- For broader project history, list sources then drill in:
-  `brick history sources --format json`
-  `brick history sessions --source <id> --format json`
-  `brick history chunks --source <id> --session-id <sid> --format json`
+When you locate a file or code you are about to change or reason about, your
+FIRST step — before drawing conclusions from the code alone — is `explain`:
 
-All `brick metadata` and `brick history` commands support `--format json`.";
+`brick explain <path>:<line>`
+
+It returns who changed that code, WHEN, WHY (the rationale that cannot be read
+from the code itself), what was derived from or triggered by it, and whether
+another session is editing the same file right now. The anchor can also be an
+artifact, mission, or event id.
+
+**Prefer `explain` over `grep` and `git log` for understanding existing code.**
+git log / git blame / grep are a FALLBACK, used only when `brick explain` reports
+no record for that code.
+
+### After you change code
+
+When you finish a non-trivial change, record WHY so the next agent (or you, in
+three months) can recover your reasoning. If your tool exposes Brick over MCP,
+call the `link` tool with a one-line `note` (and a `cause` anchor + `relation`
+when the change was prompted by other code). The `explain` and `link` MCP tools
+are the primary write/read surface.
+
+### Investigate with explain, not git
+
+`git log` / `git blame` / `grep` are a FALLBACK for understanding existing code,
+used only when `brick explain` reports no record. Reach for `explain` first.";
 
 /// One memory file to act on, resolved from a target + scope.
 #[derive(Debug, Clone)]
@@ -687,7 +698,7 @@ mod tests {
         let content = std::fs::read_to_string(&file.path).expect("read");
         assert_eq!(content.matches(BLOCK_START_PREFIX).count(), 1);
         assert_eq!(content.matches(BLOCK_END).count(), 1);
-        assert!(content.contains("brick metadata recall"));
+        assert!(content.contains("brick explain"));
     }
 
     #[test]

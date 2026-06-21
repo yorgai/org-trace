@@ -1,11 +1,13 @@
-//! End-to-end integration test for the MCP capability kit.
+//! End-to-end integration test for the MCP surface after the CTP reshape.
 //!
 //! Spawns the real `brick mcp-serve` binary (built by cargo as
 //! `CARGO_BIN_EXE_brick`) and drives it over the real stdio JSON-RPC protocol —
-//! the exact surface a Claude Code / Codex / ORGII MCP client speaks. Two native
-//! source profiles (codex_app + claude_code) are backed by real transcript files
-//! in their native on-disk formats, so this exercises real session discovery,
-//! liveness probing, FTS5 search, and the planning/coordination loop end to end.
+//! the exact surface a Claude Code / Codex / ORGII MCP client speaks.
+//!
+//! The main coding-agent surface is exactly two tools: `explain` (read WHY,
+//! subsumes blame's WHO) and `link` (write a causal edge). Planning tools live
+//! behind `mcp-serve --planning` for a dedicated planning agent. The nine former
+//! query/coordination tools are retired and return an actionable migration hint.
 //!
 //! Everything runs under a private temp `BRICK_HOME` and a throwaway git repo, so
 //! it never touches the developer's real Brick home or working tree. No network,
@@ -71,8 +73,20 @@ struct Mcp {
 
 impl Mcp {
     fn spawn(home: &Path, cwd: &Path) -> Self {
-        let mut child = Command::new(BIN)
-            .arg("mcp-serve")
+        Self::spawn_inner(home, cwd, false)
+    }
+
+    fn spawn_planning(home: &Path, cwd: &Path) -> Self {
+        Self::spawn_inner(home, cwd, true)
+    }
+
+    fn spawn_inner(home: &Path, cwd: &Path, planning: bool) -> Self {
+        let mut command = Command::new(BIN);
+        command.arg("mcp-serve");
+        if planning {
+            command.arg("--planning");
+        }
+        let mut child = command
             .current_dir(cwd)
             .env("BRICK_HOME", home)
             .stdin(Stdio::piped())
@@ -104,10 +118,18 @@ impl Mcp {
     }
 
     /// Calls a tool and returns its parsed JSON payload (the text content block).
+    /// A tool-level failure (MCP `isError=true`, plain-text message) surfaces as
+    /// `{"_rpc_error": <message>}`; a transport error surfaces the rpc error.
     fn call(&mut self, tool: &str, args: Value) -> Value {
         let resp = self.rpc("tools/call", json!({"name": tool, "arguments": args}));
         if let Some(err) = resp.get("error") {
-            return json!({ "_error": err });
+            return json!({ "_rpc_error": err });
+        }
+        if resp["result"]["isError"].as_bool() == Some(true) {
+            let msg = resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("tool error");
+            return json!({ "_rpc_error": msg });
         }
         let text = resp["result"]["content"][0]["text"]
             .as_str()
@@ -128,8 +150,6 @@ impl Mcp {
 
 impl Drop for Mcp {
     fn drop(&mut self) {
-        // Closing stdin ends the blocking serve loop so the child exits cleanly;
-        // kill is a belt-and-suspenders fallback if it is still alive.
         self.stdin.take();
         let _ = self.child.wait();
         let _ = self.child.kill();
@@ -143,27 +163,14 @@ fn write_lines(path: &Path, lines: &[Value]) {
 
 /// A live Codex session (open turn) that patched a real repo file.
 fn write_codex(dir: &Path, sid: &str, repo: &Path, file: &str) {
-    write_codex_at(dir, sid, repo, file, 0, false);
-}
-
-/// Writes a Codex transcript with controllable freshness and turn state.
-///
-/// `base_offset` shifts every embedded timestamp into the past (seconds), which
-/// drives the liveness ACTIVE_WINDOW gate because `session_updated_at` is parsed
-/// from these timestamps — not the file mtime. `closed` appends a `task_complete`
-/// so the turn-signal parser reports the turn as finished (Idle).
-fn write_codex_at(dir: &Path, sid: &str, repo: &Path, file: &str, base_offset: i64, closed: bool) {
     let patch = format!("diff --git a/{file} b/{file}\n+++ b/{file}\n+// cache git status\n");
-    let mut lines = vec![
-        json!({"timestamp":iso(base_offset - 30),"payload":{"type":"user_message","message":"Cache git status lookups in commands_git","cwd":repo.display().to_string(),"model":"gpt-5"}}),
-        json!({"timestamp":iso(base_offset - 25),"payload":{"type":"task_started"}}),
-        json!({"timestamp":iso(base_offset - 20),"payload":{"type":"agent_message","message":"Adding a cache layer"}}),
-        json!({"timestamp":iso(base_offset - 15),"payload":{"type":"function_call","call_id":"c1","name":"apply_patch","arguments": json!({"patch": patch}).to_string()}}),
-        json!({"timestamp":iso(base_offset - 14),"payload":{"type":"function_call_output","call_id":"c1","output":"applied"}}),
+    let lines = vec![
+        json!({"timestamp":iso(-30),"payload":{"type":"user_message","message":"Cache git status lookups in commands_git","cwd":repo.display().to_string(),"model":"gpt-5"}}),
+        json!({"timestamp":iso(-25),"payload":{"type":"task_started"}}),
+        json!({"timestamp":iso(-20),"payload":{"type":"agent_message","message":"Adding a cache layer"}}),
+        json!({"timestamp":iso(-15),"payload":{"type":"function_call","call_id":"c1","name":"apply_patch","arguments": json!({"patch": patch}).to_string()}}),
+        json!({"timestamp":iso(-14),"payload":{"type":"function_call_output","call_id":"c1","output":"applied"}}),
     ];
-    if closed {
-        lines.push(json!({"timestamp":iso(base_offset - 12),"payload":{"type":"task_complete"}}));
-    }
     write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
 }
 
@@ -176,18 +183,8 @@ fn write_claude(dir: &Path, sid: &str, repo: &Path, file: &str) {
     write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
 }
 
-/// A live Claude session (trailing assistant with no stop_reason → Active).
-fn write_claude_live(dir: &Path, sid: &str, repo: &Path, file: &str) {
-    let lines = vec![
-        json!({"type":"user","timestamp":iso(-20),"message":{"role":"user","content":format!("Refactor {file}"),"cwd":repo.display().to_string()}}),
-        json!({"type":"assistant","timestamp":iso(-10),"message":{"content":[{"type":"text","text":"Working"}],"stop_reason":Value::Null}}),
-    ];
-    write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
-}
-
 /// Spins up two configured native source profiles under one `BRICK_HOME` and a
-/// temp git repo. Returns `(root, home, repo, codex_dir, claude_dir)`. Shared by
-/// the behavioral tests so each gets an isolated, fully-initialized Brick world.
+/// temp git repo. Returns `(root, home, repo, codex_dir, claude_dir)`.
 fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
     let root = unique_tmp(tag);
     let home = root.join("home");
@@ -213,17 +210,8 @@ fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         &home,
         &repo,
         &[
-            "source",
-            "configure",
-            "--name",
-            "codex_app",
-            "--app-id",
-            "codex_app",
-            "--actor-id",
-            "codex-agent",
-            "--actor-type",
-            "agent",
-            "--session-log-path",
+            "source", "configure", "--name", "codex_app", "--app-id", "codex_app", "--actor-id",
+            "codex-agent", "--actor-type", "agent", "--session-log-path",
             codex_dir.to_str().unwrap(),
         ],
     );
@@ -231,551 +219,12 @@ fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         &home,
         &repo,
         &[
-            "source",
-            "configure",
-            "--name",
-            "claude_code",
-            "--app-id",
-            "claude_code",
-            "--actor-id",
-            "claude-agent",
-            "--actor-type",
-            "agent",
-            "--session-log-path",
+            "source", "configure", "--name", "claude_code", "--app-id", "claude_code",
+            "--actor-id", "claude-agent", "--actor-type", "agent", "--session-log-path",
             claude_dir.to_str().unwrap(),
         ],
     );
     (root, home, repo, codex_dir, claude_dir)
-}
-
-/// External session ids visible in a `live_sessions` response.
-fn live_ids(m: &mut Mcp) -> Vec<String> {
-    let live = m.call("sessions", json!({}));
-    live["sessions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| s["external_session_id"].as_str().map(str::to_string))
-        .collect()
-}
-
-/// Active-claim scopes visible in a `list_announcements` response.
-fn claim_scopes(m: &mut Mcp) -> Vec<String> {
-    let la = m.call("claims", json!({}));
-    la["announcements"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|a| a["scope"].as_str().map(str::to_string))
-        .collect()
-}
-
-#[test]
-fn mcp_capability_kit_end_to_end() {
-    let (root, home, repo, codex_dir, claude_dir) = setup_world("e2e");
-    // This kit exercises gated planning/blame tools too, so seed a login (no-op
-    // in the open build). The free/gated boundary is asserted in dedicated tests.
-    write_fake_login(&home);
-    let file_codex = "src/commands_git.rs";
-    let file_claude = "src/commands_memory.rs";
-    write_codex(&codex_dir, "codex-live-001", &repo, file_codex);
-    write_claude(&claude_dir, "claude-done-002", &repo, file_claude);
-
-    let org = extract(
-        &brick(&home, &repo, &["org", "create", "SmokeOrg"]),
-        "org_id",
-    )
-    .expect("org_id");
-    let proj = extract(
-        &brick(
-            &home,
-            &repo,
-            &["project", "create", "--org", &org, "SmokeProject"],
-        ),
-        "project_id",
-    )
-    .expect("project_id");
-
-    let mut m = Mcp::spawn(&home, &repo);
-
-    // ---- tools/list: all 14 present ----
-    let tools = m.tool_names();
-    for want in [
-        "log_file",
-        "blame",
-        "log_line",
-        "search",
-        "show_session",
-        "status",
-        "mission_list",
-        "show_mission",
-        "mission",
-        "artifact_add",
-        "artifact_attach",
-        "sessions",
-        "claim",
-        "claims",
-    ] {
-        assert!(
-            tools.contains(&want.to_string()),
-            "missing tool {want}; got {tools:?}"
-        );
-    }
-
-    // ---- live_sessions: sees running Codex, not the finished Claude ----
-    let live = m.call("sessions", json!({}));
-    let sessions = live["sessions"].as_array().cloned().unwrap_or_default();
-    let live_ids: Vec<&str> = sessions
-        .iter()
-        .filter_map(|s| s["external_session_id"].as_str())
-        .collect();
-    assert!(
-        live_ids.contains(&"codex-live-001"),
-        "codex not live: {live_ids:?}"
-    );
-    assert!(
-        !live_ids.contains(&"claude-done-002"),
-        "finished claude should not be live: {live_ids:?}"
-    );
-    // Real git work_scope resolution: the repo dir name appears in the row.
-    let repo_name = repo.file_name().unwrap().to_str().unwrap();
-    let codex_row = sessions
-        .iter()
-        .find(|s| s["external_session_id"] == "codex-live-001")
-        .unwrap();
-    assert!(
-        codex_row.to_string().contains(repo_name),
-        "work_scope not resolved: {codex_row}"
-    );
-
-    // ---- search_sessions: FTS5 tokenized (out-of-order) + substring ----
-    let sr = m.call("search", json!({"query": "git status cache"}));
-    assert!(
-        sr["match_count"].as_u64().unwrap_or(0) >= 1,
-        "out-of-order query failed: {sr}"
-    );
-    let sr2 = m.call("search", json!({"query": "commands_git"}));
-    assert!(
-        sr2["match_count"].as_u64().unwrap_or(0) >= 1,
-        "substring file query failed: {sr2}"
-    );
-
-    // ---- recall_file / read_session / explore_memory ----
-    let rc = m.call("log_file", json!({"path": file_codex}));
-    assert!(
-        rc["session_count"].as_u64().unwrap_or(0) >= 1
-            || rc.to_string().to_lowercase().contains("commands_git"),
-        "recall_file found nothing: {rc}"
-    );
-    let rs = m.call(
-        "read_session",
-        json!({"source": "codex_app", "session_id": "codex-live-001"}),
-    );
-    assert!(rs.get("_error").is_none(), "read_session error: {rs}");
-    let em = m.call(
-        "explore_memory",
-        json!({"question": "how did we speed up git status"}),
-    );
-    assert!(em.get("_error").is_none(), "explore_memory error: {em}");
-
-    // ---- planning loop ----
-    let cc = m.call("status", json!({}));
-    assert!(
-        cc.get("counts").is_some(),
-        "current_context missing counts: {cc}"
-    );
-    let created = m.call("mission", json!({"action":"create","project":proj,"title":"Cache git status","status":"active","source":"codex_app"}));
-    let mid = created["mission_id"]
-        .as_str()
-        .expect("mission_id")
-        .to_string();
-    assert_eq!(created["created"], json!(true));
-    let lm = m.call("mission_list", json!({"status":"active"}));
-    assert!(
-        lm["missions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|x| x["title"] == "Cache git status"),
-        "mission not listed: {lm}"
-    );
-    let art = m.call(
-        "artifact_add",
-        json!({"title":"PR: cache","kind":"patch","mission":mid,"source":"codex_app"}),
-    );
-    let aid = art["artifact_id"]
-        .as_str()
-        .expect("artifact_id")
-        .to_string();
-    assert_eq!(art["recorded"], json!(true));
-    let ev = m.call(
-        "artifact_attach",
-        json!({"artifact":aid,"path":file_codex,"source":"codex_app"}),
-    );
-    assert_eq!(ev["attached"], json!(true));
-    let sm = m.call("show_mission", json!({"mission":mid}));
-    assert!(
-        sm["artifact_ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a == &json!(aid)),
-        "artifact not under mission: {sm}"
-    );
-    let upd = m.call(
-        "manage_mission",
-        json!({"action":"update","mission":mid,"status":"completed"}),
-    );
-    assert_eq!(upd["updated"], json!(true));
-
-    // ---- announce_work + liveness-aware retirement ----
-    m.call("claim", json!({"scope":file_codex,"message":"editing","source":"codex_app","session_id":"codex-live-001"}));
-    m.call(
-        "announce_work",
-        json!({"scope":"src/ghost.rs","message":"bare mcp","source":"mcp","session_id":"ghost"}),
-    );
-    m.call("claim", json!({"scope":file_claude,"message":"reviewing","source":"claude_code","session_id":"claude-done-002"}));
-    let la = m.call("claims", json!({}));
-    let scopes: Vec<&str> = la["announcements"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|a| a["scope"].as_str())
-        .collect();
-    assert!(
-        scopes.contains(&file_codex),
-        "live codex claim should be kept: {scopes:?}"
-    );
-    assert!(
-        scopes.contains(&"src/ghost.rs"),
-        "unprobeable bare-mcp claim should be kept (TTL): {scopes:?}"
-    );
-    assert!(
-        !scopes.contains(&file_claude),
-        "dead claude-session claim should be retired: {scopes:?}"
-    );
-    let rc2 = m.call("log_file", json!({"path": file_codex}));
-    assert!(
-        rc2.to_string().contains("active_claims"),
-        "recall_file should surface active_claims: {rc2}"
-    );
-
-    // ---- cross-tool: a Claude view reads Codex-authored mission/artifact ----
-    let sm2 = m.call("show_mission", json!({"mission":mid}));
-    assert_eq!(sm2["title"], "Cache git status");
-    assert!(sm2["artifact_ids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|a| a == &json!(aid)));
-
-    drop(m);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Liveness is recomputed every call, never cached: a session that is live while
-/// its turn is open must drop out of `live_sessions` the moment the transcript
-/// gains a completion marker — on the SAME long-lived mcp-serve process. A static
-/// one-shot snapshot cannot tell "recomputed" apart from "cached after first
-/// scan"; only this in-place flip proves the architectural claim.
-#[test]
-fn liveness_flips_when_turn_completes_same_process() {
-    let (root, home, repo, codex_dir, _claude_dir) = setup_world("flip-turn");
-    let file = "src/commands_git.rs";
-    write_codex_at(&codex_dir, "codex-turn", &repo, file, 0, false); // open turn, fresh
-
-    let mut m = Mcp::spawn(&home, &repo);
-    assert!(
-        live_ids(&mut m).contains(&"codex-turn".to_string()),
-        "open fresh turn should be live"
-    );
-
-    // Same session id, same freshness, but now the turn is complete.
-    write_codex_at(&codex_dir, "codex-turn", &repo, file, 0, true);
-    assert!(
-        !live_ids(&mut m).contains(&"codex-turn".to_string()),
-        "completed turn must drop out of live_sessions on the next call (recomputed, not cached)"
-    );
-
-    drop(m);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// The 120s ACTIVE_WINDOW is real: an open-turn session that is fresh shows as
-/// live, but the identical transcript aged past the window must read as not-live
-/// even though its turn is still open — proving recency gates before turn signals.
-#[test]
-fn liveness_respects_active_window_same_process() {
-    let (root, home, repo, codex_dir, _claude_dir) = setup_world("flip-window");
-    let file = "src/commands_git.rs";
-    write_codex_at(&codex_dir, "codex-fresh", &repo, file, 0, false); // open + fresh
-
-    let mut m = Mcp::spawn(&home, &repo);
-    assert!(
-        live_ids(&mut m).contains(&"codex-fresh".to_string()),
-        "fresh open turn should be live"
-    );
-
-    // Push every timestamp ~200s into the past (> ACTIVE_WINDOW = 120s). Still an
-    // open turn, but stale → must be Idle without even consulting turn signals.
-    write_codex_at(&codex_dir, "codex-fresh", &repo, file, -200, false);
-    assert!(
-        !live_ids(&mut m).contains(&"codex-fresh".to_string()),
-        "an aged session must fall out of the active window regardless of open turn"
-    );
-
-    drop(m);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Two independent mcp-serve processes — modeling Codex and Claude Code running
-/// side by side against the same machine — share one BRICK_HOME. Work announced
-/// by one process is immediately visible to the other (real cross-client
-/// coordination), and when the announcing session ends, its claim is retired on
-/// the peer's next read (liveness-aware retirement across process boundaries).
-#[test]
-fn cross_client_announcement_visibility_and_retirement() {
-    let (root, home, repo, codex_dir, claude_dir) = setup_world("cross-client");
-    let codex_file = "src/commands_git.rs";
-
-    // A live Codex session (process A's "self") and a live Claude session whose
-    // claim we will later retire by ending it.
-    write_codex_at(&codex_dir, "codex-A", &repo, codex_file, 0, false);
-    write_claude_live(&claude_dir, "claude-B", &repo, "src/commands_memory.rs");
-
-    let mut client_a = Mcp::spawn(&home, &repo); // pretend: Codex's MCP client
-    let mut client_b = Mcp::spawn(&home, &repo); // pretend: Claude Code's MCP client
-
-    // Client A announces work tied to its live Codex session.
-    client_a.call("claim", json!({
-        "scope": codex_file, "message": "refactoring", "source": "codex_app", "session_id": "codex-A"
-    }));
-    // Client B announces work tied to its live Claude session.
-    client_b.call("claim", json!({
-        "scope": "src/commands_memory.rs", "message": "reviewing", "source": "claude_code", "session_id": "claude-B"
-    }));
-
-    // Cross-client visibility: B sees A's claim and vice versa.
-    let seen_by_b = claim_scopes(&mut client_b);
-    assert!(
-        seen_by_b.contains(&codex_file.to_string()),
-        "B must see A's claim: {seen_by_b:?}"
-    );
-    assert!(
-        seen_by_b.contains(&"src/commands_memory.rs".to_string()),
-        "B must see its own claim: {seen_by_b:?}"
-    );
-    let seen_by_a = claim_scopes(&mut client_a);
-    assert!(
-        seen_by_a.contains(&"src/commands_memory.rs".to_string()),
-        "A must see B's claim: {seen_by_a:?}"
-    );
-
-    // End Claude session B: its transcript becomes a finished turn. The claim is
-    // now owned by a dead session and must be retired on the next peer read.
-    write_claude(&claude_dir, "claude-B", &repo, "src/commands_memory.rs");
-    let after = claim_scopes(&mut client_a);
-    assert!(
-        after.contains(&codex_file.to_string()),
-        "A's claim (live session) must survive: {after:?}"
-    );
-    assert!(
-        !after.contains(&"src/commands_memory.rs".to_string()),
-        "B's claim must be retired once its session ended, seen from the peer process: {after:?}"
-    );
-
-    drop(client_a);
-    drop(client_b);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// End-to-end line-level AI blame: an agent session captures a working diff that
-/// adds two lines to a file, then `blame_file` (over the real mcp-serve binary)
-/// must attribute exactly those current line numbers to that session/actor/
-/// mission, while untouched lines stay unattributed. Proves the whole chain —
-/// unified hunk capture → event log → blame replay — closes the provenance loop.
-#[test]
-fn blame_file_attributes_changed_lines_to_agent_session() {
-    let root = unique_tmp("blame");
-    let home = root.join("home");
-    let repo = root.join("repo");
-    std::fs::create_dir_all(repo.join("src")).unwrap();
-
-    // A real git repo with a committed baseline file.
-    assert!(git(&repo, &["init", "-q"]).success());
-    assert!(git(&repo, &["config", "user.email", "t@t.com"]).success());
-    assert!(git(&repo, &["config", "user.name", "t"]).success());
-    std::fs::write(repo.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
-    assert!(git(&repo, &["add", "-A"]).success());
-    assert!(git(&repo, &["commit", "-qm", "init"]).success());
-
-    brick(&home, &repo, &["init"]);
-    write_fake_login(&home);
-    let org = extract(
-        &brick(&home, &repo, &["org", "create", "BlameOrg"]),
-        "org_id",
-    )
-    .expect("org id");
-    let project = extract(
-        &brick(
-            &home,
-            &repo,
-            &["project", "create", "--org", &org, "BlameProj"],
-        ),
-        "project_id",
-    )
-    .expect("project id");
-    let mission = extract(
-        &brick(
-            &home,
-            &repo,
-            &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "mission",
-                "create",
-                "--project",
-                &project,
-                "Add y",
-                "--status",
-                "active",
-            ],
-        ),
-        "mission_id",
-    )
-    .expect("mission id");
-    let session = extract(
-        &brick(
-            &home,
-            &repo,
-            &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "session",
-                "start",
-                "--mission",
-                &mission,
-                "--name",
-                "s1",
-            ],
-        ),
-        "session_id",
-    )
-    .expect("session id");
-    let artifact = extract(
-        &brick(
-            &home,
-            &repo,
-            &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "artifact",
-                "create",
-                "--mission",
-                &mission,
-                "--kind",
-                "patch",
-                "y patch",
-            ],
-        ),
-        "artifact_id",
-    )
-    .expect("artifact id");
-
-    // The agent edits the file (adds lines 3 and 4) and captures a working diff
-    // bound to its session — this is the line-level provenance event.
-    std::fs::write(
-        repo.join("src/main.rs"),
-        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
-    )
-    .unwrap();
-    let captured = brick(
-        &home,
-        &repo,
-        &[
-            "--actor-type",
-            "agent",
-            "--actor-id",
-            "codex-bot",
-            "evidence",
-            "diff",
-            "--artifact",
-            &artifact,
-            "--session",
-            &session,
-            "--mission",
-            &mission,
-            "--target",
-            "working",
-        ],
-    );
-    assert!(
-        captured.status.success(),
-        "evidence diff failed: {}",
-        String::from_utf8_lossy(&captured.stderr)
-    );
-
-    // Blame over the real mcp-serve binary, cwd = repo.
-    let mut m = Mcp::spawn(&home, &repo);
-    let blame = m.call("blame", json!({"path": "src/main.rs"}));
-    let lines = blame["lines"].as_array().expect("lines array");
-    // Owner mode: line_count is the whole file, but only owned lines are returned.
-    assert_eq!(blame["line_count"], json!(5), "file has 5 lines: {blame}");
-    assert_eq!(blame["mode"], json!("owner"), "default owner mode: {blame}");
-
-    let owned =
-        |n: u64| -> Option<&Value> { lines.iter().find(|line| line["line_no"] == json!(n)) };
-    // Lines 3 and 4 are the agent's additions → attributed to its session.
-    for n in [3u64, 4] {
-        let line = owned(n).unwrap_or_else(|| panic!("owned line {n} missing: {blame}"));
-        assert_eq!(
-            line["session_id"],
-            json!(session),
-            "line {n} should attribute to the capturing session: {line}"
-        );
-        assert_eq!(
-            line["actor_id"],
-            json!("codex-bot"),
-            "line {n} actor: {line}"
-        );
-        assert_eq!(
-            line["mission_id"],
-            json!(mission),
-            "line {n} mission: {line}"
-        );
-        assert_eq!(
-            line["confidence"],
-            json!("working"),
-            "line {n} confidence: {line}"
-        );
-    }
-    // Line 1 (`fn main() {`) was untouched → not an owned line, so it is absent
-    // from the owner-mode response (collapsed into skipped_lines).
-    assert!(
-        owned(1).is_none(),
-        "untouched line 1 must not appear in owner mode: {blame}"
-    );
-    assert_eq!(
-        blame["owner_lines"],
-        json!(2),
-        "exactly 2 owner lines: {blame}"
-    );
-    assert_eq!(
-        blame["skipped_lines"],
-        json!(3),
-        "remaining 3 lines skipped: {blame}"
-    );
-
-    drop(m);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Runs a git subcommand in `repo`, returning its exit status.
@@ -787,32 +236,174 @@ fn git(repo: &Path, args: &[&str]) -> std::process::ExitStatus {
         .expect("run git")
 }
 
-/// Writes a valid, non-expired login session into `$BRICK_HOME/identity.json`
-/// so the proprietary `sync` build's soft gate lets blame/planning tools run.
-/// The shape mirrors `brick_sync::identity::Identity`. No-op in the open build.
-fn write_fake_login(home: &Path) {
-    let far_future =
-        (Utc::now() + chrono::Duration::days(3650)).to_rfc3339_opts(SecondsFormat::Secs, true);
-    let body = serde_json::json!({
-        "user_id": "test-user",
-        "email": "tester@example.com",
-        "access_token": "test-access",
-        "refresh_token": "test-refresh",
-        "expires_at": far_future,
-    });
-    std::fs::create_dir_all(home).unwrap();
-    std::fs::write(home.join("identity.json"), body.to_string()).unwrap();
+// ---------------------------------------------------------------------------
+// Surface shape: explain + link only; planning behind a flag; retired hints.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn main_surface_is_explain_and_link_only() {
+    let (root, home, repo, _codex_dir, _claude_dir) = setup_world("surface");
+    let mut m = Mcp::spawn(&home, &repo);
+
+    let mut tools = m.tool_names();
+    tools.sort();
+    assert_eq!(
+        tools,
+        vec!["explain".to_string(), "link".to_string()],
+        "main surface must be exactly explain + link; got {tools:?}"
+    );
+
+    // Every retired tool name returns an actionable migration hint, not a bare
+    // unknown-tool failure.
+    for retired in [
+        "log_file",
+        "recall_file",
+        "blame",
+        "blame_file",
+        "log_line",
+        "search",
+        "show_session",
+        "sessions",
+        "live_sessions",
+        "claim",
+        "claims",
+        "status",
+        "mission",
+        "mission_list",
+        "artifact_add",
+    ] {
+        let resp = m.call(retired, json!({}));
+        assert_eq!(
+            resp.get("error").and_then(Value::as_str),
+            Some("tool_retired"),
+            "retired tool {retired} should report tool_retired: {resp}"
+        );
+        assert!(
+            resp.get("hint").and_then(Value::as_str).is_some(),
+            "retired tool {retired} should carry a migration hint: {resp}"
+        );
+    }
+
+    // A genuinely unknown tool is a hard RPC error, not a retired hint.
+    let unknown = m.call("totally_made_up_tool", json!({}));
+    assert!(
+        unknown.get("_rpc_error").is_some(),
+        "unknown tool should hard-error: {unknown}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Removes the login session so the soft gate denies gated tools.
-#[cfg_attr(not(feature = "sync"), allow(dead_code))]
-fn remove_login(home: &Path) {
-    let _ = std::fs::remove_file(home.join("identity.json"));
+#[test]
+fn planning_surface_exposes_planning_tools() {
+    let (root, home, repo, _codex_dir, _claude_dir) = setup_world("planning-surface");
+    let mut m = Mcp::spawn_planning(&home, &repo);
+
+    let mut tools = m.tool_names();
+    tools.sort();
+    assert_eq!(
+        tools,
+        vec![
+            "artifact_add".to_string(),
+            "artifact_attach".to_string(),
+            "mission".to_string(),
+            "mission_list".to_string(),
+            "show_mission".to_string(),
+        ],
+        "planning surface tools mismatch: {tools:?}"
+    );
+    // explain/link are NOT on the planning surface.
+    assert!(!tools.contains(&"explain".to_string()));
+    assert!(!tools.contains(&"link".to_string()));
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// Planning loop over the planning surface (mission → artifact → attach).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn planning_loop_mission_artifact_attach() {
+    let (root, home, repo, _codex_dir, _claude_dir) = setup_world("planning-loop");
+    let org = extract(&brick(&home, &repo, &["org", "create", "O"]), "org_id").expect("org");
+    let project = extract(
+        &brick(&home, &repo, &["project", "create", "--org", &org, "P"]),
+        "project_id",
+    )
+    .expect("project");
+
+    let mut m = Mcp::spawn_planning(&home, &repo);
+
+    let created = m.call(
+        "mission",
+        json!({"action":"create","project":project,"title":"Cache git status","status":"active","source":"codex_app"}),
+    );
+    assert_eq!(created["created"], json!(true), "{created}");
+    let mid = created["mission_id"].as_str().expect("mission_id").to_string();
+
+    let listed = m.call("mission_list", json!({"status":"active"}));
+    assert!(
+        listed["missions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["title"] == "Cache git status"),
+        "mission not listed: {listed}"
+    );
+
+    let art = m.call(
+        "artifact_add",
+        json!({"title":"PR: cache","kind":"patch","mission":mid,"source":"codex_app"}),
+    );
+    assert_eq!(art["recorded"], json!(true), "{art}");
+    let aid = art["artifact_id"].as_str().expect("artifact_id").to_string();
+
+    let attached = m.call(
+        "artifact_attach",
+        json!({"artifact":aid,"path":"src/commands_git.rs","source":"codex_app"}),
+    );
+    assert_eq!(attached["attached"], json!(true), "{attached}");
+
+    let shown = m.call("show_mission", json!({"mission":mid}));
+    assert!(
+        shown["artifact_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == &json!(aid)),
+        "artifact not under mission: {shown}"
+    );
+
+    // Planning surface refuses an explain call (wrong surface).
+    let wrong = m.call("explain", json!({"anchor":"src/commands_git.rs:1"}));
+    assert!(
+        wrong.get("_rpc_error").is_some(),
+        "explain must not exist on the planning surface: {wrong}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// explain end-to-end: file:line → blame → causal chain with WHO + WHY.
+// ---------------------------------------------------------------------------
 
 /// Bootstraps a git repo + brick home + an active agent mission/session/artifact
-/// for blame tests. Returns `(root, home, repo, session, mission, artifact)`.
-fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
+/// for explain/blame tests. Returns a handle that can capture diffs and explain.
+struct World {
+    root: PathBuf,
+    home: PathBuf,
+    repo: PathBuf,
+    session: String,
+    mission: String,
+    artifact: String,
+}
+
+fn world(tag: &str, seed_files: &[(&str, &str)]) -> World {
     let root = unique_tmp(tag);
     let home = root.join("home");
     let repo = root.join("repo");
@@ -827,11 +418,6 @@ fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
     assert!(git(&repo, &["commit", "-qm", "init"]).success());
 
     brick(&home, &repo, &["init"]);
-    // Under the proprietary `sync` build, line-level blame is gated behind a
-    // login. Existing blame scenarios assert attribution, not the gate, so seed
-    // a valid login here; the dedicated gate test below removes it to assert the
-    // denial. No-op in the open-source build (no login concept).
-    write_fake_login(&home);
     let org = extract(&brick(&home, &repo, &["org", "create", "O"]), "org_id").expect("org");
     let project = extract(
         &brick(&home, &repo, &["project", "create", "--org", &org, "P"]),
@@ -843,17 +429,8 @@ fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
             &home,
             &repo,
             &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "mission",
-                "create",
-                "--project",
-                &project,
-                "m",
-                "--status",
-                "active",
+                "--actor-type", "agent", "--actor-id", "codex-bot", "mission", "create",
+                "--project", &project, "m", "--status", "active",
             ],
         ),
         "mission_id",
@@ -864,16 +441,8 @@ fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
             &home,
             &repo,
             &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "session",
-                "start",
-                "--mission",
-                &mission,
-                "--name",
-                "s1",
+                "--actor-type", "agent", "--actor-id", "codex-bot", "session", "start",
+                "--mission", &mission, "--name", "s1",
             ],
         ),
         "session_id",
@@ -884,23 +453,14 @@ fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
             &home,
             &repo,
             &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "artifact",
-                "create",
-                "--mission",
-                &mission,
-                "--kind",
-                "patch",
-                "p",
+                "--actor-type", "agent", "--actor-id", "codex-bot", "artifact", "create",
+                "--mission", &mission, "--kind", "patch", "p",
             ],
         ),
         "artifact_id",
     )
     .expect("artifact");
-    BlameWorld {
+    World {
         root,
         home,
         repo,
@@ -910,36 +470,16 @@ fn blame_world(tag: &str, seed_files: &[(&str, &str)]) -> BlameWorld {
     }
 }
 
-struct BlameWorld {
-    root: PathBuf,
-    home: PathBuf,
-    repo: PathBuf,
-    session: String,
-    mission: String,
-    artifact: String,
-}
-
-impl BlameWorld {
+impl World {
     /// Captures a working diff for the whole tree, bound to the agent session.
     fn capture_working(&self) {
         let out = brick(
             &self.home,
             &self.repo,
             &[
-                "--actor-type",
-                "agent",
-                "--actor-id",
-                "codex-bot",
-                "evidence",
-                "diff",
-                "--artifact",
-                &self.artifact,
-                "--session",
-                &self.session,
-                "--mission",
-                &self.mission,
-                "--target",
-                "working",
+                "--actor-type", "agent", "--actor-id", "codex-bot", "evidence", "diff",
+                "--artifact", &self.artifact, "--session", &self.session, "--mission",
+                &self.mission, "--target", "working",
             ],
         );
         assert!(
@@ -949,51 +489,62 @@ impl BlameWorld {
         );
     }
 
-    fn blame(&self, path: &str) -> Value {
+    fn explain(&self, anchor: &str) -> Value {
         let mut m = Mcp::spawn(&self.home, &self.repo);
-        let v = m.call("blame", json!({ "path": path }));
-        drop(m);
-        v
-    }
-
-    fn blame_history(&self, path: &str, line_start: u64, line_end: u64) -> Value {
-        let mut m = Mcp::spawn(&self.home, &self.repo);
-        let v = m.call(
-            "log_line",
-            json!({ "path": path, "line_start": line_start, "line_end": line_end }),
-        );
+        let v = m.call("explain", json!({ "anchor": anchor }));
         drop(m);
         v
     }
 }
 
-/// Returns the actor_id attributed to a given line, or None.
-fn line_actor(blame: &Value, line_no: u64) -> Option<String> {
-    blame["lines"]
-        .as_array()
-        .unwrap()
+/// Returns the first step in an explain chain attributed to a given actor.
+fn step_for_actor<'a>(chain: &'a Value, actor: &str) -> Option<&'a Value> {
+    chain["causal_chain"]
+        .as_array()?
         .iter()
-        .find(|l| l["line_no"] == json!(line_no))
-        .and_then(|l| l["actor_id"].as_str().map(str::to_string))
+        .find(|step| step["actor_id"].as_str() == Some(actor))
 }
 
-fn line_confidence(blame: &Value, line_no: u64) -> Option<String> {
-    blame["lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|l| l["line_no"] == json!(line_no))
-        .and_then(|l| l["confidence"].as_str().map(str::to_string))
-}
-
-/// Real-workflow regression: after the agent's change is COMMITTED, blame must
-/// still attribute the agent's lines — now via the commit → per-file patch-id
-/// path (confidence "commit"), not the stale working overlay. Guards the bug
-/// where post-commit attribution was silently lost.
 #[test]
-fn blame_survives_commit_via_per_file_patch_id() {
-    let w = blame_world(
-        "blame-commit",
+fn explain_file_line_resolves_who_via_blame() {
+    let w = world(
+        "explain-who",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    // Agent adds lines 3 and 4, captures a working diff bound to its session.
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+
+    // explain on the agent's added line resolves through blame to its session.
+    let chain = w.explain("src/main.rs:3");
+    assert!(
+        !chain["anchor"]["resolved_events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "anchor must resolve to an event: {chain}"
+    );
+    assert_eq!(
+        chain["anchor"]["blame_confidence"].as_str(),
+        Some("working"),
+        "uncommitted change → working confidence: {chain}"
+    );
+    let step = step_for_actor(&chain, "codex-bot")
+        .unwrap_or_else(|| panic!("no step for codex-bot: {chain}"));
+    assert_eq!(step["session_id"].as_str(), Some(w.session.as_str()), "{step}");
+    assert_eq!(step["mission_id"].as_str(), Some(w.mission.as_str()), "{step}");
+
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+#[test]
+fn explain_survives_commit_via_per_file_patch_id() {
+    let w = world(
+        "explain-commit",
         &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
     );
     std::fs::write(
@@ -1005,32 +556,23 @@ fn blame_survives_commit_via_per_file_patch_id() {
     assert!(git(&w.repo, &["add", "-A"]).success());
     assert!(git(&w.repo, &["commit", "-qm", "add y"]).success());
 
-    let blame = w.blame("src/main.rs");
-    for n in [3u64, 4] {
-        assert_eq!(
-            line_actor(&blame, n).as_deref(),
-            Some("codex-bot"),
-            "line {n}: {blame}"
-        );
-        assert_eq!(
-            line_confidence(&blame, n).as_deref(),
-            Some("commit"),
-            "line {n}: {blame}"
-        );
-    }
-    assert_eq!(blame["owner_lines"], json!(2), "{blame}");
+    let chain = w.explain("src/main.rs:3");
+    assert_eq!(
+        chain["anchor"]["blame_confidence"].as_str(),
+        Some("commit"),
+        "committed change → commit confidence: {chain}"
+    );
+    let step = step_for_actor(&chain, "codex-bot")
+        .unwrap_or_else(|| panic!("no codex-bot step after commit: {chain}"));
+    assert_eq!(step["session_id"].as_str(), Some(w.session.as_str()), "{step}");
+
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
-/// Real-workflow regression: a LATER unrelated edit inserts a line above the
-/// agent's committed change, shifting its line numbers. Blame must follow the
-/// drift (git blame maps current lines to commits) and must NOT mis-attribute
-/// the inserted line or the shifted-but-unrelated lines. Guards the stale
-/// working-hunk-coordinate bug found in live testing.
 #[test]
-fn blame_follows_line_drift_after_later_edit() {
-    let w = blame_world(
-        "blame-drift",
+fn explain_follows_line_drift_after_later_edit() {
+    let w = world(
+        "explain-drift",
         &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
     );
     std::fs::write(
@@ -1042,8 +584,7 @@ fn blame_follows_line_drift_after_later_edit() {
     assert!(git(&w.repo, &["add", "-A"]).success());
     assert!(git(&w.repo, &["commit", "-qm", "A: add y"]).success());
 
-    // A different later commit inserts a comment near the top → agent's lines
-    // shift from 3,4 down to 4,5.
+    // A later unrelated commit inserts a comment, shifting the agent's lines down.
     std::fs::write(
         w.repo.join("src/main.rs"),
         "fn main() {\n    // inserted later\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
@@ -1052,216 +593,195 @@ fn blame_follows_line_drift_after_later_edit() {
     assert!(git(&w.repo, &["add", "-A"]).success());
     assert!(git(&w.repo, &["commit", "-qm", "B: insert comment"]).success());
 
-    let blame = w.blame("src/main.rs");
-    // Agent's real lines are now 4 and 5.
-    assert_eq!(
-        line_actor(&blame, 4).as_deref(),
-        Some("codex-bot"),
-        "drifted line 4: {blame}"
-    );
-    assert_eq!(
-        line_actor(&blame, 5).as_deref(),
-        Some("codex-bot"),
-        "drifted line 5: {blame}"
-    );
-    // The inserted comment (line 2) and the original code must NOT be attributed.
+    // The agent's `let y` is now line 4; explain follows the drift to its session.
+    let drifted = w.explain("src/main.rs:4");
     assert!(
-        line_actor(&blame, 2).is_none(),
-        "inserted comment must be unattributed: {blame}"
+        step_for_actor(&drifted, "codex-bot").is_some(),
+        "drifted line 4 must still attribute to the agent: {drifted}"
     );
+    // The inserted comment (line 2) is not the agent's → no attribution.
+    let comment = w.explain("src/main.rs:2");
     assert!(
-        line_actor(&blame, 3).is_none(),
-        "shifted `let x` must be unattributed: {blame}"
+        comment["anchor"]["resolved_events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "inserted comment must not resolve to an agent event: {comment}"
     );
-    assert_eq!(blame["owner_lines"], json!(2), "{blame}");
+
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
-/// Real-workflow regression: the agent edits TWO files and lands them in ONE
-/// multi-file commit (plus brick's own .gitignore). Per-file patch-id must
-/// attribute each file independently — the whole-commit patch-id matches
-/// neither file's captured slice. Guards the multi-file-commit bug.
+// ---------------------------------------------------------------------------
+// link: write a causal edge; explain reads the WHY back.
+// ---------------------------------------------------------------------------
+
 #[test]
-fn blame_attributes_each_file_in_a_multi_file_commit() {
-    let w = blame_world(
-        "blame-multi",
-        &[("src/a.rs", "fn a() {\n}\n"), ("src/b.rs", "fn b() {\n}\n")],
+fn link_rationale_then_explain_reads_the_why() {
+    let w = world(
+        "link-rationale",
+        &[("src/auth.rs", "fn refresh() {\n    token();\n}\n")],
     );
     std::fs::write(
-        w.repo.join("src/a.rs"),
-        "fn a() {\n    let ax = 1;\n    let ay = 2;\n}\n",
+        w.repo.join("src/auth.rs"),
+        "fn refresh() {\n    lock();\n    token();\n}\n",
     )
     .unwrap();
-    std::fs::write(w.repo.join("src/b.rs"), "fn b() {\n    let bx = 9;\n}\n").unwrap();
     w.capture_working();
-    assert!(git(&w.repo, &["add", "-A"]).success());
-    assert!(git(&w.repo, &["commit", "-qm", "feat: both files"]).success());
 
-    let blame_a = w.blame("src/a.rs");
-    assert_eq!(
-        line_actor(&blame_a, 2).as_deref(),
-        Some("codex-bot"),
-        "a.rs L2: {blame_a}"
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    // Standalone rationale bound to the agent's most recent diff (no effect arg).
+    let linked = m.call(
+        "link",
+        json!({"relation":"rationale","note":"token refresh had a concurrency race; serialized it","source":"codex_app"}),
     );
-    assert_eq!(
-        line_actor(&blame_a, 3).as_deref(),
-        Some("codex-bot"),
-        "a.rs L3: {blame_a}"
-    );
-    assert_eq!(blame_a["owner_lines"], json!(2), "a.rs: {blame_a}");
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+    assert_eq!(linked["relation"], json!("rationale"), "{linked}");
 
-    let blame_b = w.blame("src/b.rs");
-    assert_eq!(
-        line_actor(&blame_b, 2).as_deref(),
-        Some("codex-bot"),
-        "b.rs L2: {blame_b}"
-    );
-    assert_eq!(blame_b["owner_lines"], json!(1), "b.rs: {blame_b}");
+    // explain the changed line and recover the WHY.
+    let chain = m.call("explain", json!({"anchor":"src/auth.rs:2"}));
+    let has_why = chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("concurrency race"))
+                .unwrap_or(false)
+        });
+    assert!(has_why, "explain must surface the linked rationale: {chain}");
+
+    drop(m);
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
-/// blame_history lists the FULL change history of a line range, not just the last
-/// touch. Two AI-captured commits modify the same line in sequence; the history
-/// must return BOTH commits (newest first), both attributed to the agent — the
-/// thing blame_file (last-commit-only) cannot do.
 #[test]
-fn blame_history_lists_all_sessions_for_a_line_range() {
-    let w = blame_world(
-        "blame-history",
-        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+fn link_cross_event_edge_shows_as_forward_effect() {
+    let w = world(
+        "link-edge",
+        &[
+            ("src/auth.rs", "fn refresh() {\n    token();\n}\n"),
+            ("src/test_auth.rs", "fn t() {}\n"),
+        ],
     );
-
-    // Capture #1: agent changes line 2, commit.
+    // First change: auth.rs (the cause), captured + committed so it has a stable id.
     std::fs::write(
-        w.repo.join("src/main.rs"),
-        "fn main() {\n    let x = 10;\n}\n",
+        w.repo.join("src/auth.rs"),
+        "fn refresh() {\n    lock();\n    token();\n}\n",
     )
     .unwrap();
     w.capture_working();
     assert!(git(&w.repo, &["add", "-A"]).success());
-    assert!(git(&w.repo, &["commit", "-qm", "A: x = 10"]).success());
+    assert!(git(&w.repo, &["commit", "-qm", "fix auth"]).success());
 
-    // Capture #2: agent changes the SAME line again, commit.
-    std::fs::write(
-        w.repo.join("src/main.rs"),
-        "fn main() {\n    let x = 20;\n}\n",
-    )
-    .unwrap();
+    // Second change: the test, captured.
+    std::fs::write(w.repo.join("src/test_auth.rs"), "fn t() {\n    refresh();\n}\n").unwrap();
     w.capture_working();
-    assert!(git(&w.repo, &["add", "-A"]).success());
-    assert!(git(&w.repo, &["commit", "-qm", "B: x = 20"]).success());
 
-    let hist = w.blame_history("src/main.rs", 2, 2);
-    let commits = hist["history"].as_array().expect("history array");
-    // Both commits that touched line 2 must be present (full history, not just
-    // the last one), newest-first.
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    // The test (effect) is derived_from the auth change (cause).
+    let linked = m.call(
+        "link",
+        json!({
+            "effect":"src/test_auth.rs:2",
+            "cause":"src/auth.rs:2",
+            "relation":"derived_from",
+            "note":"covers the race fix",
+            "source":"codex_app"
+        }),
+    );
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+    assert_eq!(linked["relation"], json!("derived_from"), "{linked}");
+
+    // explain the auth change → the test shows up as a forward effect.
+    let chain = m.call("explain", json!({"anchor":"src/auth.rs:2"}));
+    let forward = chain["forward"].as_array().cloned().unwrap_or_default();
     assert!(
-        commits.len() >= 2,
-        "expected >=2 commits in line history: {hist}"
+        forward
+            .iter()
+            .any(|effect| effect["relation_to_anchor"].as_str() == Some("derived_from")),
+        "auth change should have a derived_from forward effect: {chain}"
     );
-    assert_eq!(
-        commits[0]["subject"].as_str(),
-        Some("B: x = 20"),
-        "newest commit first: {hist}"
-    );
-    assert_eq!(
-        commits[1]["subject"].as_str(),
-        Some("A: x = 10"),
-        "older commit second: {hist}"
-    );
-    // Both are owner-attributed to the capturing agent.
-    for (i, c) in commits.iter().take(2).enumerate() {
-        assert_eq!(
-            c["actor_id"].as_str(),
-            Some("codex-bot"),
-            "commit {i} actor: {hist}"
-        );
-        assert_eq!(
-            c["attributed"],
-            json!(true),
-            "commit {i} attributed: {hist}"
-        );
-    }
-    assert!(
-        hist["attributed_commits"].as_u64().unwrap() >= 2,
-        "attributed_commits >= 2: {hist}"
-    );
+
+    drop(m);
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
-/// Free layer must never be gated: with NO login present, the file-level recall
-/// and live-awareness tools all return normal payloads (no `login_required`).
-/// `setup_world` never writes an identity, so this exercises the unauthenticated
-/// path directly. Locks the free/registered boundary so a future gate widening
-/// can't accidentally wall off the free tools.
 #[test]
-fn free_tools_work_without_login() {
-    let (root, home, repo, codex_dir, claude_dir) = setup_world("free-no-login");
-    write_codex(&codex_dir, "codex-live-free", &repo, "src/commands_git.rs");
-    write_claude(
-        &claude_dir,
-        "claude-done-free",
-        &repo,
-        "src/commands_memory.rs",
+fn link_rejects_information_free_edge() {
+    let w = world("link-empty", &[("src/a.rs", "fn a() {}\n")]);
+    std::fs::write(w.repo.join("src/a.rs"), "fn a() {\n    b();\n}\n").unwrap();
+    w.capture_working();
+
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    // No cause and no note → must be rejected as a hard error.
+    let resp = m.call("link", json!({"relation":"rationale","source":"codex_app"}));
+    assert!(
+        resp.get("_rpc_error").is_some(),
+        "link with neither cause nor note must error: {resp}"
     );
-    // Be explicit: no identity file exists in this world.
-    remove_login(&home);
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+// ---------------------------------------------------------------------------
+// explain enrichment: live coordination + empty-record honesty.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn explain_surfaces_live_session_on_anchor_file() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-live");
+    // A live Codex session is editing commands_git.rs right now.
+    write_codex(&codex_dir, "codex-live-001", &repo, "src/commands_git.rs");
 
     let mut m = Mcp::spawn(&home, &repo);
-    for (tool, args) in [
-        ("log_file", json!({ "path": "src/commands_git.rs" })),
-        (
-            "search",
-            json!({ "query": "git status caching" }),
-        ),
-        ("search", json!({ "query": "cache" })),
-        ("sessions", json!({})),
-        ("claims", json!({})),
-    ] {
-        let resp = m.call(tool, args);
-        assert!(
-            resp.get("error").and_then(Value::as_str) != Some("login_required"),
-            "free tool {tool} was gated: {resp}"
-        );
-    }
+    // Anchor on that file; even with no causal record, the live field fires.
+    let chain = m.call("explain", json!({"anchor":"src/commands_git.rs:1"}));
+    assert!(
+        chain.get("live").is_some(),
+        "explain must surface a live session editing the anchor file: {chain}"
+    );
+
     drop(m);
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Soft gate (proprietary `sync` build only): line-level blame is denied without
-/// a login and allowed once a valid session exists. Proves the registered layer
-/// is actually walled in the official binary.
-#[cfg(feature = "sync")]
 #[test]
-fn line_blame_requires_login_under_sync() {
-    let w = blame_world(
-        "blame-gate",
-        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+fn explain_is_honest_when_no_record_exists() {
+    let (root, home, repo, _codex_dir, _claude_dir) = setup_world("explain-empty");
+    let mut m = Mcp::spawn(&home, &repo);
+    // A file with no captured Brick history at all.
+    let chain = m.call("explain", json!({"anchor":"src/commands_memory.rs:1"}));
+    assert!(
+        chain["anchor"]["resolved_events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no record → no resolved events: {chain}"
     );
-    // blame_world seeded a login; remove it to assert the denial.
-    remove_login(&w.home);
-    let denied = {
-        let mut m = Mcp::spawn(&w.home, &w.repo);
-        let v = m.call("blame", json!({ "path": "src/main.rs" }));
-        drop(m);
-        v
-    };
-    assert_eq!(
-        denied.get("error").and_then(Value::as_str),
-        Some("login_required"),
-        "blame_file must be gated without login: {denied}"
+    assert!(
+        chain
+            .get("note")
+            .and_then(Value::as_str)
+            .map(|note| note.to_lowercase().contains("no brick record"))
+            .unwrap_or(false),
+        "explain must say so honestly when there is no record: {chain}"
+    );
+    // It does NOT fabricate a chain.
+    assert!(
+        chain["causal_chain"].as_array().map(|c| c.is_empty()).unwrap_or(true),
+        "no record → empty chain, never guessed: {chain}"
     );
 
-    // Restore the login → the same call now succeeds.
-    write_fake_login(&w.home);
-    let allowed = w.blame("src/main.rs");
-    assert!(
-        allowed.get("error").is_none(),
-        "blame_file must succeed once logged in: {allowed}"
-    );
-    assert!(
-        allowed.get("lines").is_some() || allowed.get("owner_lines").is_some(),
-        "logged-in blame returns a payload: {allowed}"
-    );
-    let _ = std::fs::remove_dir_all(&w.root);
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The finished Claude transcript helper is retained for parity with the source
+/// fixtures, exercised by the live test's negative space.
+#[allow(dead_code)]
+fn finished_claude(dir: &Path, sid: &str, repo: &Path, file: &str) {
+    write_claude(dir, sid, repo, file);
 }

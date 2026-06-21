@@ -14,17 +14,6 @@ use crate::args::ArtifactKindArg;
 /// query/recall/export. Shared by `brick metadata` and `brick history`.
 pub const SOURCE_REFRESH_LIMIT: usize = 100_000;
 
-/// Default source scope: search every configured source/tool.
-pub const SOURCE_ALL: &str = "all";
-
-/// Default cap on recall/query results, kept small so tool output stays
-/// triage-sized for an agent.
-pub const RESULT_LIMIT: usize = 10;
-
-/// Default per-field truncation (bytes) when paging a session transcript, so a
-/// large tool output cannot overflow the agent's context.
-pub const MAX_FIELD_BYTES: usize = 2000;
-
 /// Default kind for a newly recorded artifact. `Note` is the neutral "I produced
 /// something" default and matches the MCP path; the CLI previously defaulted to
 /// `Decision`, which over-claimed. Both surfaces now use this single value.

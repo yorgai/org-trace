@@ -53,7 +53,118 @@ pub fn handle_metadata(
         MetadataCommand::RecallHook { source, limit } => {
             run_recall_hook(store, profiles, &source, limit)
         }
+        MetadataCommand::ExplainHook => run_explain_hook(store),
     }
+}
+
+/// Claude Code `PreToolUse` hook adapter for Read/Grep/Glob.
+///
+/// When the agent is about to inspect a file Brick has a causal record for, this
+/// injects a compact `explain` summary (who/why) so the agent sees the WHY before
+/// it draws conclusions from the code alone — the activation push that beats the
+/// "I grepped, therefore I understand" failure mode. Silent (exit 0, no output)
+/// when the file has no Brick record, so it never pollutes context. Errors are
+/// swallowed to stderr — a memory hook must never block a tool call.
+fn run_explain_hook(store: &LocalStore) -> Result<()> {
+    use std::io::Read;
+
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return Ok(());
+    }
+    let Some(file_path) = parse_hook_file_path(&raw) else {
+        return Ok(());
+    };
+
+    let context = match build_explain_hook_context(store, &file_path) {
+        Ok(Some(context)) => context,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            eprintln!("brick explain-hook: {error}");
+            return Ok(());
+        }
+    };
+
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        }
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+/// Builds the explain-hook injection for a file, or `None` when Brick has no
+/// causal record for it (so the hook stays silent). Resolves the file to its
+/// events via the event stream and surfaces any recorded rationale notes.
+fn build_explain_hook_context(store: &LocalStore, file_path: &str) -> Result<Option<String>> {
+    let events = store.read_all_events()?;
+    let index = store.load_or_rebuild_index()?;
+
+    // Match the file by its diff.captured events (path-suffix), newest first, and
+    // explain from the most recent one. Git-free: a Read/Grep hook has no line.
+    let rel = file_path.trim_start_matches("./");
+    let mut matches: Vec<&brick_protocol::TraceEvent> = events
+        .iter()
+        .filter(|event| event.event_type == brick_protocol::EventType::DiffCaptured)
+        .filter(|event| diff_touches_path(event, rel))
+        .collect();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    matches.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
+    let anchor_event = matches[0].event_id.to_string();
+
+    let anchor = brick_core::resolve_direct_anchor(&events, &anchor_event);
+    let chain = brick_core::explain_from_events(
+        &index,
+        &events,
+        anchor,
+        brick_core::DEFAULT_EXPLAIN_DEPTH,
+    );
+
+    // Only inject if there is real WHY to share (a rationale/relation note), not
+    // just a bare diff event — otherwise it is noise.
+    let whys: Vec<String> = chain
+        .steps
+        .iter()
+        .filter_map(|step| step.note.clone())
+        .collect();
+    if whys.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out = String::new();
+    out.push_str(
+        "Brick causal memory — WHY this file looks the way it does (prefer this over \
+re-deriving from the code or git log):\n",
+    );
+    for why in whys.iter().take(4) {
+        out.push_str(&format!("- {}\n", truncate(why, 200)));
+    }
+    out.push_str(&format!(
+        "Run `brick explain {rel}:<line>` for the full causal chain on a specific line."
+    ));
+    Ok(Some(out))
+}
+
+/// Whether a `diff.captured` event's file_changes touch `rel` (suffix match).
+fn diff_touches_path(event: &brick_protocol::TraceEvent, rel: &str) -> bool {
+    event
+        .payload
+        .get("file_changes")
+        .and_then(|value| value.as_array())
+        .map(|changes| {
+            changes.iter().any(|change| {
+                change
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|path| path == rel || path.ends_with(rel) || rel.ends_with(path))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Claude Code `PreToolUse` hook adapter.

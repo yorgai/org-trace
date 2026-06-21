@@ -8,18 +8,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use brick_protocol::{
     ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload,
-    ArtifactId, ArtifactLinkedToMissionPayload, ArtifactUpdatedPayload, DiffCapturedPayload,
-    EventType, MissionCreatedPayload, MissionId, MissionUpdatedPayload, OrgCreatedPayload, OrgId,
-    OrgUpdatedPayload, ProjectCreatedPayload, ProjectId, ProjectUpdatedPayload,
-    RepoContextCapturedPayload, SessionId, SessionLinkedToMissionPayload,
-    SessionLogUploadedPayload, SessionStartedPayload, TraceEvent,
+    ArtifactId, ArtifactLinkedToMissionPayload, ArtifactUpdatedPayload, CausalLinkedPayload,
+    ConfidenceLevel, DiffCapturedPayload, EventType, MissionCreatedPayload, MissionId,
+    MissionUpdatedPayload, OrgCreatedPayload, OrgId, OrgUpdatedPayload, ProjectCreatedPayload,
+    ProjectId, ProjectUpdatedPayload, RepoContextCapturedPayload, SessionId,
+    SessionLinkedToMissionPayload, SessionLogUploadedPayload, SessionStartedPayload, TraceEvent,
 };
 use chrono::Utc;
 
 use crate::{
-    IndexedArtifact, IndexedAttachment, IndexedDiff, IndexedDiffFileChange, IndexedFile,
-    IndexedFileRef, IndexedMission, IndexedOrg, IndexedProject, IndexedRepoContext, IndexedSession,
-    IndexedSessionLog, TraceIndex, INDEX_SCHEMA_VERSION,
+    CausalEdge, IndexedArtifact, IndexedAttachment, IndexedDiff, IndexedDiffFileChange,
+    IndexedFile, IndexedFileRef, IndexedMission, IndexedOrg, IndexedProject, IndexedRepoContext,
+    IndexedSession, IndexedSessionLog, TraceIndex, INDEX_SCHEMA_VERSION,
 };
 
 impl TraceIndex {
@@ -47,6 +47,8 @@ impl TraceIndex {
             session_logs: BTreeMap::new(),
             files: BTreeMap::new(),
             repo_contexts: BTreeMap::new(),
+            causes: BTreeMap::new(),
+            effects: BTreeMap::new(),
         }
     }
 
@@ -68,6 +70,7 @@ impl TraceIndex {
             EventType::ArtifactAttachmentUploaded => self.apply_artifact_attachment_uploaded(event),
             EventType::DiffCaptured => self.apply_diff_captured(event),
             EventType::RepoContextCaptured => self.apply_repo_context_captured(event),
+            EventType::CausalLinked => self.apply_causal_linked(event),
             EventType::ArtifactReviewed
             | EventType::ArtifactAccepted
             | EventType::ExternalRefLinked => Ok(()),
@@ -547,6 +550,42 @@ impl TraceIndex {
         Ok(())
     }
 
+    /// Projects a `causal.linked` event into the two adjacency tables. The edge
+    /// itself is recorded here (index time); the chain is walked later by
+    /// `explain` (query time). A standalone `Rationale` has no cause, so it only
+    /// lands in `causes` (keyed by the effect) with `cause_event = None`.
+    fn apply_causal_linked(&mut self, event: &TraceEvent) -> Result<()> {
+        let payload = payload::<CausalLinkedPayload>(event)?;
+        let effect = payload.effect_event.to_string();
+        let confidence = confidence_name(event.confidence).to_string();
+        let source_event_id = event.event_id.to_string();
+
+        if payload.cause_events.is_empty() {
+            self.causes.entry(effect.clone()).or_default().push(CausalEdge {
+                cause_event: None,
+                relation: payload.relation,
+                note: payload.note.clone(),
+                source_event_id: source_event_id.clone(),
+                confidence: confidence.clone(),
+                recorded_at: event.recorded_at,
+            });
+        } else {
+            for cause in &payload.cause_events {
+                let cause_id = cause.to_string();
+                self.causes.entry(effect.clone()).or_default().push(CausalEdge {
+                    cause_event: Some(cause_id.clone()),
+                    relation: payload.relation,
+                    note: payload.note.clone(),
+                    source_event_id: source_event_id.clone(),
+                    confidence: confidence.clone(),
+                    recorded_at: event.recorded_at,
+                });
+                self.effects.entry(cause_id).or_default().push(effect.clone());
+            }
+        }
+        Ok(())
+    }
+
     fn link_project_to_org(&mut self, project_id: &ProjectId, org_id: &OrgId, event: &TraceEvent) {
         let org = self
             .orgs
@@ -719,6 +758,19 @@ fn event_type_name(event_type: EventType) -> &'static str {
         EventType::RepoContextCaptured => "repo_context.captured",
         EventType::DiffCaptured => "diff.captured",
         EventType::ExternalRefLinked => "external_ref.linked",
+        EventType::CausalLinked => "causal.linked",
+    }
+}
+
+/// Stable snake_case name for a confidence level, mirroring the wire form so the
+/// causal adjacency tables carry the same vocabulary as the event stream.
+fn confidence_name(confidence: ConfidenceLevel) -> &'static str {
+    match confidence {
+        ConfidenceLevel::Explicit => "explicit",
+        ConfidenceLevel::Observed => "observed",
+        ConfidenceLevel::Imported => "imported",
+        ConfidenceLevel::Inferred => "inferred",
+        ConfidenceLevel::Unknown => "unknown",
     }
 }
 
@@ -905,5 +957,62 @@ mod tests {
             indexed_artifact.last_event_at,
             artifact_created_at + chrono::Duration::seconds(10)
         );
+    }
+
+    #[test]
+    fn builds_causal_adjacency_tables() {
+        use brick_protocol::{CausalLinkedPayload, CausalRelation, ConfidenceLevel};
+        use uuid::Uuid;
+
+        let e2 = Uuid::new_v4();
+        let e4 = Uuid::new_v4();
+
+        // e2 carries a standalone rationale (no upstream cause).
+        let rationale = TraceEvent::causal_linked(
+            actor(),
+            ConfidenceLevel::Observed,
+            CausalLinkedPayload {
+                effect_event: e2,
+                cause_events: vec![],
+                relation: CausalRelation::Rationale,
+                note: Some("token refresh race".to_string()),
+                repo_context_id: None,
+            },
+        )
+        .expect("rationale edge");
+
+        // e4 (a test) is derived_from e2 (the fix).
+        let derived = TraceEvent::causal_linked(
+            actor(),
+            ConfidenceLevel::Explicit,
+            CausalLinkedPayload {
+                effect_event: e4,
+                cause_events: vec![e2],
+                relation: CausalRelation::DerivedFrom,
+                note: Some("covers the race fix".to_string()),
+                repo_context_id: None,
+            },
+        )
+        .expect("derived edge");
+
+        let index = TraceIndex::build(&[rationale, derived]).expect("build index");
+
+        // causes: e2 has a rationale edge with no cause; e4 has a derived edge to e2.
+        let e2_edges = index.causes.get(&e2.to_string()).expect("e2 in causes");
+        assert_eq!(e2_edges.len(), 1);
+        assert_eq!(e2_edges[0].cause_event, None);
+        assert_eq!(e2_edges[0].relation, CausalRelation::Rationale);
+        assert_eq!(e2_edges[0].confidence, "observed");
+
+        let e4_edges = index.causes.get(&e4.to_string()).expect("e4 in causes");
+        assert_eq!(e4_edges.len(), 1);
+        assert_eq!(e4_edges[0].cause_event, Some(e2.to_string()));
+        assert_eq!(e4_edges[0].relation, CausalRelation::DerivedFrom);
+        assert_eq!(e4_edges[0].confidence, "explicit");
+
+        // effects: e2 influenced e4 (forward edge); a rationale produces no forward edge.
+        let e2_effects = index.effects.get(&e2.to_string()).expect("e2 in effects");
+        assert_eq!(e2_effects, &vec![e4.to_string()]);
+        assert!(!index.effects.contains_key(&e4.to_string()));
     }
 }

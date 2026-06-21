@@ -1,8 +1,47 @@
 # Brick
 
-Brick is a self-host-first provenance CLI and server for tracking human and AI agent work around missions, sessions, artifacts, files, diffs, imports, and commits.
+Brick is the **causal memory of a codebase**: a self-host-first provenance layer
+that answers *why* code looks the way it does, across every AI tool that touched
+it — not just *who* last changed a line (that is `git blame`), but the reasoning,
+the upstream cause, and what was derived from it.
 
-The name points at a durable unit of accountable work: like historical bricks signed by their makers, each recorded mission, session, and artifact can carry its provenance forward.
+The name points at a durable unit of accountable work: like historical bricks
+signed by their makers, each recorded change can carry its provenance — and its
+*reason* — forward in time.
+
+## Causal continuity — Brick as A2A's cross-time substrate
+
+Most agent infrastructure is about *the present moment*: A2A coordinates agents
+talking to each other right now; a session query is one stateful request. Brick
+lives on the orthogonal axis — **continuity across time**. When an A2A session
+ends, its `previous_actions` / shared-memory context is volatile; Brick is where
+that causal reasoning should land so the *next* agent, weeks later, can recover
+it.
+
+The core is a **causal graph, not a timeline.** A timeline ("these events
+happened in this order") is what `git log` already gives you, and it cannot tell
+whether two adjacent changes are related. Brick records explicit **causal edges**
+(`causal.linked` events) between changes, so `explain` walks real cause→effect
+links. Only when no edge exists does it fall back to a shallow same-session,
+time-ordered guess — and it labels every such step `inferred`, never dressing a
+timeline up as causality.
+
+- **`explain` answers WHY** (a multi-hop walk of the causal graph from an anchor)
+  and folds in WHO (line-level blame) as part of the answer.
+- **Anchors are line-level, edges are event-level.** `explain auth.rs:42` uses
+  blame to map the line → the change event that produced it (drift-aware), then
+  walks that event's causal edges. The same change event covers every line it
+  touched.
+- **It gets richer the more you use it.** Causal edges are only recorded while
+  Brick is installed; for code with no record, `explain` says so honestly and you
+  fall back to git. The more changes flow through Brick, the denser the graph.
+
+**Commercial boundary:** local `explain` is fully free and open — WHO, WHY, the
+causal walk, and live awareness all run locally with no login. Setting a wall on
+a local open feature is unenforceable anyway (it can be recompiled). The
+membership wall is on **cross-machine sync** (`brick-sync` / `brick-server`):
+syncing your causal graph and planning across machines / teams is the paid,
+networked capability.
 
 ## Status
 
@@ -35,11 +74,12 @@ cargo build -p brick --features sync   # private: adds the `brick sync` command
 cargo build -p brick-server       # private: the self-hosted remote
 ```
 
-`brick mcp-serve` (the MCP server surface) is fully open-source and exposes
-memory, planning, work-item management, and coordination tools to any
-MCP-capable agent — none of it depends on sync. The `crates/sync` and
-`crates/server` directories can be moved into a private submodule/overlay and
-dropped from the workspace `members` list without affecting the open build.
+`brick mcp-serve` (the MCP server surface) is fully open-source. Its main
+coding-agent surface is two tools — `explain` (read WHY) and `link` (write a
+causal edge); planning tools live behind `--planning` for a dedicated planning
+agent. None of it depends on sync. The `crates/sync` and `crates/server`
+directories can be moved into a private submodule/overlay and dropped from the
+workspace `members` list without affecting the open build.
 
 ## MVP walkthrough
 
@@ -149,10 +189,10 @@ Artifacts are the work products and proof attached to Missions and Sessions. The
 `brick agent install` injects a Brick instruction block into the memory files
 coding agents read as standing context — `CLAUDE.md` (Claude Code), `AGENTS.md`
 (Codex, Cursor, Copilot, OpenCode, …), and `GEMINI.md` (Gemini). The block tells
-the agent to call `brick metadata recall --path <file> --format json` before
-editing. That command returns indexed session metadata — who touched the file,
-why, change size, and transcript chunk hints — without loading full transcripts by
-default.
+the agent that when it locates existing code, its **first** step — before drawing
+conclusions from the code alone — is `brick explain <path>:<line>`, and that
+`git log` / `git blame` / `grep` are a *fallback* used only when Brick has no
+record. After a non-trivial change it nudges the agent to record WHY with `link`.
 
 ```bash
 brick agent install            # inject into this repo's CLAUDE.md/AGENTS.md/GEMINI.md
@@ -162,42 +202,55 @@ brick agent status             # report present / stale / absent per file
 brick agent uninstall          # remove only Brick's block
 ```
 
+On **Claude Code** this is reinforced with push hooks (`PreToolUse`): a
+`Read|Grep|Glob` hook injects a compact `explain` summary the moment the agent is
+about to inspect a file Brick has a causal record for — so it sees the WHY before
+it concludes — and stays completely silent when there is no record (zero context
+pollution). An `Edit|Write|MultiEdit` hook recalls the file before a change. Other
+platforms have no hook mechanism, so they rely on the markdown block plus the MCP
+tool descriptions (pull, not push) — an honest platform-capability difference.
+
 The injected text lives between `<!-- brick:managed:start v=N -->` and
 `<!-- brick:managed:end -->` sentinels. Edits are confined to that region and
 written atomically, so a user's existing memory file is never clobbered;
 re-running `install` is idempotent and rolls the block forward when the template
-version changes. `brick init` offers to run this for the current repo. `brick
-metadata` and `brick history` commands emit `--format json` so agents can parse
-them directly.
+version changes. `brick init` offers to run this for the current repo.
 
 ## MCP capability kit
 
-`brick mcp-serve` runs Brick as an MCP server over stdio, turning one install
-into a shared work surface any MCP-capable agent (Claude Code, Cursor, ORGII, …)
-can call. `brick agent install` registers it automatically. The tools group into
-three capabilities:
+`brick mcp-serve` runs Brick as an MCP server over stdio. The main coding-agent
+surface is deliberately just **two tools** — every extra tool dilutes the model's
+attention and eats context, so everything that an agent will not reliably reach
+for on its own is pushed (hooks) or kept off the agent surface entirely.
 
-- **Memory** — `search` (free-text over past sessions), `log_file` (who changed a
-  file and why), `show_session` (page through a transcript).
-- **Planning & work-item management** — `status`, `mission_list`,
-  `show_mission`, `mission` (create/update a goal), `artifact_add`
-  (log a deliverable), `artifact_attach` (back it with files).
-- **Coordination & awareness** — `claim` and `claims` (the
-  cross-session bulletin board), `sessions` (who's running now). `log_file`
-  also surfaces active claims on the file you ask about.
-- **Line-level provenance** — `blame` (per-line owner) and `log_line` (full
-  change history of a line range). Both require a Brick account.
+- **`explain`** — your single entry point into existing code: walk the causal
+  graph back from an anchor (`path:line`, or an artifact / mission / event id).
+  Returns the causal chain (who, when, why), what was derived from the anchor, a
+  transcript pointer per step, and a `live` field warning if another session is
+  editing the same file right now. This subsumes line-level blame (WHO) into the
+  WHY answer, and replaces the old `search` / `blame` / `log_*` / `show_session`
+  / `sessions` / `claims` tools.
+- **`link`** — record WHY after a non-trivial change: a standalone rationale
+  (`note`), or a causal edge (`cause` anchor + `relation`) to the change that
+  prompted it.
 
-A natural agent flow: `status` → `mission_list` → `mission`
-(create) → do the work → `artifact_add` → `artifact_attach` → `claim`.
+Planning tools (`mission`, `mission_list`, `show_mission`, `artifact_add`,
+`artifact_attach`) are **not** on the main surface — they live behind
+`brick mcp-serve --planning`, the surface for a dedicated *planning custom agent*
+(a Claude subagent, a Codex/Cursor mode, or an ORGII custom agent). When a user
+asks to plan, the main agent spawns the planning agent; the coding agent's own
+tool list stays minimal.
+
+Retired tool names (`log_file`, `blame`, `log_line`, `search`, `show_session`,
+`sessions`, `claim`, `claims`, `status`, and their older aliases) return an
+actionable migration hint pointing at `explain` for one release, so already
+installed agent memory / MCP configs fail loudly with guidance rather than
+silently.
+
 All of this is open-source and independent of the proprietary sync layer.
-The previous tool names (`recall_file`, `explore_memory`, `read_session`,
-`current_context`, `list_missions`, `manage_mission`, `record_artifact`,
-`attach_evidence`, `live_sessions`, `announce_work`, `list_announcements`,
-`blame_file`, `blame_history`) still resolve as aliases for one release.
 
 See [`docs/mcp/README.md`](docs/mcp/README.md) for the full reference — every
-tool's input/output shape and the recommended end-to-end flow.
+tool's input/output shape and the recommended flow.
 
 ## Local storage model
 

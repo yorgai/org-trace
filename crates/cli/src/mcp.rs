@@ -9,42 +9,38 @@
 //! Protocol invariant: stdout carries ONLY JSON-RPC; every diagnostic goes to
 //! stderr. A stray println on stdout corrupts the framing and breaks the client.
 
-use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    blame_file, blame_line_range_history, discover_repo_root, list_source_sessions,
-    AnnouncementStore, ClaimValidity, LocalStore, NewAnnouncement, SourceProfileStore,
+    discover_repo_root, explain_from_events, resolve_direct_anchor, resolve_file_line_anchor,
+    AnnouncementStore, CausalChain, CausalStep, LocalStore, SourceProfileStore,
+    DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
-    ArtifactKind, FileRefId, MissionCreatedPayload, MissionId, MissionStatus,
-    MissionUpdatedPayload, ProjectId, SessionId, TraceEvent,
+    ArtifactKind, CausalLinkedPayload, CausalRelation, ConfidenceLevel, FileRefId,
+    MissionCreatedPayload, MissionId, MissionStatus, MissionUpdatedPayload, ProjectId, SessionId,
+    TraceEvent,
 };
-use chrono::Duration;
 use serde_json::{json, Value};
 
-use crate::history::{
-    build_chunks_response, build_live_broadcast, collect_live_sessions, live_session_row,
-    read_profile,
-};
-use crate::metadata::{build_query_response, build_recall_response};
+use crate::history::build_live_broadcast;
 
 /// MCP protocol revision this server speaks.
 const PROTOCOL_VERSION: &str = "2024-11-05";
-/// Default source scope for tools: search every indexed tool's history.
-const DEFAULT_SOURCE: &str = crate::defaults::SOURCE_ALL;
-/// Default recall/query result cap, kept small so tool output stays triage-sized.
-const DEFAULT_LIMIT: usize = crate::defaults::RESULT_LIMIT;
-/// Default per-field truncation for `show_session`, matching the CLI default.
-const DEFAULT_MAX_FIELD_BYTES: usize = crate::defaults::MAX_FIELD_BYTES;
 
 /// Runs the stdio JSON-RPC loop until stdin closes. Never returns an error to the
 /// caller for per-request failures — those become JSON-RPC error responses; only
 /// a fatal stdout write failure propagates.
-pub fn serve(profiles: &SourceProfileStore, store: &LocalStore) -> Result<()> {
+///
+/// `planning` selects the tool surface. The default (false) is the minimal
+/// coding-agent surface — just `explain` (read WHY) and `link` (write a causal
+/// edge). With `planning=true` the planning tools (`mission`, `mission_list`,
+/// `show_mission`, `artifact_add`, `artifact_attach`) are added; this is the
+/// surface meant for a dedicated planning custom agent, not the main agent.
+pub fn serve(profiles: &SourceProfileStore, store: &LocalStore, planning: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -80,9 +76,9 @@ pub fn serve(profiles: &SourceProfileStore, store: &LocalStore) -> Result<()> {
         let id = id.unwrap();
 
         let response = match method {
-            "initialize" => success(id, initialize_result()),
-            "tools/list" => success(id, tools_list_result()),
-            "tools/call" => match handle_tool_call(profiles, store, &request) {
+            "initialize" => success(id, initialize_result(planning)),
+            "tools/list" => success(id, tools_list_result(planning)),
+            "tools/call" => match handle_tool_call(profiles, store, planning, &request) {
                 Ok(result) => success(id, result),
                 Err(error) => tool_error(id, &error.to_string()),
             },
@@ -100,7 +96,25 @@ fn write_message(out: &mut impl Write, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(planning: bool) -> Value {
+    let instructions = if planning {
+        "Brick planning surface (for a dedicated planning agent). Turn a request \
+into a tracked goal with mission action='create'; as work moves, mission \
+action='update' its status; list in-flight work with mission_list; inspect one \
+with show_mission; log deliverables with artifact_add and back them with \
+artifact_attach."
+    } else {
+        "Brick is the causal memory of this codebase — it answers WHY code looks \
+the way it does, across every AI tool that touched it. \
+When you locate a file or code you are about to change, call `explain` on it \
+BEFORE drawing conclusions from the code alone: it returns who changed it, why \
+(the rationale that can't be read from the code), what was derived from it, and \
+who is editing it right now. `explain` is your FIRST step into existing code — \
+prefer it over grep and `git log`, which are only a fallback when Brick has no \
+record. \
+After you make a non-trivial change, call `link` to record WHY in one line so \
+the next agent (or you, in three months) can recover your reasoning."
+    };
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
@@ -108,420 +122,228 @@ fn initialize_result() -> Value {
             "name": "brick",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Brick gives any agent a shared work surface across tools: \
-    memory, planning, and coordination. \
-    MEMORY — search for an open question or to find past work by topic, log_file before \
-    editing a file to see who changed it and why, show_session to page through a \
-    session's transcript. \
-    PLANNING — at the start of a task call status (what am I working on) and \
-    mission_list (what's in flight); turn a request into a tracked goal with \
-    mission action='create'; as work moves, mission action='update' its \
-    status; log deliverables with artifact_add and back them with artifact_attach. \
-    COORDINATION — before a non-trivial edit call claim so other sessions hold \
-    off, and log_file surfaces any active claims on the file you ask about. \
-    A natural flow: status → mission_list → mission(create) → work → \
-    artifact_add → artifact_attach → claim."
+        "instructions": instructions
     })
 }
 
-fn tools_list_result() -> Value {
+/// The `explain` tool schema — the single read entry point.
+fn explain_tool() -> Value {
     json!({
-        "tools": [
-            {
-                "name": "log_file",
-                "description": "Recall who previously changed a file and why, across \
-    every coding tool on this machine. Returns a one-line summary plus per-session \
-    intent and change size. Call before editing a file.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Repo-relative or absolute file path."
-                        }
+        "name": "explain",
+        "description": "Explain WHY a piece of code looks the way it does, across \
+every AI tool that touched this repo. Your FIRST step when you locate existing \
+code and before you draw conclusions from the code alone — prefer it over grep \
+and `git log`, which are only a fallback when Brick has no record. Returns a \
+causal chain: who changed the anchor, WHEN, WHY (the rationale note that cannot \
+be read from the code), what was derived from / triggered by it, each step's \
+confidence (explicit > observed > inferred), a transcript pointer per step, and \
+a `live` field warning if another session is editing the same file right now. \
+This subsumes line-level blame (WHO) into the WHY answer. Anchor can be a \
+`path:line` (e.g. `crates/core/src/auth.rs:42`), an `artifact_*` id, a \
+`mission_*` id, or an event id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "anchor": {
+                    "type": "string",
+                    "description": "What to explain: `path:line`, an artifact id, a \
+mission id, or an event id."
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "How many causal hops to walk back (default 3, max 8)."
+                }
+            },
+            "required": ["anchor"]
+        }
+    })
+}
+
+/// The `link` tool schema — the single write entry point for causal edges.
+fn link_tool() -> Value {
+    json!({
+        "name": "link",
+        "description": "Record WHY you just made a change, so the next agent can \
+recover your reasoning with `explain`. Call this after a non-trivial edit. Two \
+forms: (1) a standalone rationale — just a `note` explaining the change (e.g. \
+'token refresh had a concurrency race; serialized it'); (2) a causal edge — set \
+`cause` to the anchor that prompted this change (a `path:line`, artifact, \
+mission, or event id) and pick a `relation`. The effect is the code you just \
+changed: give its `effect` anchor (`path:line`) or omit it to use your most \
+recent captured change.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "effect": {
+                    "type": "string",
+                    "description": "Anchor for the change you just made (`path:line`, \
+or an event id). Omit to bind to your most recently captured diff."
+                },
+                "cause": {
+                    "type": "string",
+                    "description": "Optional anchor that caused this change (`path:line`, \
+artifact, mission, or event id). Omit for a standalone rationale."
+                },
+                "relation": {
+                    "type": "string",
+                    "description": "How the effect relates to the cause. Use 'rationale' \
+for a standalone reason (no cause).",
+                    "enum": ["triggered_by", "derived_from", "supersedes", "responds_to", "rationale"]
+                },
+                "note": {
+                    "type": "string",
+                    "description": "One line: WHY. Required when there is no cause."
+                }
+            },
+            "required": []
+        }
+    })
+}
+
+fn tools_list_result(planning: bool) -> Value {
+    if planning {
+        return json!({ "tools": planning_tools() });
+    }
+    json!({ "tools": [ explain_tool(), link_tool() ] })
+}
+
+/// Planning tools, exposed only on the planning surface (a dedicated planning
+/// agent), never on the main coding-agent surface.
+fn planning_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "mission_list",
+            "description": "List missions (work items / goals) Brick is tracking, \
+newest first. Use to see what's in flight before starting work or to pick up an \
+unfinished task. Optionally filter by status or project.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: planned | active | blocked | completed | archived."
                     },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "blame",
-                "description": "Owner provenance for a file: returns the lines \
-    attributable to an AI agent in THIS machine's local session history (which \
-    agent / session / mission produced them), anchored to git commits and the \
-    append-only event log. This is deliberately NOT whole-file authorship — lines \
-    changed by others, edited by hand, or never captured are reported as a \
-    skipped count, not guessed. Use it to find which lines are AI-owned and by \
-    whom before changing them. Optionally restrict to a line range, or pass \
-    include_unattributed=true to get every line verbatim.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Repo-relative file path to blame."
-                        },
-                        "line_start": {
-                            "type": "integer",
-                            "description": "Optional 1-based first line to include."
-                        },
-                        "line_end": {
-                            "type": "integer",
-                            "description": "Optional 1-based last line to include."
-                        },
-                        "include_unattributed": {
-                            "type": "boolean",
-                            "description": "Return every line verbatim (including \
-    non-owned ones) instead of only AI-owned lines plus a skipped count. Default false."
-                        }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "log_line",
-                "description": "Full change history of a line range: every commit \
-    that touched lines [line_start, line_end] of a file (newest first), each \
-    tagged with the AI session that produced it when this machine's local history \
-    can attribute it. Unlike blame (which only resolves the single LAST \
-    commit per line), this lists ALL the sessions that ever changed this code. \
-    Commits not in local records (others' commits, hand edits, or \
-    squash/rebase-rewritten history) are listed with attributed=false, not \
-    guessed. Use it to trace how a specific block of code evolved across sessions.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Repo-relative file path."
-                        },
-                        "line_start": {
-                            "type": "integer",
-                            "description": "1-based first line of the range (required)."
-                        },
-                        "line_end": {
-                            "type": "integer",
-                            "description": "1-based last line of the range (required)."
-                        }
-                    },
-                    "required": ["path", "line_start", "line_end"]
-                }
-            },
-            {
-                "name": "search",
-                "description": "Free-text search over session metadata (title, \
-    intent, touched files, repo, branch) to find past sessions by topic. Returns \
-    matches newest-first, each with a transcript pointer.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Keywords to match against session metadata."
-                        }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "show_session",
-                "description": "Page through one session's full transcript chunks. \
-    Supports offset/limit pagination and per-field truncation so large tool outputs \
-    don't overflow context; set max_field_bytes to 0 to fetch one chunk untruncated.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "source": {
-                            "type": "string",
-                            "description": "Source id (e.g. claude_code, codex_app, cursor_ide, orgii)."
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "External session id from a search hit."
-                        },
-                        "offset": { "type": "integer", "description": "Chunk offset (default 0)." },
-                        "limit": { "type": "integer", "description": "Max chunks (default 50)." },
-                        "max_field_bytes": {
-                            "type": "integer",
-                            "description": "Truncate string values over this many bytes; 0 disables (default 2000)."
-                        }
-                    },
-                    "required": ["source", "session_id"]
-                }
-            },
-            {
-                "name": "sessions",
-                "description": "List AI coding sessions that appear to be running \
-    RIGHT NOW across every tool on this machine (Claude Code, Codex, Cursor, …). \
-    Each result includes its work scope (repo or working dir), the file(s) it \
-    recently touched, and what it is doing. Use this to coordinate with other \
-    in-flight sessions and avoid editing files someone else is actively changing.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "scope": {
-                            "type": "string",
-                            "description": "Optional path prefix; only sessions whose \
-    work scope is at or under this path are returned. Omit for all live sessions."
-                        }
-                    }
-                }
-            },
-            {
-                "name": "claim",
-                "description": "Post a heads-up on the cross-session bulletin board \
-    BEFORE you start editing: 'I'm changing X, hold off'. Other sessions calling \
-    log_file on a matching path will see your note and avoid clobbering your \
-    work. The claim auto-expires (default 4h) so you don't have to remember to \
-    clear it. Call this when you begin a non-trivial change to a file or area.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "scope": {
-                            "type": "string",
-                            "description": "File path or glob you are claiming, e.g. \
-    'crates/core/src/auth.rs' or 'crates/cli/src/**/*.rs'. A bare filename like \
-    'auth.rs' matches that file anywhere."
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "One line: what you're doing and any warning, \
-    e.g. 'refactoring token validation, please hold off ~1h'."
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "Your session id, so others can tell who to \
-    coordinate with and the claim clears when your session ends. Optional."
-                        },
-                        "source": {
-                            "type": "string",
-                            "description": "Your tool/app id (e.g. claude_code). Optional."
-                        },
-                        "ttl_minutes": {
-                            "type": "integer",
-                            "description": "Minutes until the claim auto-expires (default 240)."
-                        }
-                    },
-                    "required": ["scope", "message"]
-                }
-            },
-            {
-                "name": "claims",
-                "description": "List active bulletin-board claims (other sessions' \
-    'I'm working on X' notes). With `path`, only claims covering that path. Call \
-    before editing to check nobody has claimed the area you're about to touch.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Only show claims whose scope covers this path. \
-    Omit to list every active claim."
-                        }
-                    }
-                }
-            },
-            {
-                "name": "status",
-                "description": "Report your current work context: the active org, \
-    project, mission (work item), and session Brick has on record. Call this at the \
-    START of a task to know what you're working on and where new work should be \
-    filed. Pairs with mission_list to see what's in flight.",
-                "inputSchema": { "type": "object", "properties": {} }
-            },
-            {
-                "name": "mission_list",
-                "description": "List missions (work items / goals) Brick is tracking, \
-    newest first. Use this to see 'what is in flight' before starting work, to find \
-    an existing mission to attach output to, or to pick up an unfinished task. \
-    Optionally filter by status or project.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "status": {
-                            "type": "string",
-                            "description": "Filter by status: planned | active | blocked \
-    | completed | archived. Omit for all."
-                        },
-                        "project": {
-                            "type": "string",
-                            "description": "Filter to one project id. Omit for all projects."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Max missions to return (default 50)."
-                        }
-                    }
-                }
-            },
-            {
-                "name": "show_mission",
-                "description": "Show one mission in detail: status, description, and the \
-    sessions and artifacts linked to it. Use to inspect a work item before updating \
-    it or recording output against it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "mission": {
-                            "type": "string",
-                            "description": "The mission id to show (e.g. msn-…)."
-                        }
-                    },
-                    "required": ["mission"]
-                }
-            },
-            {
-                "name": "mission",
-                "description": "Create or update a mission (work item / goal) — Brick's \
-    planning primitive. action='create' opens a new work item under a project; \
-    action='update' changes its title/description/status as work progresses \
-    (planned→active→blocked→completed). Use this to turn a user request into a \
-    tracked goal, then record artifacts and evidence against it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "description": "'create' a new mission or 'update' an existing one.",
-                            "enum": ["create", "update"]
-                        },
-                        "mission": {
-                            "type": "string",
-                            "description": "Mission id — REQUIRED for action='update'."
-                        },
-                        "project": {
-                            "type": "string",
-                            "description": "Project id this mission belongs to — REQUIRED \
-    for action='create'. For update, moves the mission to another project."
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Short imperative goal title, e.g. 'Add OAuth \
-    login'. Required for create."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional longer description / acceptance notes."
-                        },
-                        "status": {
-                            "type": "string",
-                            "description": "planned | active | blocked | completed | \
-    archived. Defaults to 'planned' on create.",
-                            "enum": ["planned", "active", "blocked", "completed", "archived"]
-                        },
-                        "session_id": { "type": "string", "description": "Your session id (optional)." },
-                        "source": { "type": "string", "description": "Your tool/app id (optional)." }
-                    },
-                    "required": ["action"]
-                }
-            },
-            {
-                "name": "artifact_add",
-                "description": "Record a deliverable you produced (a PR, a design doc, a \
-    decision, a test result) and link it to a mission. This closes the planning \
-    loop: a mission states the goal, an artifact is the proof of work. Call after \
-    finishing a meaningful piece of work.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "title": {
-                            "type": "string",
-                            "description": "What the artifact is, e.g. 'PR #42: OAuth login'."
-                        },
-                        "kind": {
-                            "type": "string",
-                            "description": "decision | file_ref | patch | review | \
-    test_result | acceptance | note. Defaults to 'note'.",
-                            "enum": ["decision", "file_ref", "patch", "review", "test_result", "acceptance", "note"]
-                        },
-                        "body": {
-                            "type": "string",
-                            "description": "Optional details / link / summary."
-                        },
-                        "mission": {
-                            "type": "string",
-                            "description": "Mission id to link this artifact to (optional \
-    but recommended so the work item shows its outputs)."
-                        },
-                        "session_id": { "type": "string", "description": "Your session id (optional)." },
-                        "source": { "type": "string", "description": "Your tool/app id (optional)." }
-                    },
-                    "required": ["title"]
-                }
-            },
-            {
-                "name": "artifact_attach",
-                "description": "Attach a file-path piece of evidence to an artifact — the \
-    concrete file(s) that back up a deliverable, forming an auditable trail. Call \
-    after artifact_add to point at the files the work touched.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "artifact": {
-                            "type": "string",
-                            "description": "Artifact id the evidence belongs to (from artifact_add)."
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "File path the artifact represents or touched."
-                        },
-                        "session_id": { "type": "string", "description": "Your session id (optional)." },
-                        "source": { "type": "string", "description": "Your tool/app id (optional)." }
-                    },
-                    "required": ["artifact", "path"]
+                    "project": { "type": "string", "description": "Filter to one project id." },
+                    "limit": { "type": "integer", "description": "Max missions (default 50)." }
                 }
             }
-        ]
-    })
+        }),
+        json!({
+            "name": "show_mission",
+            "description": "Show one mission in detail: status, description, and the \
+sessions and artifacts linked to it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mission": { "type": "string", "description": "The mission id to show." }
+                },
+                "required": ["mission"]
+            }
+        }),
+        json!({
+            "name": "mission",
+            "description": "Create or update a mission (work item / goal). \
+action='create' opens a new work item under a project; action='update' changes \
+its title/description/status as work progresses.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "'create' a new mission or 'update' an existing one.",
+                        "enum": ["create", "update"]
+                    },
+                    "mission": { "type": "string", "description": "Mission id — REQUIRED for update." },
+                    "project": {
+                        "type": "string",
+                        "description": "Project id — REQUIRED for create."
+                    },
+                    "title": { "type": "string", "description": "Short imperative goal title. Required for create." },
+                    "description": { "type": "string", "description": "Optional longer description." },
+                    "status": {
+                        "type": "string",
+                        "description": "planned | active | blocked | completed | archived.",
+                        "enum": ["planned", "active", "blocked", "completed", "archived"]
+                    },
+                    "session_id": { "type": "string", "description": "Your session id (optional)." },
+                    "source": { "type": "string", "description": "Your tool/app id (optional)." }
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "artifact_add",
+            "description": "Record a deliverable (a PR, design doc, decision, test \
+result) and link it to a mission. Call after finishing a meaningful piece of work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "What the artifact is." },
+                    "kind": {
+                        "type": "string",
+                        "description": "decision | file_ref | patch | review | test_result | acceptance | note.",
+                        "enum": ["decision", "file_ref", "patch", "review", "test_result", "acceptance", "note"]
+                    },
+                    "body": { "type": "string", "description": "Optional details / link / summary." },
+                    "mission": { "type": "string", "description": "Mission id to link this artifact to." },
+                    "session_id": { "type": "string", "description": "Your session id (optional)." },
+                    "source": { "type": "string", "description": "Your tool/app id (optional)." }
+                },
+                "required": ["title"]
+            }
+        }),
+        json!({
+            "name": "artifact_attach",
+            "description": "Attach a file-path piece of evidence to an artifact — the \
+concrete file(s) backing a deliverable. Call after artifact_add.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "artifact": { "type": "string", "description": "Artifact id (from artifact_add)." },
+                    "path": { "type": "string", "description": "File path the artifact touched." },
+                    "session_id": { "type": "string", "description": "Your session id (optional)." },
+                    "source": { "type": "string", "description": "Your tool/app id (optional)." }
+                },
+                "required": ["artifact", "path"]
+            }
+        }),
+    ]
 }
 
-/// Tools that require a Brick account (soft login gate). Line-level blame and
-/// planning/artifact tools are gated; file-level recall and live-awareness are
-/// free. Defined unconditionally so the tool set is identical across builds —
-/// only the *enforcement* (`login_required_error`) is feature-gated.
-fn tool_requires_login(name: &str) -> bool {
-    matches!(
-        name,
-        "blame" | "log_line" | "mission" | "artifact_add" | "artifact_attach"
-    )
+/// Tools retired from the MCP surface and folded elsewhere. A `tools/call` for
+/// one of these returns an actionable error pointing at the replacement, rather
+/// than a bare "unknown tool", so agents with the old names baked into memory
+/// files / MCP configs get a clear migration message for one transition cycle.
+fn retired_tool_hint(name: &str) -> Option<&'static str> {
+    let hint = match name {
+        // Memory/query tools — folded into `explain` (which returns WHO + WHY).
+        "log_file" | "recall_file" | "blame" | "blame_file" | "log_line" | "blame_history"
+        | "search" | "explore_memory" | "search_sessions" | "show_session" | "read_session" => {
+            "retired: use `explain` with a `path:line`, artifact, mission, or event \
+anchor — it returns who changed it, why, and a transcript pointer."
+        }
+        // Coordination tools — folded into `explain`'s `live` field.
+        "sessions" | "live_sessions" | "claim" | "announce_work" | "claims"
+        | "list_announcements" | "status" | "current_context" => {
+            "retired: live coordination is now the `live` field of an `explain` \
+response; there is no separate coordination tool."
+        }
+        // Planning tools — moved to the planning surface (`brick mcp-serve
+        // --planning`), used by a dedicated planning agent, not the main agent.
+        "mission" | "manage_mission" | "mission_list" | "list_missions" | "show_mission"
+        | "artifact_add" | "record_artifact" | "artifact_attach" | "attach_evidence" => {
+            "moved: planning tools live on the planning surface (a dedicated \
+planning agent via `brick mcp-serve --planning`), not the main coding surface."
+        }
+        _ => return None,
+    };
+    Some(hint)
 }
 
-/// Returns a structured `login_required` error payload when a gated tool is
-/// called without a valid login, or `None` to allow the call.
-///
-/// In the proprietary `sync` build this consults `brick_sync::identity`. In the
-/// open-source build there is no login concept, so it always allows (returns
-/// `None`) — the gate is a no-op and the tool runs unguarded.
-#[cfg(feature = "sync")]
-fn login_required_error(name: &str) -> Option<Value> {
-    if brick_sync::is_logged_in() {
-        return None;
-    }
-    Some(json!({
-        "error": "login_required",
-        "tool": name,
-        "hint": "This tool needs a Brick account. Run `brick login` first.",
-    }))
-}
-
-#[cfg(not(feature = "sync"))]
-fn login_required_error(_name: &str) -> Option<Value> {
-    None
-}
-
-/// Maps a retired tool name onto its current Git-aligned name. Unknown names
-/// pass through unchanged. Kept for one transition cycle so agents with the old
-/// names baked into memory files / MCP configs keep working.
-fn canonical_tool_name(name: &str) -> &str {
+/// Maps a retired planning tool name onto its current name for the planning
+/// surface. Unknown names pass through unchanged.
+fn canonical_planning_name(name: &str) -> &str {
     match name {
-        "recall_file" => "log_file",
-        "blame_file" => "blame",
-        "blame_history" => "log_line",
-        "explore_memory" | "search_sessions" => "search",
-        "read_session" => "show_session",
-        "live_sessions" => "sessions",
-        "current_context" => "status",
-        "announce_work" => "claim",
-        "list_announcements" => "claims",
         "list_missions" => "mission_list",
         "manage_mission" => "mission",
         "record_artifact" => "artifact_add",
@@ -533,6 +355,7 @@ fn canonical_tool_name(name: &str) -> &str {
 fn handle_tool_call(
     profiles: &SourceProfileStore,
     store: &LocalStore,
+    planning: bool,
     request: &Value,
 ) -> Result<Value> {
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -540,398 +363,26 @@ fn handle_tool_call(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
-    // Old tool names are accepted for one transition cycle and mapped onto the
-    // current Git-aligned names so already-installed agent memory / MCP configs
-    // keep working. Everything below operates on the canonical (new) name.
-    let name = canonical_tool_name(raw_name);
     let args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Soft login gate: line-level blame and planning tools require a Brick
-    // account. Free tools (file-level recall + live-awareness) are never gated.
-    // The gate is only compiled into the proprietary `sync` build; the
-    // open-source binary has no login concept and never blocks. See
-    // `brick_sync::identity` for why this is a registration hook, not a security
-    // boundary. The denial flows through the same content wrapper below so the
-    // client still receives a well-formed tool result.
-    let gate_denial = if tool_requires_login(name) {
-        login_required_error(name)
+    let payload = if planning {
+        dispatch_planning(store, canonical_planning_name(raw_name), &args)?
     } else {
-        None
-    };
-    let payload = if let Some(denial) = gate_denial {
-        denial
-    } else {
-        match name {
-            "search" => {
-                let query = args
-                    .get("query")
-                    .or_else(|| args.get("question"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("missing required string argument: query"))?
-                    .to_string();
-                let response =
-                    build_query_response(profiles, &query, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-                serde_json::to_value(response)?
-            }
-            "log_file" => {
-                let path = str_arg(&args, "path")?;
-                let recall =
-                    build_recall_response(store, profiles, &path, DEFAULT_SOURCE, DEFAULT_LIMIT)?;
-                let mut value = serde_json::to_value(recall)?;
-                // MCP-ONLY enrichment (not produced by the CLI `metadata recall`):
-                // the MCP surface adds real-time coordination signals on top of the
-                // shared recall payload. Tiered live-awareness — if another running
-                // session collides with this file or its work scope, attach a
-                // broadcast so the agent can avoid a cross-session edit conflict.
-                // Silent when there is no overlap. This asymmetry is deliberate: it
-                // is a coordination capability that only makes sense for a live agent,
-                // so it lives on the MCP path, not in the CLI's batch output.
-                if let Ok(all_profiles) = profiles.list_profiles() {
-                    if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
-                        if let Value::Object(map) = &mut value {
-                            map.insert(
-                                "live_broadcast".to_string(),
-                                serde_json::to_value(broadcast)?,
-                            );
-                        }
-                    }
-                }
-                // Bulletin-board claims: another session may have explicitly asked
-                // others to hold off this file/area. Surface those notes directly,
-                // dropping any whose owning session has already ended.
-                if let Ok(announce_store) = AnnouncementStore::open_global() {
-                    let validity = build_claim_validity(profiles);
-                    if let Ok(claims) = announce_store.matching_live(&path, validity) {
-                        if !claims.is_empty() {
-                            if let Value::Object(map) = &mut value {
-                                map.insert(
-                                    "active_claims".to_string(),
-                                    json!({
-                                        "count": claims.len(),
-                                        "message": "Another session posted a heads-up covering \
-                                    this path. Review before editing.",
-                                        "claims": claims,
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-                value
-            }
-            "blame" => {
-                let path = str_arg(&args, "path")?;
-                let line_start = usize_arg(&args, "line_start");
-                let line_end = usize_arg(&args, "line_end");
-                let include_unattributed = args
-                    .get("include_unattributed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                blame_response(store, &path, line_start, line_end, include_unattributed)?
-            }
-            "log_line" => {
-                let path = str_arg(&args, "path")?;
-                let line_start = usize_arg(&args, "line_start")
-                    .ok_or_else(|| anyhow::anyhow!("log_line requires line_start"))?;
-                let line_end = usize_arg(&args, "line_end")
-                    .ok_or_else(|| anyhow::anyhow!("log_line requires line_end"))?;
-                blame_history_response(store, &path, line_start as u64, line_end as u64)?
-            }
-            "show_session" => {
-                let source = str_arg(&args, "source")?;
-                let session_id = str_arg(&args, "session_id")?;
-                let offset = usize_arg(&args, "offset").unwrap_or(0);
-                let limit = usize_arg(&args, "limit").unwrap_or(50);
-                let max_field_bytes =
-                    usize_arg(&args, "max_field_bytes").unwrap_or(DEFAULT_MAX_FIELD_BYTES);
-                let profile = read_profile(profiles, &source)?;
-                let response = build_chunks_response(
-                    &profile,
-                    &source,
-                    &session_id,
-                    limit,
-                    offset,
-                    max_field_bytes,
-                )?;
-                serde_json::to_value(response)?
-            }
-            "sessions" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let all_profiles = profiles.list_profiles()?;
-                let live = collect_live_sessions(&all_profiles, 0, 50);
-                let rows: Vec<Value> = live
-                    .iter()
-                    .filter(|session| match scope {
-                        Some(prefix) => brick_core::work_scope(session)
-                            .map(|path| path.starts_with(prefix))
-                            .unwrap_or(false),
-                        None => true,
-                    })
-                    .map(|session| serde_json::to_value(live_session_row(session)))
-                    .collect::<std::result::Result<_, _>>()?;
-                json!({
-                    "count": rows.len(),
-                    "sessions": rows,
-                    "note": "These sessions appear to be running now. Avoid editing files \
-                they recently touched; call show_session to see what one is doing."
-                })
-            }
-            "claim" => {
-                let scope = str_arg(&args, "scope")?;
-                let message = str_arg(&args, "message")?;
-                let session_id = args
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("mcp-session")
-                    .to_string();
-                let source_id = args
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("mcp")
-                    .to_string();
-                let ttl = usize_arg(&args, "ttl_minutes")
-                    .map(|minutes| Duration::minutes(minutes as i64));
-                let work_dir = std::env::current_dir()
-                    .ok()
-                    .map(|path| path.display().to_string());
-                let announce_store = AnnouncementStore::open_global()?;
-                let announcement = announce_store.publish(NewAnnouncement {
-                    source_id,
-                    session_id,
-                    scope,
-                    message,
-                    work_dir,
-                    ttl,
-                })?;
-                json!({
-                    "published": announcement,
-                    "note": "Heads-up posted. Other sessions calling log_file on a \
-                matching path will see it. It auto-expires; no need to clear it manually."
-                })
-            }
-            "claims" => {
-                let announce_store = AnnouncementStore::open_global()?;
-                let validity = build_claim_validity(profiles);
-                let claims = match args.get("path").and_then(Value::as_str) {
-                    Some(path) if !path.is_empty() => {
-                        announce_store.matching_live(path, validity)?
-                    }
-                    _ => announce_store.list_live(validity)?,
-                };
-                json!({ "count": claims.len(), "announcements": claims })
-            }
-            "status" => {
-                // Load-or-rebuild: the staleness check rebuilds only when the queue
-                // grew since the cache was written (e.g. events just appended by
-                // other MCP calls), so back-to-back reads in one flow don't each pay
-                // a full rebuild + disk rewrite.
-                let index = store.load_or_rebuild_index()?;
-                let context = store.read_current_context().ok().flatten();
-                let current_mission = context
-                    .as_ref()
-                    .and_then(|ctx| ctx.mission_id.as_ref())
-                    .and_then(|id| index.missions.get(id.as_str()));
-                json!({
-                    "current": context,
-                    "current_mission": current_mission,
-                    "counts": {
-                        "orgs": index.orgs.len(),
-                        "projects": index.projects.len(),
-                        "missions": index.missions.len(),
-                        "sessions": index.sessions.len(),
-                        "artifacts": index.artifacts.len(),
-                    },
-                    "note": "Use mission_list to see in-flight work, mission to \
-                open or update a goal, and artifact_add to log deliverables."
-                })
-            }
-            "mission_list" => {
-                let index = store.load_or_rebuild_index()?;
-                let status_filter = args
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(|raw| raw.trim().to_lowercase());
-                let project_filter = args
-                    .get("project")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty());
-                let limit = usize_arg(&args, "limit").unwrap_or(50);
-                let mut missions: Vec<_> = index
-                    .missions
-                    .values()
-                    .filter(|mission| match &status_filter {
-                        Some(status) => mission_status_str(mission.status) == status,
-                        None => true,
-                    })
-                    .filter(|mission| match project_filter {
-                        Some(project) => mission.project_id.as_deref() == Some(project),
-                        None => true,
-                    })
-                    .collect();
-                // Newest activity first so "what's in flight" surfaces at the top.
-                missions.sort_by_key(|mission| std::cmp::Reverse(mission.last_event_at));
-                missions.truncate(limit);
-                json!({ "count": missions.len(), "missions": missions })
-            }
-            "show_mission" => {
-                let mission = str_arg(&args, "mission")?;
-                let index = store.load_or_rebuild_index()?;
-                let item = index
-                    .missions
-                    .get(&mission)
-                    .ok_or_else(|| anyhow::anyhow!("mission not found: {mission}"))?;
-                serde_json::to_value(item)?
-            }
-            "mission" => {
-                let action = str_arg(&args, "action")?;
-                let actor = mcp_actor(&args);
-                match action.as_str() {
-                    "create" => {
-                        let project = str_arg(&args, "project")?;
-                        let title = str_arg(&args, "title")?;
-                        let project_id = ProjectId::from_str(&project)
-                            .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?;
-                        let mission_id = MissionId::new();
-                        let event = TraceEvent::mission_created(
-                            actor,
-                            mission_id.clone(),
-                            MissionCreatedPayload {
-                                project_id,
-                                title,
-                                description: opt_str_arg(&args, "description"),
-                                status: mission_status_from_str(
-                                    args.get("status").and_then(Value::as_str),
-                                )?,
-                                repo_context_id: None,
-                            },
-                        )?;
-                        store.append_event(&event)?;
-                        json!({
-                            "created": true,
-                            "mission_id": mission_id.to_string(),
-                            "note": "Mission opened. Record deliverables against it with \
-                        artifact_add, and update its status with mission action='update'."
-                        })
-                    }
-                    "update" => {
-                        let mission = str_arg(&args, "mission")?;
-                        let mission_id = MissionId::from_str(&mission)
-                            .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?;
-                        let project_id = match args.get("project").and_then(Value::as_str) {
-                            Some(project) if !project.is_empty() => Some(
-                                ProjectId::from_str(project)
-                                    .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?,
-                            ),
-                            _ => None,
-                        };
-                        let title = opt_str_arg(&args, "title");
-                        let description = opt_str_arg(&args, "description");
-                        let status = match args.get("status").and_then(Value::as_str) {
-                            Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
-                            _ => None,
-                        };
-                        if project_id.is_none()
-                            && title.is_none()
-                            && description.is_none()
-                            && status.is_none()
-                        {
-                            return Err(anyhow::anyhow!(
-                            "mission update needs at least one of project, title, description, or status"
-                        ));
-                        }
-                        let event = TraceEvent::mission_updated(
-                            actor,
-                            mission_id.clone(),
-                            MissionUpdatedPayload {
-                                project_id,
-                                title,
-                                description,
-                                status,
-                                repo_context_id: None,
-                            },
-                        )?;
-                        store.append_event(&event)?;
-                        json!({ "updated": true, "mission_id": mission_id.to_string() })
-                    }
-                    other => {
-                        return Err(anyhow::anyhow!(
-                        "unknown mission action: {other} (expected 'create' or 'update')"
-                    ))
-                    }
+        match raw_name {
+            "explain" => explain_tool_call(profiles, store, &args)?,
+            "link" => link_tool_call(store, &args)?,
+            other => {
+                // A retired name gets an actionable migration hint; a truly
+                // unknown name gets the generic error.
+                if let Some(hint) = retired_tool_hint(other) {
+                    json!({ "error": "tool_retired", "tool": other, "hint": hint })
+                } else {
+                    return Err(anyhow::anyhow!("unknown tool: {other}"));
                 }
             }
-            "artifact_add" => {
-                let title = str_arg(&args, "title")?;
-                let actor = mcp_actor(&args);
-                let mission_id = match args.get("mission").and_then(Value::as_str) {
-                    Some(mission) if !mission.is_empty() => Some(
-                        MissionId::from_str(mission)
-                            .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?,
-                    ),
-                    _ => None,
-                };
-                let session_id = match args.get("session_id").and_then(Value::as_str) {
-                    Some(session) if !session.is_empty() => Some(
-                        SessionId::from_str(session)
-                            .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
-                    ),
-                    _ => None,
-                };
-                let artifact_id = ArtifactId::new();
-                let event = TraceEvent::artifact_created(
-                    actor,
-                    artifact_id.clone(),
-                    mission_id,
-                    session_id,
-                    ArtifactCreatedPayload {
-                        artifact_kind: artifact_kind_from_str(
-                            args.get("kind").and_then(Value::as_str),
-                        ),
-                        title,
-                        body: opt_str_arg(&args, "body"),
-                        repo_context_id: None,
-                    },
-                )?;
-                store.append_event(&event)?;
-                json!({
-                    "recorded": true,
-                    "artifact_id": artifact_id.to_string(),
-                    "note": "Deliverable logged. Attach the backing files with artifact_attach."
-                })
-            }
-            "artifact_attach" => {
-                let artifact = str_arg(&args, "artifact")?;
-                let path = str_arg(&args, "path")?;
-                let actor = mcp_actor(&args);
-                let artifact_id = ArtifactId::from_str(&artifact)
-                    .map_err(|err| anyhow::anyhow!("invalid artifact id: {err}"))?;
-                let session_id = match args.get("session_id").and_then(Value::as_str) {
-                    Some(session) if !session.is_empty() => Some(
-                        SessionId::from_str(session)
-                            .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
-                    ),
-                    _ => None,
-                };
-                let event = TraceEvent::artifact_file_ref_recorded(
-                    actor,
-                    artifact_id.clone(),
-                    session_id,
-                    ArtifactFileRefRecordedPayload {
-                        file_ref_id: FileRefId::new(),
-                        path,
-                        repo_context_id: None,
-                    },
-                )?;
-                store.append_event(&event)?;
-                json!({ "attached": true, "artifact_id": artifact_id.to_string() })
-            }
-            other => return Err(anyhow::anyhow!("unknown tool: {other}")),
         }
     };
 
@@ -942,6 +393,306 @@ fn handle_tool_call(
             { "type": "text", "text": serde_json::to_string_pretty(&payload)? }
         ]
     }))
+}
+
+/// `explain` dispatch: resolve the anchor (file:line via blame, or a direct id),
+/// walk the causal graph, then enrich with transcript pointers and the `live`
+/// coordination field.
+fn explain_tool_call(
+    profiles: &SourceProfileStore,
+    store: &LocalStore,
+    args: &Value,
+) -> Result<Value> {
+    let anchor_input = str_arg(args, "anchor")?;
+    let depth = usize_arg(args, "depth").unwrap_or(DEFAULT_EXPLAIN_DEPTH);
+
+    let events = store.read_all_events()?;
+    let index = store.load_or_rebuild_index()?;
+
+    // file:line anchors need git + the working tree; direct ids do not.
+    let (anchor, anchored_path) = if let Some((path, line)) = parse_file_line(&anchor_input) {
+        let cwd = std::env::current_dir()?;
+        let repo_root = discover_repo_root(&cwd)?;
+        let rel_path = normalize_repo_relative(&repo_root, &path);
+        let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
+        (anchor, Some(rel_path))
+    } else {
+        (resolve_direct_anchor(&events, &anchor_input), None)
+    };
+
+    let mut chain = explain_from_events(&index, &events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
+    enrich_transcripts(profiles, &mut chain);
+
+    let mut value = serde_json::to_value(&chain)?;
+    // `live` field: if another running session is touching the anchored file
+    // right now, surface it so the agent avoids a cross-session edit conflict.
+    // This is what replaced the standalone `sessions`/`claims` coordination tools.
+    if let Some(path) = anchored_path {
+        if let Ok(all_profiles) = profiles.list_profiles() {
+            if let Some(broadcast) = build_live_broadcast(&all_profiles, &path, None) {
+                if let Value::Object(map) = &mut value {
+                    map.insert("live".to_string(), serde_json::to_value(broadcast)?);
+                }
+            }
+        }
+        if let Ok(announce_store) = AnnouncementStore::open_global() {
+            if let Ok(claims) = announce_store.matching(&path) {
+                if !claims.is_empty() {
+                    if let Value::Object(map) = &mut value {
+                        map.insert("active_claims".to_string(), serde_json::to_value(claims)?);
+                    }
+                }
+            }
+        }
+    }
+
+    if chain_is_empty(&chain) {
+        if let Value::Object(map) = &mut value {
+            map.insert(
+                "note".to_string(),
+                json!("No Brick record for this anchor yet. Brick only records causal \
+edges for changes made while it was installed; fall back to git/grep here. As \
+more changes flow through Brick, explain gets richer."),
+            );
+        }
+    }
+
+    Ok(value)
+}
+
+/// `link` dispatch: write a `causal.linked` event. Supports a standalone
+/// rationale (note only) or a cross-event edge (cause anchor + relation).
+fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
+    let events = store.read_all_events()?;
+
+    let effect_event = match opt_str_arg(args, "effect") {
+        Some(anchor) => resolve_anchor_to_event(store, &events, &anchor)?
+            .ok_or_else(|| anyhow::anyhow!("could not resolve effect anchor: {anchor}"))?,
+        // No explicit effect: bind to the most recent captured diff event.
+        None => latest_diff_event(&events)
+            .ok_or_else(|| anyhow::anyhow!("no effect given and no recent diff to bind to"))?,
+    };
+
+    let cause_anchor = opt_str_arg(args, "cause");
+    let cause_events = match &cause_anchor {
+        Some(anchor) => resolve_anchor_to_event(store, &events, anchor)?
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let note = opt_str_arg(args, "note");
+    let relation = parse_relation(args.get("relation").and_then(Value::as_str), &cause_events)?;
+
+    // Invariant mirror: a standalone edge needs a note.
+    if cause_events.is_empty() && note.is_none() {
+        return Err(anyhow::anyhow!(
+            "link needs either a cause anchor or a note explaining the change"
+        ));
+    }
+
+    // Confidence is `explicit` — the agent asserted this edge directly.
+    let event = TraceEvent::causal_linked(
+        mcp_actor(args),
+        ConfidenceLevel::Explicit,
+        CausalLinkedPayload {
+            effect_event,
+            cause_events: cause_events.clone(),
+            relation,
+            note: note.clone(),
+            repo_context_id: None,
+        },
+    )
+    .map_err(|err| anyhow::anyhow!("invalid causal edge: {err}"))?;
+    store.append_event(&event)?;
+
+    Ok(json!({
+        "linked": true,
+        "effect_event": effect_event.to_string(),
+        "cause_events": cause_events.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "relation": relation_wire(relation),
+        "note": note,
+        "note_hint": "Recorded. The next agent can recover this with `explain`."
+    }))
+}
+
+/// Planning-surface dispatch (mission / artifact tools).
+fn dispatch_planning(store: &LocalStore, name: &str, args: &Value) -> Result<Value> {
+    let payload = match name {
+        "mission_list" => {
+            let index = store.load_or_rebuild_index()?;
+            let status_filter = args
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|raw| raw.trim().to_lowercase());
+            let project_filter = args
+                .get("project")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let limit = usize_arg(args, "limit").unwrap_or(50);
+            let mut missions: Vec<_> = index
+                .missions
+                .values()
+                .filter(|mission| match &status_filter {
+                    Some(status) => mission_status_str(mission.status) == status,
+                    None => true,
+                })
+                .filter(|mission| match project_filter {
+                    Some(project) => mission.project_id.as_deref() == Some(project),
+                    None => true,
+                })
+                .collect();
+            missions.sort_by_key(|mission| std::cmp::Reverse(mission.last_event_at));
+            missions.truncate(limit);
+            json!({ "count": missions.len(), "missions": missions })
+        }
+        "show_mission" => {
+            let mission = str_arg(args, "mission")?;
+            let index = store.load_or_rebuild_index()?;
+            let item = index
+                .missions
+                .get(&mission)
+                .ok_or_else(|| anyhow::anyhow!("mission not found: {mission}"))?;
+            serde_json::to_value(item)?
+        }
+        "mission" => dispatch_mission(store, args)?,
+        "artifact_add" => {
+            let title = str_arg(args, "title")?;
+            let actor = mcp_actor(args);
+            let mission_id = match args.get("mission").and_then(Value::as_str) {
+                Some(mission) if !mission.is_empty() => Some(
+                    MissionId::from_str(mission)
+                        .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let session_id = match args.get("session_id").and_then(Value::as_str) {
+                Some(session) if !session.is_empty() => Some(
+                    SessionId::from_str(session)
+                        .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let artifact_id = ArtifactId::new();
+            let event = TraceEvent::artifact_created(
+                actor,
+                artifact_id.clone(),
+                mission_id,
+                session_id,
+                ArtifactCreatedPayload {
+                    artifact_kind: artifact_kind_from_str(args.get("kind").and_then(Value::as_str)),
+                    title,
+                    body: opt_str_arg(args, "body"),
+                    repo_context_id: None,
+                },
+            )?;
+            store.append_event(&event)?;
+            json!({
+                "recorded": true,
+                "artifact_id": artifact_id.to_string(),
+                "note": "Deliverable logged. Attach the backing files with artifact_attach."
+            })
+        }
+        "artifact_attach" => {
+            let artifact = str_arg(args, "artifact")?;
+            let path = str_arg(args, "path")?;
+            let actor = mcp_actor(args);
+            let artifact_id = ArtifactId::from_str(&artifact)
+                .map_err(|err| anyhow::anyhow!("invalid artifact id: {err}"))?;
+            let session_id = match args.get("session_id").and_then(Value::as_str) {
+                Some(session) if !session.is_empty() => Some(
+                    SessionId::from_str(session)
+                        .map_err(|err| anyhow::anyhow!("invalid session id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let event = TraceEvent::artifact_file_ref_recorded(
+                actor,
+                artifact_id.clone(),
+                session_id,
+                ArtifactFileRefRecordedPayload {
+                    file_ref_id: FileRefId::new(),
+                    path,
+                    repo_context_id: None,
+                },
+            )?;
+            store.append_event(&event)?;
+            json!({ "attached": true, "artifact_id": artifact_id.to_string() })
+        }
+        other => return Err(anyhow::anyhow!("unknown planning tool: {other}")),
+    };
+    Ok(payload)
+}
+
+fn dispatch_mission(store: &LocalStore, args: &Value) -> Result<Value> {
+    let action = str_arg(args, "action")?;
+    let actor = mcp_actor(args);
+    match action.as_str() {
+        "create" => {
+            let project = str_arg(args, "project")?;
+            let title = str_arg(args, "title")?;
+            let project_id = ProjectId::from_str(&project)
+                .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?;
+            let mission_id = MissionId::new();
+            let event = TraceEvent::mission_created(
+                actor,
+                mission_id.clone(),
+                MissionCreatedPayload {
+                    project_id,
+                    title,
+                    description: opt_str_arg(args, "description"),
+                    status: mission_status_from_str(args.get("status").and_then(Value::as_str))?,
+                    repo_context_id: None,
+                },
+            )?;
+            store.append_event(&event)?;
+            Ok(json!({
+                "created": true,
+                "mission_id": mission_id.to_string(),
+                "note": "Mission opened. Record deliverables with artifact_add, and \
+update its status with mission action='update'."
+            }))
+        }
+        "update" => {
+            let mission = str_arg(args, "mission")?;
+            let mission_id = MissionId::from_str(&mission)
+                .map_err(|err| anyhow::anyhow!("invalid mission id: {err}"))?;
+            let project_id = match args.get("project").and_then(Value::as_str) {
+                Some(project) if !project.is_empty() => Some(
+                    ProjectId::from_str(project)
+                        .map_err(|err| anyhow::anyhow!("invalid project id: {err}"))?,
+                ),
+                _ => None,
+            };
+            let title = opt_str_arg(args, "title");
+            let description = opt_str_arg(args, "description");
+            let status = match args.get("status").and_then(Value::as_str) {
+                Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
+                _ => None,
+            };
+            if project_id.is_none() && title.is_none() && description.is_none() && status.is_none() {
+                return Err(anyhow::anyhow!(
+                    "mission update needs at least one of project, title, description, or status"
+                ));
+            }
+            let event = TraceEvent::mission_updated(
+                actor,
+                mission_id.clone(),
+                MissionUpdatedPayload {
+                    project_id,
+                    title,
+                    description,
+                    status,
+                    repo_context_id: None,
+                },
+            )?;
+            store.append_event(&event)?;
+            Ok(json!({ "updated": true, "mission_id": mission_id.to_string() }))
+        }
+        other => Err(anyhow::anyhow!(
+            "unknown mission action: {other} (expected 'create' or 'update')"
+        )),
+    }
 }
 
 /// Returns a required non-empty string argument, or an error.
@@ -959,96 +710,108 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
         .map(|value| value as usize)
 }
 
-/// Builds the `blame_file` tool response as **owner provenance**: the lines this
-/// machine's local AI session history can attribute to an agent, plus a count of
-/// the lines it deliberately does not claim. By default only attributed (owner)
-/// lines are returned; the rest collapse into `skipped_lines` so the agent gets a
-/// precise, honest answer instead of a wall of `unattributed` noise. Pass
-/// `include_unattributed=true` to get every line verbatim (debugging). Resolves
-/// the repo root from the current working directory (where `brick mcp-serve` ran).
-fn blame_response(
-    store: &LocalStore,
-    path: &str,
-    line_start: Option<usize>,
-    line_end: Option<usize>,
-    include_unattributed: bool,
-) -> Result<Value> {
-    let cwd = std::env::current_dir()?;
-    let repo_root = discover_repo_root(&cwd)?;
-    let rel_path = normalize_repo_relative(&repo_root, path);
-    let mut lines = blame_file(store, &repo_root, &rel_path)?;
-    if let Some(start) = line_start {
-        lines.retain(|line| line.line_no as usize >= start);
+/// Parses a `path:line` anchor into `(path, line)`. Returns `None` when the input
+/// is not of that shape (e.g. it's a bare id) — note a Windows-style `C:\...` has
+/// no trailing integer, so it won't false-match.
+fn parse_file_line(input: &str) -> Option<(String, u64)> {
+    let (path, line) = input.rsplit_once(':')?;
+    let line: u64 = line.trim().parse().ok()?;
+    if path.is_empty() {
+        return None;
     }
-    if let Some(end) = line_end {
-        lines.retain(|line| line.line_no as usize <= end);
-    }
-    let total = lines.len();
-    let is_owned =
-        |line: &brick_core::BlameLine| line.session_id.is_some() || line.actor_id.is_some();
-    let attributed = lines.iter().filter(|line| is_owned(line)).count();
-    let skipped = total - attributed;
-
-    if include_unattributed {
-        return Ok(json!({
-            "path": rel_path,
-            "mode": "full",
-            "line_count": total,
-            "owner_lines": attributed,
-            "skipped_lines": skipped,
-            "lines": lines,
-        }));
-    }
-
-    let owner_lines: Vec<_> = lines.into_iter().filter(is_owned).collect();
-    Ok(json!({
-        "path": rel_path,
-        "mode": "owner",
-        "line_count": total,
-        "owner_lines": attributed,
-        "skipped_lines": skipped,
-        "note": format!(
-            "Owner provenance: {attributed} line(s) attributable to an AI agent in this \
-    machine's local session history; {skipped} line(s) are not in local records (changed by \
-    others, edited by hand, or never captured) and are not guessed. Pass \
-    include_unattributed=true to see every line."
-        ),
-        "lines": owner_lines,
-    }))
+    Some((path.to_string(), line))
 }
 
-/// Builds the `blame_history` tool response: the FULL change history of a line
-/// range — every commit that touched `[line_start, line_end]` (newest first),
-/// each tagged with the owner session that captured it when attributable. This is
-/// the "all the sessions that ever changed this code" view, distinct from
-/// `blame_file`, which only resolves the single last commit per line. Commits
-/// Brick cannot attribute are listed with `attributed=false`, not guessed.
-fn blame_history_response(
+/// Resolves any anchor (file:line, artifact/mission/event id) to a single event
+/// id for `link`. file:line uses blame; ids reuse the direct resolver.
+fn resolve_anchor_to_event(
     store: &LocalStore,
-    path: &str,
-    line_start: u64,
-    line_end: u64,
-) -> Result<Value> {
-    let cwd = std::env::current_dir()?;
-    let repo_root = discover_repo_root(&cwd)?;
-    let rel_path = normalize_repo_relative(&repo_root, path);
-    let touches = blame_line_range_history(store, &repo_root, &rel_path, line_start, line_end)?;
-    let attributed = touches.iter().filter(|touch| touch.attributed).count();
-    Ok(json!({
-        "path": rel_path,
-        "line_start": line_start,
-        "line_end": line_end,
-        "commit_count": touches.len(),
-        "attributed_commits": attributed,
-        "note": format!(
-            "Full history of lines {line_start}-{line_end}: {} commit(s) touched this range, \
-    {attributed} attributable to a local AI session. Commits with attributed=false are not in \
-    local records (others' commits, hand edits, or squash/rebase-rewritten history) and are not \
-    guessed.",
-            touches.len()
-        ),
-        "history": touches,
-    }))
+    events: &[brick_protocol::TraceEvent],
+    anchor: &str,
+) -> Result<Option<uuid::Uuid>> {
+    if let Some((path, line)) = parse_file_line(anchor) {
+        let cwd = std::env::current_dir()?;
+        let repo_root = discover_repo_root(&cwd)?;
+        let rel_path = normalize_repo_relative(&repo_root, &path);
+        let resolved = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
+        return Ok(resolved
+            .resolved_events
+            .first()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok()));
+    }
+    let resolved = resolve_direct_anchor(events, anchor);
+    Ok(resolved
+        .resolved_events
+        .first()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok()))
+}
+
+/// The most recent `diff.captured` event, used as the default `link` effect when
+/// the agent doesn't name one (it just changed something).
+fn latest_diff_event(events: &[brick_protocol::TraceEvent]) -> Option<uuid::Uuid> {
+    events
+        .iter()
+        .filter(|event| event.event_type == brick_protocol::EventType::DiffCaptured)
+        .max_by_key(|event| event.occurred_at)
+        .map(|event| event.event_id)
+}
+
+/// Parses the `relation` arg, defaulting to `derived_from` when a cause is given
+/// or `rationale` when it is not.
+fn parse_relation(raw: Option<&str>, cause_events: &[uuid::Uuid]) -> Result<CausalRelation> {
+    match raw.map(|value| value.trim().to_lowercase()).as_deref() {
+        Some("triggered_by") => Ok(CausalRelation::TriggeredBy),
+        Some("derived_from") => Ok(CausalRelation::DerivedFrom),
+        Some("supersedes") => Ok(CausalRelation::Supersedes),
+        Some("responds_to") => Ok(CausalRelation::RespondsTo),
+        Some("rationale") => Ok(CausalRelation::Rationale),
+        Some(other) => Err(anyhow::anyhow!(
+            "unknown relation: {other} (triggered_by|derived_from|supersedes|responds_to|rationale)"
+        )),
+        None => {
+            if cause_events.is_empty() {
+                Ok(CausalRelation::Rationale)
+            } else {
+                Ok(CausalRelation::DerivedFrom)
+            }
+        }
+    }
+}
+
+fn relation_wire(relation: CausalRelation) -> &'static str {
+    match relation {
+        CausalRelation::TriggeredBy => "triggered_by",
+        CausalRelation::DerivedFrom => "derived_from",
+        CausalRelation::Supersedes => "supersedes",
+        CausalRelation::RespondsTo => "responds_to",
+        CausalRelation::Rationale => "rationale",
+    }
+}
+
+/// Fills each step's transcript pointer with the concrete on-disk location: a
+/// file path for file-backed sources (Claude/Codex/Gemini), or a sqlite ref for
+/// db-backed ones (Cursor/ORGII). The core only knows the session id; the CLI
+/// layer has the profiles to resolve it.
+fn enrich_transcripts(_profiles: &SourceProfileStore, chain: &mut CausalChain) {
+    // The core already populated `session_id` on each step's transcript pointer.
+    // Resolving session_id → concrete path requires per-source lookups that vary
+    // by tool; for now we keep the session_id pointer (the agent can open it via
+    // its own tooling) and leave richer path resolution to a follow-up. This
+    // function is the seam where that resolution lands.
+    let _ = chain;
+}
+
+/// Whether the chain found no causal information at all (a single inferred-or-
+/// empty anchor step with nothing else).
+fn chain_is_empty(chain: &CausalChain) -> bool {
+    chain.anchor.resolved_events.is_empty()
+        || (chain.steps.len() <= 1
+            && chain.forward.is_empty()
+            && chain
+                .steps
+                .first()
+                .map(|step: &CausalStep| step.note.is_none())
+                .unwrap_or(true))
 }
 
 /// Strips a leading `repo_root` prefix so blame always queries a repo-relative
@@ -1068,51 +831,6 @@ fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-/// Builds the `(source_id, session_id) -> ClaimValidity` judge used to retire
-/// bulletin-board claims whose owning session has ended.
-///
-/// We enumerate every source's sessions once (liveness filled per session) and
-/// fold them into two lookups: the set of sessions seen at all, and the subset
-/// currently active. The returned closure is then pure:
-/// - active                       -> `Live`   (keep)
-/// - seen but not active          -> `Dead`   (retire early)
-/// - never seen (CLI / bare `mcp`) -> `Unknown` (keep on TTL alone)
-///
-/// A source that fails to enumerate is simply absent from both sets, so its
-/// claims fall through to `Unknown` — one broken source never mass-retires
-/// claims it cannot speak to.
-fn build_claim_validity(profiles: &SourceProfileStore) -> impl Fn(&str, &str) -> ClaimValidity {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut live: HashSet<(String, String)> = HashSet::new();
-    if let Ok(all_profiles) = profiles.list_profiles() {
-        for profile in &all_profiles {
-            let Ok(sessions) = list_source_sessions(profile, Some(200)) else {
-                continue;
-            };
-            for session in sessions {
-                let key = (
-                    session.source_app_id.clone(),
-                    session.external_session_id.clone(),
-                );
-                if brick_core::is_active(&session) {
-                    live.insert(key.clone());
-                }
-                seen.insert(key);
-            }
-        }
-    }
-    move |source_id: &str, session_id: &str| {
-        let key = (source_id.to_string(), session_id.to_string());
-        if live.contains(&key) {
-            ClaimValidity::Live
-        } else if seen.contains(&key) {
-            ClaimValidity::Dead
-        } else {
-            ClaimValidity::Unknown
-        }
-    }
 }
 
 /// Builds the actor for an MCP-authored write. MCP has no logged-in human, so

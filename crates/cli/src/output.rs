@@ -106,5 +106,6 @@ fn format_event_type(event_type: EventType) -> &'static str {
         EventType::RepoContextCaptured => "repo_context.captured",
         EventType::DiffCaptured => "diff.captured",
         EventType::ExternalRefLinked => "external_ref.linked",
+        EventType::CausalLinked => "causal.linked",
     }
 }

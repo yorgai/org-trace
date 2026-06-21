@@ -55,6 +55,17 @@ Artifact kinds are `decision`, `file_ref`, `patch`, `review`, `test_result`, `ac
 
 - `external_ref.linked`: links mission, session, or artifact graph entities to external systems such as CI jobs, pull requests, issues, or logs.
 
+### Causal events
+
+- `causal.linked`: a directed causal edge that turns the time-ordered event stream into a **causal graph** — the core of `explain` (WHY), as opposed to a mere timeline (`git log`). Payload fields:
+  - `effect_event` (UUID, required): the event that happened (usually a `diff.captured`).
+  - `cause_events` (UUID list, may be empty): zero or more upstream events that caused it. Any `event_id` — a diff, an artifact, another session's event, a mission. Mission is just one possible cause, not a requirement.
+  - `relation` (enum): `triggered_by` (set in motion by the cause, e.g. an A2A `previous_actions` step), `derived_from` (built from the cause, e.g. a test covering a fix), `supersedes` (corrects/replaces the cause), `responds_to` (a response to a request), or `rationale` (a standalone reason with no upstream event — the WHY that cannot be reverse-engineered from the code).
+  - `note` (optional string): the one-line WHY.
+  - **Invariant:** at least one of `cause_events` (non-empty) or `note` (non-empty) must carry information; an edge with neither is rejected as noise.
+
+  The event's `confidence` distinguishes how the edge was produced: `explicit` (an agent or human asserted it via `link`), `observed` (a hook captured it from session context), or `inferred` (a fallback heuristic, used only when no explicit edge exists). Edges are projected into the rebuildable `causes` / `effects` adjacency tables at index time; the *chains* are traversed at query time by `explain` (a chain is relative to an anchor + depth, so materializing all chains would combinatorially explode). The adjacency tables and the SQLite `causal_edges` table are derived data — deleting them and rebuilding from JSONL reproduces them exactly.
+
 ## Sync endpoints
 
 The self-hosted MVP exposes append-only event transfer. Routes are unauthenticated; repo IDs are data boundaries, not authorization boundaries.

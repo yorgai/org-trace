@@ -156,7 +156,25 @@ pub enum Command {
         command: AgentCommand,
     },
     /// Run as an MCP server over stdio so any MCP-capable agent can query Brick.
-    McpServe,
+    McpServe {
+        /// Expose the planning tool surface (mission/artifact tools) instead of
+        /// the default minimal coding-agent surface (explain + link). Use this
+        /// for a dedicated planning custom agent.
+        #[arg(long)]
+        planning: bool,
+    },
+    /// Explain WHY code looks the way it does: walk the causal graph back from an
+    /// anchor (path:line, artifact/mission/event id) — who, when, why, and what
+    /// was derived from it. The read side of Brick's causal layer.
+    Explain {
+        /// Anchor: `path:line`, an artifact id, a mission id, or an event id.
+        anchor: String,
+        /// Causal hops to walk back (default 3, max 8).
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
+        format: HistoryFormatArg,
+    },
     /// Show line-level AI blame for a file: who (agent/session/mission) produced each line.
     Blame {
         /// Repo-relative or absolute file path to blame.
@@ -787,6 +805,11 @@ pub enum MetadataCommand {
         #[arg(long, default_value_t = 5)]
         limit: usize,
     },
+    /// Claude Code PreToolUse hook adapter for Read/Grep/Glob: when the agent is
+    /// about to inspect a file Brick has a causal record for, injects a one-line
+    /// `explain` summary so it sees WHY before drawing conclusions. Silent when
+    /// there is no record (zero context pollution).
+    ExplainHook,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

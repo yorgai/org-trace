@@ -78,7 +78,7 @@ fn main() -> Result<()> {
     // to the working dir as the root rather than aborting initialization.
     let repo_root = match discover_repo_root(&work_dir) {
         Ok(root) => root,
-        Err(_) if matches!(cli.command, Command::McpServe) => work_dir.clone(),
+        Err(_) if matches!(cli.command, Command::McpServe { .. }) => work_dir.clone(),
         Err(err) => return Err(err),
     };
     let source_profiles = SourceProfileStore::new(repo_root.clone());
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
         Command::Source { .. }
         | Command::History { .. }
         | Command::Metadata { .. }
-        | Command::McpServe
+        | Command::McpServe { .. }
         | Command::Announce { .. }
         | Command::Blame { .. }
         | Command::LogLine { .. }
@@ -355,7 +355,12 @@ fn main() -> Result<()> {
         )?,
         Command::History { command } => handle_history(command, &source_profiles, &store)?,
         Command::Metadata { command } => handle_metadata(command, &source_profiles, &store)?,
-        Command::McpServe => mcp::serve(&source_profiles, &store)?,
+        Command::McpServe { planning } => mcp::serve(&source_profiles, &store, planning)?,
+        Command::Explain {
+            anchor,
+            depth,
+            format,
+        } => handle_explain(&store, &anchor, depth, format)?,
         Command::Blame {
             path,
             line_start,
@@ -400,6 +405,47 @@ fn main() -> Result<()> {
 
 /// Prints line-level AI blame for `path` as JSON. Resolves the repo root from
 /// the current directory, then maps each current line to its producing session.
+/// Prints the causal chain for an anchor as JSON: the read side of Brick's
+/// causal layer. `path:line` anchors resolve through blame (git-aware); other
+/// anchors (artifact/mission/event id) resolve directly off the event stream.
+/// Never gated — local explain is free; the wall is cross-machine sync.
+fn handle_explain(
+    store: &LocalStore,
+    anchor: &str,
+    depth: Option<usize>,
+    format: args::HistoryFormatArg,
+) -> Result<()> {
+    history::ensure_json(format);
+    let events = store.read_all_events()?;
+    let index = store.load_or_rebuild_index()?;
+    let depth = depth.unwrap_or(brick_core::DEFAULT_EXPLAIN_DEPTH);
+
+    let resolved = if let Some((rel_path, line)) = parse_anchor_file_line(anchor) {
+        let cwd = std::env::current_dir()?;
+        let repo_root = discover_repo_root(&cwd)?;
+        let rel = match std::path::Path::new(&rel_path).strip_prefix(&repo_root) {
+            Ok(stripped) => stripped.to_string_lossy().into_owned(),
+            Err(_) => rel_path.trim_start_matches("./").to_string(),
+        };
+        brick_core::resolve_file_line_anchor(store, &repo_root, &rel, line)?
+    } else {
+        brick_core::resolve_direct_anchor(&events, anchor)
+    };
+
+    let chain = brick_core::explain_from_events(&index, &events, resolved, depth);
+    history::print_json(&chain)
+}
+
+/// Parses a `path:line` anchor into `(path, line)`; `None` for bare ids.
+fn parse_anchor_file_line(input: &str) -> Option<(String, u64)> {
+    let (path, line) = input.rsplit_once(':')?;
+    let line: u64 = line.trim().parse().ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some((path.to_string(), line))
+}
+
 fn handle_blame(
     store: &LocalStore,
     path: &str,
