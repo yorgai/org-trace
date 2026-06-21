@@ -164,15 +164,17 @@ fn link_tool() -> Value {
     json!({
         "name": "link",
         "description": "Record WHY you just made a change, so the next agent can \
-recover your reasoning with `explain`. Call this after a non-trivial edit. Two \
+recover your reasoning with `explain`. Call this after a non-trivial edit. Three \
 forms: (1) a standalone rationale — just a `note` explaining the change (e.g. \
 'token refresh had a concurrency race; serialized it'); (2) a causal edge — set \
 `cause` to the anchor that prompted this change (a `path`, `path:line`, \
-artifact, mission, or event id) and pick a `relation`. The effect is the code \
-you just changed: give its `effect` anchor (a `path` or `path:line`), or omit \
-`effect` to auto-capture your current uncommitted changes and bind the reason \
-to exactly those files. Tip: if you made several unrelated edits, commit (or \
-link) between them so each reason binds to the right files.",
+artifact, mission, or event id) and pick a `relation`; (3) implementing a \
+planned work item — set `cause` to its `mission_…` id with \
+relation='derived_from' so the planning record connects to the real code. The \
+effect is the code you just changed: give its `effect` anchor (a `path` or \
+`path:line`), or omit `effect` to auto-capture your current uncommitted changes \
+and bind the reason to exactly those files. Tip: if you made several unrelated \
+edits, commit (or link) between them so each reason binds to the right files.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -184,9 +186,12 @@ uncommitted changes (all touched files) and bind the reason to them."
                 },
                 "cause": {
                     "type": "string",
-                    "description": "Optional anchor that caused this change (a \
-`path`, `path:line`, artifact, mission, or event id). Omit for a standalone \
-rationale."
+                    "description": "Optional anchor that caused/motivated this \
+change: a `path`, `path:line`, artifact, mission, or event id. If you are \
+implementing a planned work item, pass that `mission_…` id here (with \
+relation='derived_from') so the planning record links to the actual code — do \
+NOT just mention the mission in `note`, that leaves the graph disconnected. \
+Omit for a standalone rationale."
                 },
                 "relation": {
                     "type": "string",

@@ -788,6 +788,65 @@ fn link_without_effect_auto_captures_the_edited_file() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// Regression from live cross-scenario testing (planning → code bridge): a
+/// coding agent implements a planned mission, then links its code change to that
+/// mission by passing the `mission_…` id as `cause`. The edge MUST resolve to
+/// the mission's event (not be dropped), so `explain mission_…` later traverses
+/// from the work item down to the real code. The live failure was the agent
+/// stuffing the mission id into `note` text instead of `cause`, leaving the
+/// graph disconnected — this pins that `cause=mission` actually wires up.
+#[test]
+fn link_cause_mission_connects_planning_to_code() {
+    let w = world(
+        "link-mission-cause",
+        &[("src/cache.rs", "fn get() {}\n")],
+    );
+    // Agent edits the file implementing the mission.
+    std::fs::write(
+        w.repo.join("src/cache.rs"),
+        "fn get() -> Option<String> {\n    None\n}\n",
+    )
+    .unwrap();
+
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let linked = m.call(
+        "link",
+        json!({
+            "cause": w.mission,
+            "relation": "derived_from",
+            "note": "implemented cache TTL expiry for the planned mission",
+            "source": "claude_code",
+        }),
+    );
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+    assert!(
+        !linked["cause_events"].as_array().unwrap().is_empty(),
+        "cause=mission must resolve to a real event, not be dropped: {linked}"
+    );
+    assert_eq!(linked["relation"], json!("derived_from"), "{linked}");
+
+    // explain the mission and confirm the forward edge reaches the code change.
+    let chain = m.call("explain", json!({"anchor": w.mission}));
+    let reaches_code = chain["forward"]
+        .as_array()
+        .map(|fs| {
+            fs.iter().any(|f| {
+                f["what"]
+                    .as_str()
+                    .map(|w| w.contains("cache.rs"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        reaches_code,
+        "explain(mission) must reach the linked code change as a forward effect: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 /// Regression from live Codex testing: an agent edits a file then calls `link`
 /// with `effect: "src/cache.rs:1"` — a perfectly reasonable anchor on the line
 /// it just changed. That line has no Brick event yet (the edit is uncommitted),
