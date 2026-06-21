@@ -788,6 +788,64 @@ fn link_without_effect_auto_captures_the_edited_file() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// Regression from live multi-hop chain testing: an agent edits a file and
+/// `git add`s it (stages it) BEFORE calling `link` with no `effect`. A plain
+/// `git diff` (unstaged) shows nothing for a staged file, so the old capture
+/// returned empty and the rationale mis-bound to a stale prior diff — every hop
+/// of a chain collapsed onto one event. Auto-capture must fold in staged changes
+/// so the reason binds to the file actually changed.
+#[test]
+fn link_auto_capture_includes_staged_changes() {
+    let w = world(
+        "link-staged-capture",
+        &[
+            ("src/old.rs", "fn old() {}\n"),
+            ("src/cache.rs", "fn get() {}\n"),
+        ],
+    );
+    // A prior committed diff on old.rs is the stale event the bug would grab.
+    std::fs::write(w.repo.join("src/old.rs"), "fn old() { 1 }\n").unwrap();
+    w.capture_working();
+    assert!(git(&w.repo, &["add", "-A"]).success());
+    assert!(git(&w.repo, &["commit", "-q", "-m", "old"]).success());
+
+    // Agent edits cache.rs and STAGES it before linking.
+    std::fs::write(
+        w.repo.join("src/cache.rs"),
+        "fn get() -> Option<String> {\n    None\n}\n",
+    )
+    .unwrap();
+    assert!(git(&w.repo, &["add", "src/cache.rs"]).success());
+
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let linked = m.call(
+        "link",
+        json!({"relation":"rationale","note":"staged TTL fix in get()","source":"codex_app"}),
+    );
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+    assert_eq!(
+        linked["captured_files"],
+        json!(["src/cache.rs"]),
+        "staged change must be captured, not missed: {linked}"
+    );
+
+    let chain = m.call("explain", json!({"anchor":"src/cache.rs"}));
+    let has_why = chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("staged TTL fix"))
+                .unwrap_or(false)
+        });
+    assert!(has_why, "staged rationale must bind to cache.rs: {chain}");
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 /// Regression from live cross-scenario testing (planning → code bridge): a
 /// coding agent implements a planned mission, then links its code change to that
 /// mission by passing the `mission_…` id as `cause`. The edge MUST resolve to

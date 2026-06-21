@@ -573,9 +573,13 @@ uncommitted changes to capture"
 }
 
 /// When `link` is called with no `effect`, the agent has just edited code with
-/// its own tools (which leave no Brick event). Capture the current working diff
-/// so the rationale binds to the files actually touched, and return the new
-/// `diff.captured` event id. Returns `None` when the working tree is clean.
+/// its own tools (which leave no Brick event). Capture everything the agent
+/// changed since the last commit — BOTH unstaged (`Working`) and staged
+/// (`Staged`) changes — so the rationale binds to the files actually touched,
+/// and return the new `diff.captured` event id. Returns `None` when there are no
+/// changes at all. Merging both targets matters: an agent (or its harness) that
+/// `git add`s its work before calling `link` would otherwise capture nothing and
+/// the reason would mis-bind to a stale prior diff.
 fn capture_working_diff_event(
     store: &LocalStore,
     args: &Value,
@@ -585,7 +589,7 @@ fn capture_working_diff_event(
     let Ok(repo_root) = discover_repo_root(&cwd) else {
         return Ok(None);
     };
-    let payload = capture_diff(
+    let mut payload = capture_diff(
         &repo_root,
         DiffCaptureRequest {
             target: DiffTarget::Working,
@@ -594,6 +598,26 @@ fn capture_working_diff_event(
             repo_context_id: None,
         },
     )?;
+    // Fold in staged changes the working-tree diff doesn't see, deduping by path
+    // so a file that is both staged and further edited isn't listed twice.
+    let staged = capture_diff(
+        &repo_root,
+        DiffCaptureRequest {
+            target: DiffTarget::Staged,
+            base_commit: None,
+            head_commit: None,
+            repo_context_id: None,
+        },
+    )?;
+    for change in staged.file_changes {
+        if !payload
+            .file_changes
+            .iter()
+            .any(|existing| existing.path == change.path)
+        {
+            payload.file_changes.push(change);
+        }
+    }
     if payload.file_changes.is_empty() {
         return Ok(None);
     }
