@@ -88,7 +88,17 @@ Output (abridged):
   `relation`), and a `confidence` of `explicit` > `observed` > `inferred`.
 - `forward` is what was derived from / triggered by the anchor.
 - `live` appears only when another running session is touching the anchored file
-  — this replaces the old standalone `sessions` / `claims` tools.
+  (Tier 1) or working in the same project (Tier 2) — this replaces the old
+  standalone `sessions` / `claims` tools. **Liveness is never stored** — a
+  persisted "active" flag is wrong the instant it lands. It is recomputed on
+  every scan from two signals, so an abandoned or crashed session cannot show
+  "active" forever:
+  1. **A 120s activity window** — a transcript untouched for longer is `Idle`
+     without even being opened, so a session whose process died simply stops
+     appearing once it goes quiet.
+  2. **Turn boundaries** — within the window, a finished turn is still `Idle`
+     (Codex `task_complete` after the last `task_started`; Claude an `assistant`
+     record with `stop_reason` set). Only an open turn counts as live.
 - When the anchor has no causal record, `resolved_events` is empty, `causal_chain`
   is empty (never guessed), and a `note` says so — fall back to git there.
 
@@ -197,7 +207,8 @@ the planning surface exposes the five planning tools, retired names return a
 migration hint, `explain` resolves a `path:line` through blame and walks the
 causal chain (including across commit + line drift), `link` records both a
 standalone rationale and a cross-event edge, `explain` surfaces a live session
-on the anchor file, and — spawning the server with an unrelated working
+on the anchor file while excluding a finished (Idle) session from the `live`
+field, and — spawning the server with an unrelated working
 directory — an absolute anchor still recovers the WHO/WHY while a relative
 anchor degrades to the actionable note, and the planning surface still creates
 and lists a mission via its `BRICK_HOME` fallback.

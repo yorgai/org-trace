@@ -1166,6 +1166,40 @@ fn explain_surfaces_live_session_on_anchor_file() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Anti-zombie guard for the `live` field: a FINISHED session (Claude assistant
+/// with `stop_reason` set → Idle) editing the anchor file must NOT show up as
+/// live. This is the "someone left a session open and it shows active forever"
+/// failure mode — liveness is recomputed per scan from turn boundaries, never a
+/// stored flag, so a completed turn drops out immediately. A genuinely live
+/// session on the SAME file still fires (positive control), proving the gate
+/// discriminates rather than just suppressing everything.
+#[test]
+fn explain_live_excludes_finished_session_but_keeps_active() {
+    let (root, home, repo, codex_dir, claude_dir) = setup_world("explain-live-zombie");
+
+    // Only a FINISHED Claude session has touched commands_memory.rs → no live.
+    write_claude(&claude_dir, "claude-done-001", &repo, "src/commands_memory.rs");
+
+    let mut m = Mcp::spawn(&home, &repo);
+    let finished = m.call("explain", json!({"anchor":"src/commands_memory.rs:1"}));
+    assert!(
+        finished.get("live").is_none(),
+        "a finished (Idle) session must NOT surface as live: {finished}"
+    );
+
+    // Positive control: an ACTIVE Codex session on a different file does fire,
+    // so the absence above is real discrimination, not a blanket suppression.
+    write_codex(&codex_dir, "codex-live-002", &repo, "src/commands_git.rs");
+    let active = m.call("explain", json!({"anchor":"src/commands_git.rs:1"}));
+    assert!(
+        active.get("live").is_some(),
+        "an active session on the anchor file must still fire: {active}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn explain_is_honest_when_no_record_exists() {
     let (root, home, repo, _codex_dir, _claude_dir) = setup_world("explain-empty");
