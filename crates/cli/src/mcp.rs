@@ -14,9 +14,9 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    discover_repo_root, explain_from_events, resolve_direct_anchor, resolve_file_line_anchor,
-    AnnouncementStore, CausalChain, CausalStep, LocalStore, SourceProfileStore,
-    DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
+    discover_repo_root, explain_from_events, resolve_direct_anchor, resolve_file_anchor,
+    resolve_file_line_anchor, AnnouncementStore, CausalChain, LocalStore,
+    SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -416,6 +416,16 @@ fn explain_tool_call(
         let rel_path = normalize_repo_relative(&repo_root, &path);
         let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
         (anchor, Some(rel_path))
+    } else if looks_like_path(&anchor_input) {
+        // A whole-file anchor (no `:line`) — agents very often ask about a file,
+        // not a line. Match the file's change events directly instead of treating
+        // the path as an opaque id (which wrongly reported "no record").
+        let rel_path = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| discover_repo_root(&cwd).ok())
+            .map(|repo_root| normalize_repo_relative(&repo_root, &anchor_input))
+            .unwrap_or_else(|| anchor_input.clone());
+        (resolve_file_anchor(&events, &rel_path), Some(rel_path))
     } else {
         (resolve_direct_anchor(&events, &anchor_input), None)
     };
@@ -722,6 +732,28 @@ fn parse_file_line(input: &str) -> Option<(String, u64)> {
     Some((path.to_string(), line))
 }
 
+/// Heuristic: does the anchor look like a file path rather than an id? Brick ids
+/// are `artifact_*` / `mission_*` / `session_*` prefixes or bare UUIDs; anything
+/// with a path separator or a file extension is a whole-file anchor.
+fn looks_like_path(input: &str) -> bool {
+    let s = input.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with("artifact_")
+        || s.starts_with("mission_")
+        || s.starts_with("session_")
+        || s.starts_with("org_")
+        || s.starts_with("project_")
+    {
+        return false;
+    }
+    if uuid::Uuid::parse_str(s).is_ok() {
+        return false;
+    }
+    s.contains('/') || s.contains('.')
+}
+
 /// Resolves any anchor (file:line, artifact/mission/event id) to a single event
 /// id for `link`. file:line uses blame; ids reuse the direct resolver.
 fn resolve_anchor_to_event(
@@ -734,6 +766,18 @@ fn resolve_anchor_to_event(
         let repo_root = discover_repo_root(&cwd)?;
         let rel_path = normalize_repo_relative(&repo_root, &path);
         let resolved = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
+        return Ok(resolved
+            .resolved_events
+            .first()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok()));
+    }
+    if looks_like_path(anchor) {
+        let rel_path = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| discover_repo_root(&cwd).ok())
+            .map(|repo_root| normalize_repo_relative(&repo_root, anchor))
+            .unwrap_or_else(|| anchor.to_string());
+        let resolved = resolve_file_anchor(events, &rel_path);
         return Ok(resolved
             .resolved_events
             .first()
@@ -801,17 +845,13 @@ fn enrich_transcripts(_profiles: &SourceProfileStore, chain: &mut CausalChain) {
     let _ = chain;
 }
 
-/// Whether the chain found no causal information at all (a single inferred-or-
-/// empty anchor step with nothing else).
+/// Whether `explain` found genuinely nothing to say. A chain is empty ONLY when
+/// the anchor resolved to no events at all — that is the real "no Brick record"
+/// case. A single `diff.captured` step still carries WHO + mission_title + what,
+/// which is real provenance; treating "no rationale note yet" as "no record"
+/// wrongly pushed agents back to git even when Brick knew who/why-by-mission.
 fn chain_is_empty(chain: &CausalChain) -> bool {
-    chain.anchor.resolved_events.is_empty()
-        || (chain.steps.len() <= 1
-            && chain.forward.is_empty()
-            && chain
-                .steps
-                .first()
-                .map(|step: &CausalStep| step.note.is_none())
-                .unwrap_or(true))
+    chain.anchor.resolved_events.is_empty() || chain.steps.is_empty()
 }
 
 /// Strips a leading `repo_root` prefix so blame always queries a repo-relative

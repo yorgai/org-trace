@@ -37,6 +37,7 @@ pub enum AnchorKind {
     Artifact,
     Mission,
     FileLine,
+    File,
 }
 
 /// The resolved anchor: what the caller asked about and which events it mapped to.
@@ -73,6 +74,9 @@ pub struct CausalStep {
     pub actor_id: Option<String>,
     pub session_id: Option<String>,
     pub mission_id: Option<String>,
+    /// Human-readable mission title resolved from `mission_id`, so the agent sees
+    /// the WHY ("Harden token refresh") instead of an opaque id it discards.
+    pub mission_title: Option<String>,
     pub occurred_at: String,
     /// Relation of THIS step to the step it caused (the one nearer the anchor).
     /// `None` for the anchor/root steps themselves.
@@ -174,6 +178,50 @@ pub fn resolve_direct_anchor(events: &[TraceEvent], input: &str) -> ExplainAncho
     }
 }
 
+/// Resolves a whole-file anchor (a path with no `:line`) to the events that
+/// changed that file, newest first. Agents very often ask about a file without a
+/// specific line ("why does auth.rs look like this"), so this is git-free and
+/// matches `diff.captured` events by path suffix rather than treating the path as
+/// an opaque id (which wrongly reported "no record").
+pub fn resolve_file_anchor(events: &[TraceEvent], path: &str) -> ExplainAnchor {
+    let rel = path.trim().trim_start_matches("./");
+    let mut matches: Vec<&TraceEvent> = events
+        .iter()
+        .filter(|event| event.event_type == EventType::DiffCaptured)
+        .filter(|event| diff_event_touches(event, rel))
+        .collect();
+    matches.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
+    let resolved = matches
+        .iter()
+        .map(|event| event.event_id.to_string())
+        .collect();
+    ExplainAnchor {
+        kind: AnchorKind::File,
+        input: path.to_string(),
+        resolved_events: resolved,
+        blame_confidence: None,
+    }
+}
+
+/// Whether a `diff.captured` event's `file_changes` touch `rel` (suffix match,
+/// tolerant of repo-relative vs absolute differences).
+fn diff_event_touches(event: &TraceEvent, rel: &str) -> bool {
+    event
+        .payload
+        .get("file_changes")
+        .and_then(|value| value.as_array())
+        .map(|changes| {
+            changes.iter().any(|change| {
+                change
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|path| path == rel || path.ends_with(rel) || rel.ends_with(path))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Resolves a `file:line` anchor to the event that produced that line, reusing
 /// line-level `blame` (line → commit → patch-id → event, drift-aware). This is
 /// the git-dependent branch kept separate from the pure graph traversal so the
@@ -221,6 +269,7 @@ pub fn explain_from_events(
         .iter()
         .map(|event| (event.event_id.to_string(), event))
         .collect();
+    let mission_titles = mission_title_index(events);
 
     let mut steps = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -247,6 +296,7 @@ pub fn explain_from_events(
             rationale_note,
             rationale_conf,
             step_depth,
+            &mission_titles,
         );
         steps.push(step);
 
@@ -284,7 +334,8 @@ pub fn explain_from_events(
             .first()
             .and_then(|id| by_id.get(id).copied())
         {
-            for inferred in inferred_same_session_steps(events, anchor_event, depth) {
+            for inferred in inferred_same_session_steps(events, anchor_event, depth, &mission_titles)
+            {
                 if visited.insert(inferred.event_id.clone()) {
                     steps.push(inferred);
                 }
@@ -336,6 +387,7 @@ fn build_step(
     note: Option<String>,
     rationale_conf: Option<String>,
     depth: usize,
+    mission_titles: &BTreeMap<String, String>,
 ) -> CausalStep {
     match event {
         Some(event) => CausalStep {
@@ -346,6 +398,7 @@ fn build_step(
             actor_id: Some(event.actor.actor_id.clone()),
             session_id: event.session_id.as_ref().map(ToString::to_string),
             mission_id: event.mission_id.as_ref().map(ToString::to_string),
+            mission_title: mission_title_for(event, mission_titles),
             occurred_at: event.occurred_at.to_rfc3339(),
             relation,
             note,
@@ -363,6 +416,7 @@ fn build_step(
             actor_id: None,
             session_id: None,
             mission_id: None,
+            mission_title: None,
             occurred_at: String::new(),
             relation,
             note,
@@ -373,6 +427,41 @@ fn build_step(
     }
 }
 
+/// Builds a `mission_id` → mission title lookup from `mission.created` /
+/// `mission.updated` events, so any step carrying a mission gets a human label.
+fn mission_title_index(events: &[TraceEvent]) -> BTreeMap<String, String> {
+    let mut titles = BTreeMap::new();
+    for event in events {
+        if matches!(
+            event.event_type,
+            EventType::MissionCreated | EventType::MissionUpdated
+        ) {
+            if let Some(mission_id) = event.mission_id.as_ref() {
+                if let Some(title) = event
+                    .payload
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .filter(|title| !title.is_empty())
+                {
+                    titles.insert(mission_id.to_string(), title.to_string());
+                }
+            }
+        }
+    }
+    titles
+}
+
+/// Resolves the human mission title for an event's `mission_id`, if known.
+fn mission_title_for(
+    event: &TraceEvent,
+    mission_titles: &BTreeMap<String, String>,
+) -> Option<String> {
+    event
+        .mission_id
+        .as_ref()
+        .and_then(|mission_id| mission_titles.get(&mission_id.to_string()).cloned())
+}
+
 /// Shallow fallback: when an anchor event has no causal edges, surface the most
 /// recent prior events in the SAME session as `inferred` context. This is a
 /// timeline, not a causal chain — every step is marked `inferred`.
@@ -380,6 +469,7 @@ fn inferred_same_session_steps(
     events: &[TraceEvent],
     anchor_event: &TraceEvent,
     depth: usize,
+    mission_titles: &BTreeMap<String, String>,
 ) -> Vec<CausalStep> {
     let Some(session) = anchor_event.session_id.as_ref() else {
         return Vec::new();
@@ -405,6 +495,7 @@ fn inferred_same_session_steps(
             actor_id: Some(event.actor.actor_id.clone()),
             session_id: event.session_id.as_ref().map(ToString::to_string),
             mission_id: event.mission_id.as_ref().map(ToString::to_string),
+            mission_title: mission_title_for(event, mission_titles),
             occurred_at: event.occurred_at.to_rfc3339(),
             relation: Some("inferred_prior".to_string()),
             note: None,
@@ -749,5 +840,99 @@ mod tests {
         let anchor = resolve_direct_anchor(&events, artifact_id.as_str());
         assert_eq!(anchor.kind, AnchorKind::Artifact);
         assert_eq!(anchor.resolved_events.len(), 1);
+    }
+
+    /// Regression: an agent very often anchors on a whole file (no `:line`), e.g.
+    /// `explain src/auth.rs`. That must resolve to the file's change events, not
+    /// be treated as an opaque id reporting "no record". Newest diff comes first.
+    #[test]
+    fn whole_file_anchor_resolves_to_file_change_events_newest_first() {
+        let session = SessionId::new();
+        let mut older = diff_event(&session, "src/auth.rs");
+        older.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let newer = diff_event(&session, "src/auth.rs");
+        let newer_id = newer.event_id.to_string();
+        let unrelated = diff_event(&session, "src/other.rs");
+        let events = vec![older, newer, unrelated];
+
+        let anchor = resolve_file_anchor(&events, "src/auth.rs");
+        assert_eq!(anchor.kind, AnchorKind::File);
+        assert_eq!(anchor.resolved_events.len(), 2, "both auth.rs diffs match");
+        assert_eq!(
+            anchor.resolved_events[0], newer_id,
+            "newest diff resolves first"
+        );
+
+        // And it walks into a populated chain rather than an empty one.
+        let index = TraceIndex::build(&events).expect("index");
+        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
+        assert!(!chain.steps.is_empty(), "whole-file anchor yields a chain");
+        assert_eq!(chain.steps[0].actor_id.as_deref(), Some("claude"));
+    }
+
+    /// Regression: a step carrying a `mission_id` must expose the human
+    /// `mission_title` so the agent sees the WHY instead of an opaque id it
+    /// discards (which made it wrongly fall back to git).
+    #[test]
+    fn step_resolves_mission_title_from_mission_event() {
+        let session = SessionId::new();
+        let project = brick_protocol::ProjectId::new();
+        let mission_id = brick_protocol::MissionId::new();
+        let mission = TraceEvent::mission_created(
+            actor(),
+            mission_id.clone(),
+            brick_protocol::MissionCreatedPayload {
+                project_id: project,
+                title: "Harden token refresh".to_string(),
+                description: None,
+                status: brick_protocol::MissionStatus::Active,
+                repo_context_id: None,
+            },
+        )
+        .expect("mission event");
+
+        // A diff carrying that mission.
+        let mut diff = TraceEvent::diff_captured(
+            actor(),
+            brick_protocol::ArtifactId::new(),
+            Some(session.clone()),
+            Some(mission_id.clone()),
+            DiffCapturedPayload {
+                diff_target: DiffTarget::Working,
+                base_commit: None,
+                head_commit: None,
+                patch_id: None,
+                summary_hash: "h".to_string(),
+                file_changes: vec![DiffFileChange {
+                    path: "src/auth.rs".to_string(),
+                    old_path: None,
+                    change_kind: DiffFileChangeKind::Modified,
+                    additions: Some(1),
+                    deletions: Some(0),
+                    hunks: vec![],
+                    patch_id: None,
+                }],
+                repo_context_id: None,
+            },
+        )
+        .expect("diff event");
+        diff.occurred_at = chrono::Utc::now();
+        let diff_id = diff.event_id.to_string();
+
+        let events = vec![mission, diff];
+        let index = TraceIndex::build(&events).expect("index");
+        let anchor = resolve_direct_anchor(&events, &diff_id);
+        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
+
+        let step = chain
+            .steps
+            .iter()
+            .find(|step| step.event_id == diff_id)
+            .expect("diff step");
+        assert_eq!(
+            step.mission_title.as_deref(),
+            Some("Harden token refresh"),
+            "mission title must be resolved for the agent"
+        );
     }
 }

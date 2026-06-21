@@ -428,6 +428,16 @@ fn handle_explain(
             Err(_) => rel_path.trim_start_matches("./").to_string(),
         };
         brick_core::resolve_file_line_anchor(store, &repo_root, &rel, line)?
+    } else if anchor_looks_like_path(anchor) {
+        let cwd = std::env::current_dir()?;
+        let rel = match discover_repo_root(&cwd) {
+            Ok(repo_root) => match std::path::Path::new(anchor).strip_prefix(&repo_root) {
+                Ok(stripped) => stripped.to_string_lossy().into_owned(),
+                Err(_) => anchor.trim_start_matches("./").to_string(),
+            },
+            Err(_) => anchor.trim_start_matches("./").to_string(),
+        };
+        brick_core::resolve_file_anchor(&events, &rel)
     } else {
         brick_core::resolve_direct_anchor(&events, anchor)
     };
@@ -444,6 +454,25 @@ fn parse_anchor_file_line(input: &str) -> Option<(String, u64)> {
         return None;
     }
     Some((path.to_string(), line))
+}
+
+/// Heuristic mirror of the MCP layer: a whole-file anchor (path, no `:line`) vs a
+/// Brick id. Lets `brick explain src/auth.rs` work without a line number.
+fn anchor_looks_like_path(input: &str) -> bool {
+    let s = input.trim();
+    if s.is_empty()
+        || s.starts_with("artifact_")
+        || s.starts_with("mission_")
+        || s.starts_with("session_")
+        || s.starts_with("org_")
+        || s.starts_with("project_")
+    {
+        return false;
+    }
+    if uuid::Uuid::parse_str(s).is_ok() {
+        return false;
+    }
+    s.contains('/') || s.contains('.')
 }
 
 fn handle_blame(

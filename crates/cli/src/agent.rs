@@ -26,7 +26,7 @@ use crate::mcp_config;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 5;
+const TEMPLATE_VERSION: u32 = 6;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -53,14 +53,22 @@ FIRST step — before drawing conclusions from the code alone — is `explain`:
 
 `brick explain <path>:<line>`
 
-It returns who changed that code, WHEN, WHY (the rationale that cannot be read
-from the code itself), what was derived from or triggered by it, and whether
-another session is editing the same file right now. The anchor can also be an
-artifact, mission, or event id.
+It returns a `causal_chain`: who changed that code, WHEN, the `mission_title`
+they did it under, what was derived from or triggered by it, and whether another
+session is editing the file right now. The anchor can also be an artifact,
+mission, or event id.
+
+**What counts as a real Brick record.** A chain step carrying an `actor_id`, a
+`mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY
+even when its `note` is null (not every change has a one-line rationale, but the
+mission it belonged to and who did it are still the reason). Only fall back to
+git/grep when `explain` returns an empty `causal_chain` or an explicit
+\"No Brick record\" note. Do NOT dismiss a populated chain as \"no record\"
+just because `note` is null.
 
 **Prefer `explain` over `grep` and `git log` for understanding existing code.**
-git log / git blame / grep are a FALLBACK, used only when `brick explain` reports
-no record for that code.
+git log / git blame / grep are a FALLBACK, used only when `explain` truly has no
+record for that code.
 
 ### After you change code
 
@@ -68,12 +76,7 @@ When you finish a non-trivial change, record WHY so the next agent (or you, in
 three months) can recover your reasoning. If your tool exposes Brick over MCP,
 call the `link` tool with a one-line `note` (and a `cause` anchor + `relation`
 when the change was prompted by other code). The `explain` and `link` MCP tools
-are the primary write/read surface.
-
-### Investigate with explain, not git
-
-`git log` / `git blame` / `grep` are a FALLBACK for understanding existing code,
-used only when `brick explain` reports no record. Reach for `explain` first.";
+are the primary write/read surface.";
 
 /// One memory file to act on, resolved from a target + scope.
 #[derive(Debug, Clone)]

@@ -541,6 +541,56 @@ fn explain_file_line_resolves_who_via_blame() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// Regression for live Claude testing: an agent very often anchors on a whole
+/// file (no `:line`) — `explain src/main.rs`. That must resolve to the file's
+/// change events with the WHO + `mission_title`, NOT report "No Brick record"
+/// (which wrongly pushed the agent back to git), and the chain must not be empty.
+#[test]
+fn explain_whole_file_anchor_resolves_without_no_record() {
+    let w = world(
+        "explain-wholefile",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+
+    // Whole-file anchor: no line number.
+    let chain = w.explain("src/main.rs");
+    assert_eq!(
+        chain["anchor"]["kind"].as_str(),
+        Some("file"),
+        "whole-file anchor must resolve as kind=file: {chain}"
+    );
+    assert!(
+        !chain["anchor"]["resolved_events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "whole-file anchor must resolve to the file's change events: {chain}"
+    );
+    assert!(
+        chain.get("note").is_none()
+            || !chain["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No Brick record"),
+        "a tracked file must NOT report 'No Brick record': {chain}"
+    );
+    let step = step_for_actor(&chain, "codex-bot")
+        .unwrap_or_else(|| panic!("whole-file chain missing codex-bot step: {chain}"));
+    assert_eq!(
+        step["mission_title"].as_str(),
+        Some("m"),
+        "step must carry the human mission_title: {step}"
+    );
+
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 #[test]
 fn explain_survives_commit_via_per_file_patch_id() {
     let w = world(
