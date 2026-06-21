@@ -167,22 +167,26 @@ fn link_tool() -> Value {
 recover your reasoning with `explain`. Call this after a non-trivial edit. Two \
 forms: (1) a standalone rationale — just a `note` explaining the change (e.g. \
 'token refresh had a concurrency race; serialized it'); (2) a causal edge — set \
-`cause` to the anchor that prompted this change (a `path:line`, artifact, \
-mission, or event id) and pick a `relation`. The effect is the code you just \
-changed: give its `effect` anchor (`path:line`) or omit it to use your most \
-recent captured change.",
+`cause` to the anchor that prompted this change (a `path`, `path:line`, \
+artifact, mission, or event id) and pick a `relation`. The effect is the code \
+you just changed: give its `effect` anchor (a `path` or `path:line`), or omit \
+`effect` to auto-capture your current uncommitted changes and bind the reason \
+to exactly those files. Tip: if you made several unrelated edits, commit (or \
+link) between them so each reason binds to the right files.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "effect": {
                     "type": "string",
-                    "description": "Anchor for the change you just made (`path:line`, \
-or an event id). Omit to bind to your most recently captured diff."
+                    "description": "Anchor for the change you just made: a file \
+`path`, a `path:line`, or an event id. Omit to auto-capture your current \
+uncommitted changes (all touched files) and bind the reason to them."
                 },
                 "cause": {
                     "type": "string",
-                    "description": "Optional anchor that caused this change (`path:line`, \
-artifact, mission, or event id). Omit for a standalone rationale."
+                    "description": "Optional anchor that caused this change (a \
+`path`, `path:line`, artifact, mission, or event id). Omit for a standalone \
+rationale."
                 },
                 "relation": {
                     "type": "string",
