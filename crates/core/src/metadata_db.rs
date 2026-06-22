@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Current schema version for the unified metadata database.
-pub const METADATA_DB_SCHEMA_VERSION: u16 = 5;
+pub const METADATA_DB_SCHEMA_VERSION: u16 = 6;
 
 const METADATA_KEY_SCHEMA_VERSION: &str = "schema_version";
 const METADATA_KEY_RESET_AT: &str = "reset_at";
@@ -591,6 +591,58 @@ impl MetadataDb {
     /// Reads one source-profile row by source ID.
     pub fn get_source_profile(&self, source_id: &str) -> Result<Option<SourceProfileRecord>> {
         read_source_profile(&self.connection, source_id)
+    }
+
+    /// Reads the incremental-index watermark for a source: `(last_indexed_updated_at,
+    /// last_refreshed_at)`. `None` means the source has never been indexed — the
+    /// caller does a first full scan. `last_indexed_updated_at` is the high-water
+    /// `updated_at` already indexed; `last_refreshed_at` powers the persistent,
+    /// cross-process refresh throttle.
+    pub fn get_source_watermark(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<(Option<String>, String)>> {
+        self.connection
+            .query_row(
+                "SELECT last_indexed_updated_at, last_refreshed_at
+                 FROM source_index_watermark WHERE source_id = ?1",
+                params![source_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .context("failed to read source index watermark")
+    }
+
+    /// Upserts a source's incremental-index watermark. Pass the highest
+    /// `updated_at` indexed this pass as `last_indexed_updated_at` (or `None` to
+    /// leave it unset on a no-op pass) and the refresh moment as `last_refreshed_at`.
+    pub fn set_source_watermark(
+        &mut self,
+        source_id: &str,
+        last_indexed_updated_at: Option<&str>,
+        last_refreshed_at: &str,
+    ) -> Result<()> {
+        // COALESCE keeps a prior high-water mark when this pass indexed nothing
+        // (last_indexed_updated_at = NULL) so a quiet refresh never rewinds it.
+        self.connection.execute(
+            "INSERT INTO source_index_watermark (source_id, last_indexed_updated_at, last_refreshed_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(source_id) DO UPDATE SET
+                 last_indexed_updated_at = COALESCE(excluded.last_indexed_updated_at, source_index_watermark.last_indexed_updated_at),
+                 last_refreshed_at = excluded.last_refreshed_at",
+            params![source_id, last_indexed_updated_at, last_refreshed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Clears a source's watermark so the next refresh does a full re-scan.
+    /// Backs `brick history refresh --full`.
+    pub fn clear_source_watermark(&mut self, source_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM source_index_watermark WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        Ok(())
     }
 
     /// Inserts a running source-scan row and returns its generated ID.
@@ -1205,6 +1257,11 @@ fn create_schema(connection: &Connection) -> Result<()> {
              PRIMARY KEY (brick_session_id, source_session_id),
              FOREIGN KEY(source_session_id) REFERENCES source_sessions(source_session_id) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS source_index_watermark (
+             source_id TEXT PRIMARY KEY,
+             last_indexed_updated_at TEXT,
+             last_refreshed_at TEXT NOT NULL
+         );
          CREATE INDEX IF NOT EXISTS idx_source_sessions_source ON source_sessions(source_id, last_seen_at);
          CREATE INDEX IF NOT EXISTS idx_source_sessions_path ON source_sessions(source_path);
          CREATE INDEX IF NOT EXISTS idx_source_sessions_repo_path ON source_sessions(source_id, repo_path);
@@ -1476,6 +1533,7 @@ fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> Fil
         actor_type,
         evidence_kind: FileSessionBlameEvidenceKind::SourceMetadata,
         last_seen_at: record.last_seen_at.to_rfc3339(),
+        title: record.title.clone().or_else(|| record.name.clone()),
         lines_added: record.lines_added,
         lines_removed: record.lines_removed,
         files_changed: record.files_changed,

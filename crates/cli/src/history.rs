@@ -1609,10 +1609,14 @@ pub(crate) fn refresh_profiles_to_metadata(
     let mut totals = RefreshStats::default();
     for profile in profiles {
         metadata_db.upsert_source_profile(&source_profile_upsert(profile))?;
+        // Incremental: only scan sessions newer than the last indexed high-water
+        // mark. First run (no watermark) → `since = None` → full scan.
+        let watermark = metadata_db.get_source_watermark(&profile.name)?;
+        let since = watermark.as_ref().and_then(|(mark, _)| mark.clone());
         let scan_id = metadata_db.begin_source_scan(&profile.name)?;
-        let profile_stats = refresh_single_profile(metadata_db, profile, limit);
+        let profile_stats = refresh_single_profile(metadata_db, profile, limit, since.as_deref());
         match &profile_stats {
-            Ok(stats) => {
+            Ok((stats, max_updated_at)) => {
                 metadata_db.finish_source_scan(
                     scan_id,
                     SourceScanStatus::Completed,
@@ -1621,6 +1625,14 @@ pub(crate) fn refresh_profiles_to_metadata(
                         "reindexed": stats.reindexed,
                         "skipped": stats.skipped,
                     })),
+                )?;
+                // Advance the watermark: `last_indexed_updated_at` to the batch max
+                // (None leaves the prior mark intact via COALESCE), `last_refreshed_at`
+                // to now for the persistent cross-process throttle.
+                metadata_db.set_source_watermark(
+                    &profile.name,
+                    max_updated_at.as_deref(),
+                    &Utc::now().to_rfc3339(),
                 )?;
                 totals.merge(*stats);
             }
@@ -1637,15 +1649,92 @@ pub(crate) fn refresh_profiles_to_metadata(
     Ok(totals)
 }
 
+/// Minimum gap between two automatic refreshes of the same repo's sources.
+/// Consecutive `explain`/`link` calls (even across separate CLI processes) must
+/// not re-scan every time; this throttle keeps the auto-refresh cheap while
+/// staying near-real-time. Persisted in `source_index_watermark.last_refreshed_at`
+/// so it survives process exit — the old in-process `OnceLock` was useless for
+/// the CLI, where every invocation is a fresh process.
+const AUTO_REFRESH_THROTTLE_SECS: i64 = 10;
+
+/// Refreshes the metadata index for every source profile bound to `repo_root`,
+/// so `explain`/`link` always read a near-real-time view without the user ever
+/// running a CLI refresh. Best-effort by contract: any failure (unreadable
+/// source, locked db, missing profiles) is swallowed so the caller's read still
+/// succeeds with whatever is already indexed. Throttled via the persistent
+/// per-source watermark so repeated calls — even back-to-back CLI processes —
+/// do not re-scan within the throttle window.
+pub(crate) fn refresh_repo_sources_best_effort(repo_root: &Path) {
+    let _ = refresh_repo_sources(repo_root);
+}
+
+/// Inner fallible body of [`refresh_repo_sources_best_effort`]; errors are
+/// reported to the caller (the wrapper discards them).
+fn refresh_repo_sources(repo_root: &Path) -> Result<()> {
+    // Zero-config: prefer explicitly configured profiles, but when none exist
+    // (the user never ran a setup command — the common case), auto-discover the
+    // AI-tool sources present on this machine and index those. Nothing is written
+    // into the repo; discovery is read-only path probing.
+    let mut profiles = SourceProfileStore::new(repo_root.to_path_buf()).list_profiles()?;
+    if profiles.is_empty() {
+        profiles = brick_core::discover_sources()
+            .iter()
+            .map(crate::source::profile_from_discovered_source)
+            .collect();
+    }
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    let mut metadata_db = MetadataDb::open_global()?;
+    // Persistent throttle: drop any source refreshed within the throttle window,
+    // keyed by `source_index_watermark.last_refreshed_at`. This is what makes a
+    // back-to-back `explain` cheap across separate CLI processes (the old
+    // in-process throttle never fired for the CLI). Profiles with no watermark
+    // (never indexed) always pass through for their first full scan.
+    let now = Utc::now();
+    let due: Vec<SourceProfile> = profiles
+        .into_iter()
+        .filter(|profile| match metadata_db.get_source_watermark(&profile.name) {
+            Ok(Some((_, last_refreshed_at))) => {
+                DateTime::parse_from_rfc3339(&last_refreshed_at)
+                    .map(|last| {
+                        now.signed_duration_since(last.with_timezone(&Utc)).num_seconds()
+                            >= AUTO_REFRESH_THROTTLE_SECS
+                    })
+                    .unwrap_or(true)
+            }
+            _ => true,
+        })
+        .collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    refresh_profiles_to_metadata(&mut metadata_db, &due, SOURCE_INDEX_REFRESH_LIMIT)?;
+    Ok(())
+}
+
 fn refresh_single_profile(
     metadata_db: &mut MetadataDb,
     profile: &SourceProfile,
     limit: usize,
-) -> Result<RefreshStats> {
+    since: Option<&str>,
+) -> Result<(RefreshStats, Option<String>)> {
     let mut stats = RefreshStats::default();
+    // High-water `updated_at` seen this pass; advances the source watermark so the
+    // next refresh only scans sessions newer than this.
+    let mut max_updated_at: Option<String> = None;
     record_source_roots(metadata_db, profile)?;
-    for session in list_source_sessions(profile, Some(limit))? {
+    for session in brick_core::list_source_sessions_since(profile, Some(limit), since)? {
         stats.scanned += 1;
+        if let Some(updated) = session.session_updated_at.map(system_time_to_utc) {
+            let updated = updated.to_rfc3339();
+            if max_updated_at
+                .as_deref()
+                .is_none_or(|current| updated.as_str() > current)
+            {
+                max_updated_at = Some(updated);
+            }
+        }
         let repo_path = session
             .repo_path
             .as_ref()
@@ -1679,7 +1768,7 @@ fn refresh_single_profile(
     for plan in list_source_plans(profile)? {
         metadata_db.upsert_source_plan_with_edges(&plan)?;
     }
-    Ok(stats)
+    Ok((stats, max_updated_at))
 }
 
 /// Records the native scan roots a profile reads from into source_roots.

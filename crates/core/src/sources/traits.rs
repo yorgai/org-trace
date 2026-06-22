@@ -27,13 +27,26 @@ pub fn list_source_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
+    list_source_sessions_since(profile, limit, None)
+}
+
+/// Like [`list_source_sessions`] but with an optional `since` watermark (RFC3339)
+/// for incremental refresh. Only ORGII (the multi-GB SQLite source where a full
+/// re-scan is expensive) honors `since` today; every other provider ignores it
+/// and returns its newest `limit` sessions, relying on the refresh layer's
+/// per-session fingerprint skip to avoid redundant upserts.
+pub fn list_source_sessions_since(
+    profile: &SourceProfile,
+    limit: Option<usize>,
+    since: Option<&str>,
+) -> Result<Vec<NativeSourceSession>> {
     let mut sessions = match profile.name.as_str() {
         SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit),
         SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit),
         SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit),
         SOURCE_OPENCODE => opencode::list_sessions(profile, limit),
         SOURCE_WINDSURF => windsurf::list_sessions(profile, limit),
-        SOURCE_ORGII => orgii::list_sessions(profile, limit),
+        SOURCE_ORGII => orgii::list_sessions(profile, limit, since),
         SOURCE_GEMINI => gemini::list_sessions(profile, limit),
         _ => list_native_source_sessions(profile, limit),
     }?;

@@ -154,10 +154,18 @@ pub fn source_sessions_to_steps(
             .rsplit('/')
             .next()
             .unwrap_or(row.file_path.as_str());
+        // A session-specific `what`: prefer the session's human title so two
+        // sessions that touched the same file read differently ("Cache git status
+        // — touched lib.rs" vs "Fix auth race — touched lib.rs"). Fall back to the
+        // old generic phrasing only when no title was indexed.
+        let what = match row.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(title) => format!("{title} — touched {file_name}"),
+            None => format!("touched {file_name} in {source} session"),
+        };
         steps.push(CausalStep {
             event_id,
             event_type: EVENT_TYPE_SOURCE_SESSION.to_string(),
-            what: Some(format!("touched {file_name} in {source} session")),
+            what: Some(what),
             actor_type: row.actor_type.clone(),
             actor_id: row.actor_id.clone().or_else(|| Some(source.clone())),
             session_id: (!external.is_empty()).then(|| external.clone()),
@@ -176,6 +184,53 @@ pub fn source_sessions_to_steps(
         });
     }
     steps
+}
+
+/// Merges metadata source-session steps into an existing JSONL causal chain,
+/// producing one unified timeline instead of an either/or fallback.
+///
+/// Why this exists: a file's history is commonly *interleaved* — some changes
+/// were `link`ed into the JSONL ledger (the authoritative half) and some were
+/// only seen by an external tool's session db (the indexed half). A naive
+/// "use JSONL if non-empty, else metadata" drops every un-`link`ed change that
+/// happens to sit next to a `link`ed one. This merges both.
+///
+/// Dedup key is `session_id`: a session that was BOTH `link`ed and indexed
+/// appears in both sources, so any `source_steps` whose `session_id` already
+/// appears among `chain_steps` is dropped (the JSONL version carries more — an
+/// explicit note, mission, relation). When a JSONL step has NO `session_id`
+/// (the `link` call omitted `session`), we deliberately do NOT fuzzy-match:
+/// keeping a possible duplicate is correct, silently dropping a real change is
+/// not. Such pairs are still distinguishable by `confidence` (explicit vs
+/// observed).
+///
+/// Ordering note: JSONL `occurred_at` is the moment the change happened, but a
+/// source-session step's `occurred_at` is `last_seen_at` — when the indexer last
+/// scanned it, NOT the change moment. Mixing them is acceptable (external
+/// sessions only ever carry coarse time) but means a source step can sort later
+/// than its true position. The sort is stable, so for equal timestamps the
+/// JSONL step (inserted first) stays ahead of the metadata step.
+pub fn merge_source_steps_into(chain_steps: &mut Vec<CausalStep>, source_steps: Vec<CausalStep>) {
+    let linked_session_ids: HashSet<String> = chain_steps
+        .iter()
+        .filter_map(|step| step.session_id.clone())
+        .collect();
+    for step in source_steps {
+        let already_linked = step
+            .session_id
+            .as_ref()
+            .is_some_and(|id| linked_session_ids.contains(id));
+        if already_linked {
+            continue;
+        }
+        chain_steps.push(step);
+    }
+    // One unified timeline: stable-sort by occurred_at, then renumber depth so it
+    // stays a contiguous 0..N distance-from-anchor sequence after the merge.
+    chain_steps.sort_by(|a, b| a.occurred_at.cmp(&b.occurred_at));
+    for (depth, step) in chain_steps.iter_mut().enumerate() {
+        step.depth = depth;
+    }
 }
 
 /// Resolves a direct (non-file) anchor string to its starting event-ids.
@@ -1059,6 +1114,7 @@ mod tests {
             actor_type: Some("agent".to_string()),
             evidence_kind: crate::FileSessionBlameEvidenceKind::SourceMetadata,
             last_seen_at: "2026-06-20T10:00:00+00:00".to_string(),
+            title: None,
             lines_added: Some(3),
             lines_removed: Some(1),
             files_changed: Some(1),
@@ -1108,5 +1164,93 @@ mod tests {
     #[test]
     fn source_sessions_to_steps_empty_input_is_empty() {
         assert!(source_sessions_to_steps(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn source_sessions_to_steps_what_uses_title_when_present() {
+        let mut row = blame_row("orgii", "s1", "/repo/src/types.ts", "/repo");
+        row.title = Some("Cache git status lookups".to_string());
+        let steps = source_sessions_to_steps(&[row], 0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].what.as_deref(),
+            Some("Cache git status lookups — touched types.ts"),
+            "a session with a title must get a title-based what"
+        );
+    }
+
+    #[test]
+    fn source_sessions_to_steps_what_falls_back_without_title() {
+        // blame_row leaves title None → generic phrasing.
+        let row = blame_row("orgii", "s2", "/repo/src/types.ts", "/repo");
+        let steps = source_sessions_to_steps(&[row], 0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].what.as_deref(),
+            Some("touched types.ts in orgii session"),
+            "no title → fall back to the generic phrasing"
+        );
+    }
+
+    /// Builds a minimal CausalStep for merge tests.
+    fn step(event_id: &str, session_id: Option<&str>, occurred_at: &str, confidence: &str) -> CausalStep {
+        CausalStep {
+            event_id: event_id.to_string(),
+            event_type: "test".to_string(),
+            what: None,
+            actor_type: None,
+            actor_id: None,
+            session_id: session_id.map(ToOwned::to_owned),
+            mission_id: None,
+            mission_title: None,
+            occurred_at: occurred_at.to_string(),
+            relation: None,
+            note: None,
+            confidence: confidence.to_string(),
+            transcript: None,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn merge_interleaves_linked_and_source_steps_by_time() {
+        // The exact bug the merge fixes: change 1 (source only) → change 2
+        // (linked) → change 3 (source only). The old fill-if-empty fallback
+        // dropped 1 and 3 because the chain already had the linked step 2.
+        let mut chain = vec![step("link-2", Some("s2"), "2026-06-22T10:02:00Z", "explicit")];
+        let source = vec![
+            step("source-session:codex:s1", Some("s1"), "2026-06-22T10:01:00Z", "observed"),
+            step("source-session:codex:s3", Some("s3"), "2026-06-22T10:03:00Z", "observed"),
+        ];
+        merge_source_steps_into(&mut chain, source);
+        let order: Vec<&str> = chain.iter().map(|s| s.event_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["source-session:codex:s1", "link-2", "source-session:codex:s3"],
+            "all three changes must appear, time-ordered"
+        );
+        // depth renumbered contiguously 0..N.
+        assert_eq!(chain.iter().map(|s| s.depth).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn merge_dedups_source_step_already_linked_by_session_id() {
+        // The same session was BOTH linked and indexed — keep the richer linked
+        // version, drop the source duplicate.
+        let mut chain = vec![step("link-a", Some("sA"), "2026-06-22T10:00:00Z", "explicit")];
+        let source = vec![step("source-session:codex:sA", Some("sA"), "2026-06-22T10:00:00Z", "observed")];
+        merge_source_steps_into(&mut chain, source);
+        assert_eq!(chain.len(), 1, "duplicate session must be deduped");
+        assert_eq!(chain[0].event_id, "link-a");
+    }
+
+    #[test]
+    fn merge_keeps_both_when_linked_step_has_no_session_id() {
+        // link without a `session` arg → no session_id → no fuzzy dedup; keep
+        // both rather than risk dropping a real change.
+        let mut chain = vec![step("link-x", None, "2026-06-22T10:00:00Z", "explicit")];
+        let source = vec![step("source-session:codex:sX", Some("sX"), "2026-06-22T10:00:30Z", "observed")];
+        merge_source_steps_into(&mut chain, source);
+        assert_eq!(chain.len(), 2, "no session_id means no dedup — keep both");
     }
 }

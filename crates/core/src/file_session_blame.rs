@@ -55,6 +55,10 @@ pub struct FileSessionBlameRow {
     pub actor_type: Option<String>,
     pub evidence_kind: FileSessionBlameEvidenceKind,
     pub last_seen_at: String,
+    /// The session's human title (ORGII session name / first user prompt, etc.),
+    /// surfaced so `explain` can describe WHAT a session was about instead of a
+    /// generic "touched <file>".
+    pub title: Option<String>,
     pub lines_added: Option<u64>,
     pub lines_removed: Option<u64>,
     pub files_changed: Option<u64>,
