@@ -26,7 +26,7 @@ use crate::mcp_config;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 6;
+const TEMPLATE_VERSION: u32 = 7;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -55,8 +55,9 @@ FIRST step — before drawing conclusions from the code alone — is `explain`:
 
 It returns a `causal_chain`: who changed that code, WHEN, the `mission_title`
 they did it under, what was derived from or triggered by it, and whether another
-session is editing the file right now. The anchor can also be an artifact,
-mission, or event id.
+session is editing the file right now. To understand a whole block at once, pass
+a line range: `brick explain <path>:<start>-<end>` (e.g. `src/auth.rs:10-20`).
+The anchor can also be a whole file, an artifact, mission, or event id.
 
 **What counts as a real Brick record.** A chain step carrying an `actor_id`, a
 `mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY

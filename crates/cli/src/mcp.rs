@@ -15,9 +15,10 @@ use std::str::FromStr;
 use anyhow::Result;
 use brick_core::{
     capture_diff, discover_repo_root, explain_from_events, resolve_direct_anchor,
-    resolve_file_anchor, resolve_file_line_anchor, source_sessions_to_steps, AnnouncementStore,
-    CausalChain, DiffCaptureRequest, LocalStore, MetadataDb, SourceFileSessionBlameQuery,
-    SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
+    resolve_file_anchor, resolve_file_line_anchor, resolve_file_range_anchor,
+    source_sessions_to_steps, AnnouncementStore, CausalChain, DiffCaptureRequest, LocalStore,
+    MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH,
+    MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -140,19 +141,21 @@ be read from the code), what was derived from / triggered by it, each step's \
 confidence (explicit > observed > inferred), a transcript pointer per step, and \
 a `live` field warning if another session is editing the same file right now. \
 This subsumes line-level blame (WHO) into the WHY answer. Anchor can be a \
-`path:line` (e.g. `/abs/workspace/src/auth.rs:42`), an `artifact_*` id, a \
-`mission_*` id, or an event id. Prefer an ABSOLUTE path — the server may run \
-from a different working directory than your workspace, and an absolute anchor \
-always resolves the right repo.",
+`path:line` (e.g. `/abs/workspace/src/auth.rs:42`), a `path:start-end` line \
+range to explain a whole block at once (e.g. `/abs/workspace/src/auth.rs:10-20`), \
+a whole-file `path`, an `artifact_*` id, a `mission_*` id, or an event id. Prefer \
+an ABSOLUTE path — the server may run from a different working directory than \
+your workspace, and an absolute anchor always resolves the right repo.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "anchor": {
                     "type": "string",
-                    "description": "What to explain: a `path:line` or whole-file \
-`path` (use an ABSOLUTE path, e.g. `/abs/workspace/src/auth.rs:42`, so it \
-resolves regardless of the server's working directory), an artifact id, a \
-mission id, or an event id."
+                    "description": "What to explain: a `path:line`, a `path:start-end` \
+line range (e.g. `/abs/ws/src/auth.rs:10-20`, to get every change that touched \
+that block), a whole-file `path` (use an ABSOLUTE path, e.g. \
+`/abs/workspace/src/auth.rs:42`, so it resolves regardless of the server's \
+working directory), an artifact id, a mission id, or an event id."
                 },
                 "depth": {
                     "type": "integer",
@@ -515,10 +518,16 @@ is fine here."
     let events = store.read_all_events()?;
     let index = store.load_or_rebuild_index()?;
 
-    // file:line anchors need git + the working tree; direct ids do not.
-    let (anchor, anchored_path, is_file_line) = if let Some((path, line)) =
-        parse_file_line(&anchor_input)
+    // file:line and file:start-end anchors need git + the working tree; direct
+    // ids do not.
+    let (anchor, anchored_path, is_file_line) = if let Some((path, start, end)) =
+        parse_file_range(&anchor_input)
     {
+        let repo_root = store.repo_root().to_path_buf();
+        let rel_path = normalize_repo_relative(&repo_root, &path);
+        let anchor = resolve_file_range_anchor(store, &repo_root, &rel_path, start, end)?;
+        (anchor, Some(rel_path), true)
+    } else if let Some((path, line)) = parse_file_line(&anchor_input) {
         let repo_root = store.repo_root().to_path_buf();
         let rel_path = normalize_repo_relative(&repo_root, &path);
         let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
@@ -989,6 +998,20 @@ fn parse_file_line(input: &str) -> Option<(String, u64)> {
         return None;
     }
     Some((path.to_string(), line))
+}
+
+/// Parses a `path:start-end` line-RANGE anchor (e.g. `src/auth.rs:10-20`).
+/// Returns `None` for a bare path, a single `path:line` (handled by
+/// [`parse_file_line`]), or a malformed range. Tolerates `end < start`.
+fn parse_file_range(input: &str) -> Option<(String, u64, u64)> {
+    let (path, span) = input.rsplit_once(':')?;
+    if path.is_empty() {
+        return None;
+    }
+    let (start, end) = span.trim().split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some((path.to_string(), start, end))
 }
 
 /// Heuristic: does the anchor look like a file path rather than an id? Brick ids

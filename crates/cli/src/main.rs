@@ -420,9 +420,21 @@ fn handle_explain(
     let index = store.load_or_rebuild_index()?;
     let depth = depth.unwrap_or(brick_core::DEFAULT_EXPLAIN_DEPTH);
 
-    let (resolved, anchored_path, is_file_line) = if let Some((rel_path, line)) =
-        parse_anchor_file_line(anchor)
+    let (resolved, anchored_path, is_file_line) = if let Some((rel_path, start, end)) =
+        parse_anchor_file_range(anchor)
     {
+        let cwd = std::env::current_dir()?;
+        let repo_root = discover_repo_root(&cwd)?;
+        let rel = match std::path::Path::new(&rel_path).strip_prefix(&repo_root) {
+            Ok(stripped) => stripped.to_string_lossy().into_owned(),
+            Err(_) => rel_path.trim_start_matches("./").to_string(),
+        };
+        (
+            brick_core::resolve_file_range_anchor(store, &repo_root, &rel, start, end)?,
+            Some(rel),
+            true,
+        )
+    } else if let Some((rel_path, line)) = parse_anchor_file_line(anchor) {
         let cwd = std::env::current_dir()?;
         let repo_root = discover_repo_root(&cwd)?;
         let rel = match std::path::Path::new(&rel_path).strip_prefix(&repo_root) {
@@ -473,6 +485,18 @@ fn parse_anchor_file_line(input: &str) -> Option<(String, u64)> {
         return None;
     }
     Some((path.to_string(), line))
+}
+
+/// Parses a `path:start-end` line-range anchor into `(path, start, end)`.
+fn parse_anchor_file_range(input: &str) -> Option<(String, u64, u64)> {
+    let (path, span) = input.rsplit_once(':')?;
+    if path.is_empty() {
+        return None;
+    }
+    let (start, end) = span.trim().split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some((path.to_string(), start, end))
 }
 
 /// Heuristic mirror of the MCP layer: a whole-file anchor (path, no `:line`) vs a

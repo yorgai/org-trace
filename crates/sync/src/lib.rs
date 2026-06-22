@@ -25,6 +25,12 @@ const DEFAULT_REMOTE: &str = "http://127.0.0.1:7821";
 const PULL_PAGE_LIMIT: usize = 500;
 
 /// Handles `push` by posting queued events without draining the local queue.
+///
+/// Upload is account-scoped: the queued events are sent with the logged-in
+/// user's Supabase bearer token so the server can attribute them to the account
+/// (and its org) for org-scope blame. Refuses to push when not logged in —
+/// uploading is the registered-tier feature, distinct from the always-free local
+/// recorder.
 pub fn handle_push(
     store: &LocalStore,
     dry_run: bool,
@@ -41,8 +47,15 @@ pub fn handle_push(
         return Ok(());
     }
 
+    // Account-scoped upload: refresh the token if needed and send it as the
+    // bearer so the server attributes events to this user/org. Without this the
+    // login → upload → org-blame pipeline is not actually connected.
+    let identity = identity::refresh_if_needed()
+        .context("upload requires a Brick account. Run `brick login` first")?;
+
     let request = PushEventsRequest { events };
-    let response = push_events_to_remote(&remote, repo_id.as_deref(), &request)?;
+    let response =
+        push_events_to_remote(&remote, repo_id.as_deref(), &request, Some(&identity.access_token))?;
     print_push_result(&response, request.events.len());
     Ok(())
 }
@@ -158,10 +171,14 @@ fn push_events_to_remote(
     remote: &str,
     repo_id: Option<&str>,
     request: &PushEventsRequest,
+    bearer: Option<&str>,
 ) -> Result<PushEventsResponse> {
     let url = events_url(remote, repo_id);
-    let mut response = ureq::post(&url)
-        .header("content-type", "application/json")
+    let mut builder = ureq::post(&url).header("content-type", "application/json");
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", &format!("Bearer {token}"));
+    }
+    let mut response = builder
         .send_json(request)
         .with_context(|| format!("failed to POST events to {url}"))?;
     response
@@ -279,5 +296,16 @@ mod tests {
             .read_inbound_events()
             .expect("read inbound")
             .is_empty());
+    }
+
+    #[test]
+    fn push_dry_run_does_not_require_login() {
+        // A dry-run push must work for anyone (it makes no network call and sends
+        // no token), so it returns Ok even with no identity on disk.
+        let repo_root = temp_repo_root("dry-run-push");
+        let store = LocalStore::new(&repo_root);
+        store.append_event(&event("queued")).expect("append");
+        let result = handle_push(&store, true, Some("http://127.0.0.1:7821".to_string()), None);
+        assert!(result.is_ok(), "dry-run push must not require login: {result:?}");
     }
 }

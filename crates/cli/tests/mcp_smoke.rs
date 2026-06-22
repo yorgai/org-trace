@@ -613,6 +613,56 @@ fn explain_file_line_resolves_who_via_blame() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// A `path:start-end` line-range anchor unions the blame events across the whole
+/// block, so an agent can ask "why does this block look like this" in one call.
+#[test]
+fn explain_line_range_anchor_unions_block_events() {
+    let w = world(
+        "explain-range",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    // Agent rewrites the body, adding lines 3 and 4 inside the block.
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+
+    // A range that spans the agent's added lines resolves through blame.
+    let chain = w.explain("src/main.rs:2-4");
+    assert_eq!(
+        chain["anchor"]["kind"].as_str(),
+        Some("file_line"),
+        "range anchor is a line anchor: {chain}"
+    );
+    assert!(
+        chain["anchor"]["input"]
+            .as_str()
+            .map(|s| s.ends_with(":2-4"))
+            .unwrap_or(false),
+        "anchor input echoes the normalized range: {chain}"
+    );
+    assert!(
+        !chain["anchor"]["resolved_events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "range must resolve to at least one event: {chain}"
+    );
+    assert_eq!(
+        chain["anchor"]["blame_confidence"].as_str(),
+        Some("working"),
+        "uncommitted change → working confidence: {chain}"
+    );
+    assert!(
+        step_for_actor(&chain, "codex-bot").is_some(),
+        "range chain carries the WHO: {chain}"
+    );
+
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 /// Regression from live ORGII testing: MCP clients (Claude Code, Codex, ORGII)
 /// spawn the stdio server with `cwd=/` — NOT the agent's workspace. The store is
 /// otherwise derived from process cwd, so `cwd=/` made every `explain` crash on

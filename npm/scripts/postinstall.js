@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const { createHash } = require("crypto");
+const { spawnSync } = require("child_process");
 
 const pkg = require("../package.json");
 const REPO = "yorgai/Brick-Vault";
@@ -128,6 +129,44 @@ async function main() {
 
   fs.writeFileSync(dest, binary, { mode: 0o755 });
   console.log(`brick: installed native binary at ${dest}`);
+
+  autoConfigureAgents(dest);
+}
+
+// One-click goal: after the binary lands, wire the `explain` + `link` tools into
+// every MCP-capable coding agent on this machine (Claude Code, Codex, Cursor,
+// Gemini, Windsurf, VS Code) plus their memory files. Best-effort: a failure
+// here never fails the npm install — the user can always run it by hand. Opt out
+// with BRICK_SKIP_AGENT_INSTALL=1.
+function autoConfigureAgents(brickBin) {
+  if (process.env.BRICK_SKIP_AGENT_INSTALL === "1") {
+    console.log(
+      "brick: BRICK_SKIP_AGENT_INSTALL=1 set, skipping agent auto-config. " +
+        "Run `brick agent install --global` later to enable explain/link."
+    );
+    return;
+  }
+  try {
+    const result = spawnSync(brickBin, ["agent", "install", "--global"], {
+      stdio: "inherit",
+      timeout: 60_000,
+    });
+    if (result.status === 0) {
+      console.log(
+        "brick: configured explain + link for your coding agents (`brick agent status` to verify)."
+      );
+    } else {
+      console.warn(
+        "brick: agent auto-config did not complete. " +
+          "Run `brick agent install --global` to enable explain/link."
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `brick: agent auto-config skipped (${error.message}). ` +
+        "Run `brick agent install --global` to enable explain/link."
+    );
+  }
 }
 
 main().catch((error) => {

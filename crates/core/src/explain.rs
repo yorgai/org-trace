@@ -318,6 +318,56 @@ pub fn resolve_file_line_anchor(
     })
 }
 
+/// Resolves a `path:start-end` line-RANGE anchor: unions the blame events of
+/// every line in `[line_start, line_end]`, so an agent can ask "why does this
+/// block (lines 10-20) look like this" and get every change that touched it.
+/// Deduplicates events while preserving first-seen order (top-of-range first).
+/// `blame_confidence` is the strongest confidence seen across the range.
+pub fn resolve_file_range_anchor(
+    store: &LocalStore,
+    repo_root: &std::path::Path,
+    rel_path: &str,
+    line_start: u64,
+    line_end: u64,
+) -> anyhow::Result<ExplainAnchor> {
+    let (lo, hi) = if line_start <= line_end {
+        (line_start, line_end)
+    } else {
+        (line_end, line_start)
+    };
+    let lines = blame_file(store, repo_root, rel_path)?;
+    let mut resolved: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut best_rank = 0u8;
+    let mut best_confidence: Option<String> = None;
+    for blame in lines.iter().filter(|b| b.line_no >= lo && b.line_no <= hi) {
+        if let Some(event_id) = blame.source_event_id.clone() {
+            if seen.insert(event_id.clone()) {
+                resolved.push(event_id);
+            }
+        }
+        let conf = serde_json::to_value(blame.confidence)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string));
+        let rank = match conf.as_deref() {
+            Some("commit") => 3,
+            Some("working") => 2,
+            Some(_) => 1,
+            None => 0,
+        };
+        if rank > best_rank {
+            best_rank = rank;
+            best_confidence = conf;
+        }
+    }
+    Ok(ExplainAnchor {
+        kind: AnchorKind::FileLine,
+        input: format!("{rel_path}:{lo}-{hi}"),
+        resolved_events: resolved,
+        blame_confidence: best_confidence,
+    })
+}
+
 /// Walks the causal graph backward from `anchor`'s resolved events, returning the
 /// chain of steps (newest/anchor first) plus the anchor's forward effects.
 pub fn explain_from_events(
