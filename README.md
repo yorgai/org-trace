@@ -53,7 +53,7 @@ Open-source crates (the default `cargo build`):
 
 - `brick`: standalone CLI client (also an MCP server via `brick mcp-serve`)
 - `brick-protocol`: shared provenance event schema
-- `brick-core`: local storage, indexing, repo context, and announcements
+- `brick-core`: local storage, indexing, and repo context
 - `brick-importers`: explicit-file importers for agent transcripts and CI summaries
 
 Proprietary crates (excluded from the default build; see "Build surface" below):
@@ -214,7 +214,7 @@ The injected text lives between `<!-- brick:managed:start v=N -->` and
 `<!-- brick:managed:end -->` sentinels. Edits are confined to that region and
 written atomically, so a user's existing memory file is never clobbered;
 re-running `install` is idempotent and rolls the block forward when the template
-version changes. `brick init` offers to run this for the current repo.
+version changes. `npm install` wires this up globally on first install.
 
 ## MCP capability kit
 
@@ -254,13 +254,13 @@ tool's input/output shape and the recommended flow.
 
 ## Local storage model
 
-Local writes use append-only JSONL under `.brick/provenance/` by default. `brick init` automatically adds `.brick/` to the repository `.gitignore` idempotently, because Brick local state is not source code and should not be committed. The effective store root resolves in this order: `--store-root`, `BRICK_STORE_ROOT`, selected source profile `store_root`, then repo-local `.brick/provenance`.
+Brick is **zero-config**: there is no `brick init` and nothing is ever written into your working tree. A user has exactly one Brick home, `~/.brick` (override with `BRICK_HOME`). Each repository's append-only JSONL provenance ledger lives under `<BRICK_HOME>/repos/<repo_id>/provenance/`, where `repo_id` is derived from the repository's canonical root path. The effective store root resolves in this order: `--store-root`, `BRICK_STORE_ROOT`, selected source profile `store_root`, then the global per-repo provenance root.
 
-Repo-level behavior lives in `.brick/config.toml`; source-specific paths live in `.brick/sources/<name>.toml`. `brick init` and `brick source scan` discover common external stores such as `~/.orgii`, ORGII `sessions.db`, Cursor `state.vscdb`, Claude Code `~/.claude/projects`, Codex `sessions/`, Windsurf `state.vscdb`, and OpenCode `opencode.db`. Local Brick events default to metadata-only pointers with hashes, sizes, source paths, and availability. Full transcript or recording bytes are copied into local content-addressed blobs only when `--copy` is passed or the config/source profile opts into `default_full_evidence_upload = true`.
+Source-specific paths can be configured per repo under `<BRICK_HOME>/repos/<repo_id>/provenance/sources/<name>.toml`, but configuration is optional: when no profiles are configured, Brick auto-discovers the AI-tool stores present on this machine (such as `~/.orgii` ORGII `sessions.db`, Cursor `state.vscdb`, Claude Code `~/.claude/projects`, Codex `sessions/`, Windsurf `state.vscdb`, and OpenCode `opencode.db`) and indexes them on demand. Discovery is read-only path probing. Local Brick events default to metadata-only pointers with hashes, sizes, source paths, and availability. Full transcript or recording bytes are copied into local content-addressed blobs only when `--copy` is passed or a source profile opts into `default_full_evidence_upload = true`.
 
 `index.json`, `brick.sqlite`, and `views/` are derived indexes under the effective store. Rebuilding them never mutates the source event log. `views/` contains agent-readable Markdown files for orgs, projects, missions, sessions, and artifacts. Pull writes remote events to separate inbound logs and deduplicates them by event ID when rebuilding indexes.
 
-Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `brick history sessions`, `brick history plans`, `brick history recent-paths`, and `brick import native list/ingest` refresh native source-session or source-plan rows into that metadata index before returning results.
+Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `explain` and `link` refresh the index for the anchor's repo on every call (throttled), so an agent always reads a near-real-time view without ever running a CLI command.
 
 ## Documentation
 

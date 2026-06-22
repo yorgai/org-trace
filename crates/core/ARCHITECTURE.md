@@ -11,7 +11,7 @@ ignores these distinctions tends to introduce subtle bugs, so read this first.
                  ┌─────────────────────────────┐
    append_event  │  JSONL queue  (SOURCE OF      │   <-- the ONLY truth
    ───────────►  │  TRUTH, append-only)          │
-                 │  .brick/provenance/queue/*.jsonl
+                 │  <BRICK_HOME>/repos/<id>/.brick/provenance/queue/*.jsonl
                  └──────────────┬──────────────┘
                                 │ TraceIndex::build(read_all_events())
             ┌───────────────────┼────────────────────┐
@@ -30,8 +30,6 @@ Rules (enforced by convention, stated in each module header):
 - Two *additional* SQLite DBs have different truth semantics:
   - `metadata.sqlite` — a **rebuildable cache** of external-tool ("source")
     sessions. A schema bump triggers a full reset.
-  - `announcements.sqlite` — **authored user intent, a source of truth.** It is
-    migrated additively and never reset.
 
 ### Index loading
 
@@ -130,9 +128,10 @@ Watch for these when reading code:
   where the storage root was resolved from.
 - **"status"** — five unrelated types: `MissionStatus`, `SourceScanStatus`,
   `IndexStatus`, `QueueStatus`, `SqliteIndexStatus`. Always read the type.
-- **"claim"** — (a) an *announcement* (a session claiming "I'm working on X");
-  (b) a *negative* assertion in blame/diff docs ("does NOT claim line-level
-  authorship"). Opposite intent, same word.
+- **"claim"** — only ever a *negative* assertion in blame/diff docs ("does NOT
+  claim line-level authorship"). The old "session announcement" sense is gone
+  (the announcements/claims feature was removed; live coordination is now the
+  `live` field of an `explain` response).
 - **"record"** — (a) a DB read-DTO (`SourceSessionRecord`, `SqliteDiffRecord`,
   …); (b) the act of logging an event ("recorded", `recorded_at`).
 

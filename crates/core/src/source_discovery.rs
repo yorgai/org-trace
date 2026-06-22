@@ -1,9 +1,9 @@
 //! Built-in discovery of local agent history and evidence stores.
 //!
 //! Discovery is intentionally read-only. It builds deterministic candidate sets
-//! for known source storage locations and only reports paths that already exist
-//! so `brick init` can help users decide what to include without copying
-//! transcripts or recordings into Brick.
+//! for known source storage locations and only reports paths that already exist,
+//! so the zero-config refresh path can auto-index a machine's AI-tool sources
+//! without copying transcripts or recordings into Brick.
 
 use std::env;
 use std::path::{Path, PathBuf};

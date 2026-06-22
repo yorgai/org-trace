@@ -23,9 +23,14 @@ Windows (x64). On unsupported platforms, build from source with
 
 ## Make your agents use it
 
+`npm install` already wires Brick into every MCP-capable coding agent on your
+machine (it runs `brick agent install --global` for you). There is **no
+`brick init`** and nothing is written into your repositories — Brick is
+zero-config. To re-run or verify it by hand:
+
 ```sh
-brick init               # discover your tools' local session history
-brick agent install --global
+brick agent install --global   # idempotent; re-run after installing a new agent
+brick agent status             # see which agents are wired up
 ```
 
 `agent install` does two things, both idempotent and non-destructive:
@@ -35,20 +40,22 @@ brick agent install --global
    automatically before edits.
 2. **Pull** — registers the Brick **MCP server** (`brick mcp-serve`) into Claude
    Code (`~/.claude.json`) and Cursor (`~/.cursor/mcp.json`), so any MCP-capable
-   agent can call Brick's tools on demand: `explore_memory`, `recall_file`,
-   `search_sessions`, `read_session`.
+   agent can call Brick's two tools on demand: **`explain`** (who changed this
+   code and why) and **`link`** (record why after a change).
 
 ## Use it directly
 
 ```sh
-brick metadata recall --path src/main.rs   # who changed this file & why
-brick metadata query --query "auth race"   # find past sessions by topic
+brick explain src/main.rs:42   # who changed this line & why
+brick history sessions         # browse indexed sessions across your AI tools
 ```
 
 ## Environment variables
 
 - `BRICK_SKIP_DOWNLOAD=1` — skip the binary download on `npm install` (falls
   back to a `brick` already on your PATH).
+- `BRICK_SKIP_AGENT_INSTALL=1` — skip the automatic agent wiring on install.
+- `BRICK_HOME` — override the global Brick home (default `~/.brick`).
 
 ## License
 

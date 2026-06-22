@@ -79,7 +79,8 @@ Storage root resolution order:
 1. `--store-root`
 2. `BRICK_STORE_ROOT`
 3. selected source profile `store_root`
-4. `.brick/provenance` under the Git repository root
+4. `<BRICK_HOME>/repos/<repo_id>/provenance` (the global per-repo default;
+   `repo_id` is derived from the canonical repo root path)
 
 ### `brick-protocol`
 

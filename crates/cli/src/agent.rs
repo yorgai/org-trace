@@ -103,37 +103,6 @@ pub fn handle_agent(command: AgentCommand) -> Result<()> {
     }
 }
 
-/// Offered at the end of `brick init`: in an interactive terminal, ask whether
-/// to inject the Brick block into this repo's memory files; otherwise print a
-/// hint. Kept best-effort so init never fails on this step.
-pub fn init_prompt(dir: &Path) -> Result<()> {
-    use std::io::IsTerminal;
-
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        println!("Run `brick agent install` to make coding agents use Brick metadata.");
-        return Ok(());
-    }
-    let confirm = dialoguer::Confirm::new()
-        .with_prompt(
-            "Install Brick agent instructions into this repo's CLAUDE.md/AGENTS.md/GEMINI.md?",
-        )
-        .default(true)
-        .interact()?;
-    if !confirm {
-        return Ok(());
-    }
-    install(AgentInstallArgs {
-        target: AgentTargetArgs {
-            global: false,
-            target: AgentTargetArg::All,
-            dir: Some(dir.to_path_buf()),
-            format: AgentFormatArg::Text,
-        },
-        force: false,
-        print: false,
-    })
-}
-
 fn install(args: AgentInstallArgs) -> Result<()> {
     if args.print {
         println!("{}", managed_block());

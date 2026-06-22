@@ -5,7 +5,6 @@
 //! should remain outside this crate until the local recorder is stable.
 
 mod activity;
-mod announcement_store;
 mod attachment_store;
 mod blame;
 mod diff_capture;
@@ -33,7 +32,6 @@ mod store;
 mod store_options;
 
 pub use activity::*;
-pub use announcement_store::*;
 pub use attachment_store::*;
 pub use blame::*;
 pub use diff_capture::*;

@@ -218,7 +218,6 @@ fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         .unwrap()
         .success());
 
-    brick(&home, &repo, &["init"]);
     brick(
         &home,
         &repo,
@@ -489,7 +488,6 @@ fn world(tag: &str, seed_files: &[(&str, &str)]) -> World {
     assert!(git(&repo, &["add", "-A"]).success());
     assert!(git(&repo, &["commit", "-qm", "init"]).success());
 
-    brick(&home, &repo, &["init"]);
     let org = extract(&brick(&home, &repo, &["org", "create", "O"]), "org_id").expect("org");
     let project = extract(
         &brick(&home, &repo, &["project", "create", "--org", &org, "P"]),
@@ -766,6 +764,65 @@ fn explain_whole_file_anchor_resolves_without_no_record() {
         step["mission_title"].as_str(),
         Some("m"),
         "step must carry the human mission_title: {step}"
+    );
+
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// The merge fix: a file's history that is INTERLEAVED — a JSONL `link`/diff step
+/// AND an external tool's indexed session both touched the same file — must
+/// surface BOTH in one chain, not just the JSONL half. The old fill-if-empty
+/// fallback returned only the JSONL step and silently dropped the source session.
+#[test]
+fn explain_merges_linked_and_indexed_source_sessions() {
+    let w = world(
+        "explain-merge",
+        &[("src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    // JSONL half: codex-bot edits the file and captures a working diff bound to
+    // its session — one `causal_chain` step in the JSONL ledger.
+    std::fs::write(
+        w.repo.join("src/main.rs"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+    )
+    .unwrap();
+    w.capture_working();
+
+    // Indexed half: a SEPARATE external Codex session that also touched the same
+    // file, configured as a native source so the explain auto-refresh indexes it
+    // into metadata.sqlite under a different external session id.
+    let codex_dir = w.root.join("codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    brick(
+        &w.home,
+        &w.repo,
+        &[
+            "source", "configure", "--name", "codex_app", "--app-id", "codex_app", "--actor-id",
+            "codex-agent", "--actor-type", "agent", "--session-log-path",
+            codex_dir.to_str().unwrap(),
+        ],
+    );
+    write_codex(&codex_dir, "ext-session-1", &w.repo, "src/main.rs");
+
+    // Whole-file anchor → merge. Both halves must be present.
+    let chain = w.explain("src/main.rs");
+    let steps = chain["causal_chain"].as_array().expect("causal_chain array");
+    assert!(
+        steps.len() >= 2,
+        "interleaved history must surface both the linked and the indexed step, got {}: {chain}",
+        steps.len()
+    );
+    // The JSONL half (codex-bot working diff).
+    assert!(
+        step_for_actor(&chain, "codex-bot").is_some(),
+        "merged chain must keep the JSONL (codex-bot) step: {chain}"
+    );
+    // The indexed half (external Codex source session) — a `source.session` step.
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["event_id"].as_str().unwrap_or_default().starts_with("source-session:")),
+        "merged chain must include the indexed source-session step: {chain}"
     );
 
     let _ = std::fs::remove_dir_all(&w.root);
@@ -1537,11 +1594,14 @@ consumer OOM the process under backpressure.";
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Explicit always wins: when the repo has a real `diff.captured` (via the hook
-/// path) the index fallback must NOT fire — the genuine event chain stands.
+/// Interleaved history merges: when the repo has a real `diff.captured` + link
+/// rationale AND an indexed external session both touching the same file, explain
+/// surfaces BOTH (the explicit link note is not dropped, and the indexed session
+/// is not suppressed). The link here omits `session`, so there is no session_id
+/// to dedup on — both steps are kept by design (not-drop > not-duplicate).
 #[test]
-fn explain_prefers_real_events_over_indexed_sessions() {
-    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-explicit-wins");
+fn explain_merges_real_events_with_indexed_sessions() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-explicit-merge");
     let sid = "codex-explicit-wins-001";
     let file = "src/commands_git.rs";
     write_codex_with_final(&codex_dir, sid, &repo, file, "indexed session WHY");
@@ -1560,15 +1620,16 @@ fn explain_prefers_real_events_over_indexed_sessions() {
 
     let chain = m.call("explain", json!({ "anchor": file }));
     let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
-    // The genuine event chain stands; no synthesized source.session step appears.
-    assert!(
-        steps.iter().all(|s| s["event_type"] != "source.session"),
-        "real events must suppress the index fallback: {chain}"
-    );
+    // The explicit link note is present...
     assert!(
         steps.iter().any(|s| s["note"].as_str() == Some("explicit asserted reason")
             && s["confidence"].as_str() == Some("explicit")),
-        "explicit link note must win: {chain}"
+        "explicit link note must appear: {chain}"
+    );
+    // ...AND the indexed source session is merged in, not suppressed.
+    assert!(
+        steps.iter().any(|s| s["event_type"] == "source.session"),
+        "indexed source session must be merged in alongside the real event: {chain}"
     );
 
     drop(m);

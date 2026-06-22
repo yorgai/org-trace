@@ -85,8 +85,14 @@ pub fn resolve_storage_root(
         });
     }
 
+    // Zero-config default: the provenance ledger lives in the global Brick home
+    // (`~/.brick/repos/<repo_id>/provenance`), NOT under the user's working tree.
+    // A user has exactly one `~/.brick`; nothing is written into the repo. Falls
+    // back to a repo-local path only if the global home cannot be resolved.
+    let path = crate::repo_provenance_root(repo_root)
+        .unwrap_or_else(|_| repo_root.join(PROVENANCE_DIR));
     Ok(ResolvedStorageRoot {
-        path: repo_root.join(PROVENANCE_DIR),
+        path,
         source: StorageRootSource::RepoDefault,
     })
 }
@@ -163,7 +169,11 @@ mod tests {
         with_store_root_env(None, || {
             let resolved = resolve_storage_root(&repo_root, &StorageOptions::new())
                 .expect("resolve default store root");
-            assert_eq!(resolved.path, repo_root.join(PROVENANCE_DIR));
+            // Default is now the global per-repo provenance root, not repo-local.
+            assert_eq!(
+                resolved.path,
+                crate::repo_provenance_root(&repo_root).expect("global provenance root")
+            );
             assert_eq!(resolved.source, StorageRootSource::RepoDefault);
 
             let resolved = resolve_storage_root(

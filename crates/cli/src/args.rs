@@ -56,7 +56,6 @@ pub struct IdentityArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Init,
     Version {
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
@@ -100,34 +99,6 @@ pub enum Command {
         limit: usize,
         #[arg(long, default_value_t = 120)]
         window_secs: u64,
-        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
-        format: HistoryFormatArg,
-    },
-    /// List active work claims (alias for `announce list`).
-    Claims {
-        #[arg(long)]
-        path: Option<String>,
-        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
-        format: HistoryFormatArg,
-    },
-    /// Publish or release a work claim (alias for `announce claim`/`release`).
-    Claim {
-        /// File path or glob being claimed.
-        scope: String,
-        /// One-line note; required unless --release is set.
-        #[arg(long)]
-        message: Option<String>,
-        /// Release the claim instead of publishing it.
-        #[arg(long)]
-        release: bool,
-        #[arg(long)]
-        source: Option<String>,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long)]
-        work_dir: Option<String>,
-        #[arg(long)]
-        ttl_minutes: Option<i64>,
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
     },
@@ -198,11 +169,6 @@ pub enum Command {
         line_end: usize,
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
-    },
-    /// Publish, list, or clear active-work announcements (the bulletin board).
-    Announce {
-        #[command(subcommand)]
-        command: AnnounceCommand,
     },
     Source {
         #[command(subcommand)]
@@ -612,51 +578,6 @@ pub enum SourceCommand {
     Use {
         #[arg(long)]
         name: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AnnounceCommand {
-    /// Publish a claim: "I'm working on <scope>, here's a heads-up".
-    Claim {
-        /// File path or glob being claimed (e.g. auth.rs, crates/core/src/**/*.rs).
-        scope: String,
-        /// One-line note: what you're doing / why others should hold off.
-        #[arg(long)]
-        message: String,
-        /// Source/app id of the publisher (defaults to the global --source).
-        #[arg(long)]
-        source: Option<String>,
-        /// Publisher session id (defaults to the global --session).
-        #[arg(long)]
-        session: Option<String>,
-        /// Working dir / repo the claim is made from (defaults to cwd).
-        #[arg(long)]
-        work_dir: Option<String>,
-        /// Time-to-live in minutes before the claim auto-expires (default 240).
-        #[arg(long)]
-        ttl_minutes: Option<i64>,
-        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
-        format: HistoryFormatArg,
-    },
-    /// Remove your claims: a specific --scope, or all for the session.
-    Release {
-        #[arg(long)]
-        scope: Option<String>,
-        #[arg(long)]
-        source: Option<String>,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
-        format: HistoryFormatArg,
-    },
-    /// List active claims; with --path, only those covering that path.
-    List {
-        /// Only show claims whose scope covers this path.
-        #[arg(long)]
-        path: Option<String>,
-        #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
-        format: HistoryFormatArg,
     },
 }
 

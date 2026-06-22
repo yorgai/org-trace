@@ -28,34 +28,6 @@ pub struct RepoConfig {
     pub created_at: String,
 }
 
-fn ensure_brick_gitignore(repo_root: &Path) -> Result<()> {
-    let gitignore_path = repo_root.join(".gitignore");
-    let existing = match fs::read_to_string(&gitignore_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to read .gitignore at {}", gitignore_path.display())
-            });
-        }
-    };
-
-    if existing.lines().any(|line| line.trim() == ".brick/") {
-        return Ok(());
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gitignore_path)
-        .with_context(|| format!("failed to open .gitignore at {}", gitignore_path.display()))?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        writeln!(file).context("failed to terminate existing .gitignore line")?;
-    }
-    writeln!(file, ".brick/").context("failed to append .brick/ to .gitignore")?;
-    Ok(())
-}
-
 /// Queue health summary for status output and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueStatus {
@@ -73,10 +45,13 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
-    /// Creates a store handle with the default `.brick/provenance` storage root.
+    /// Creates a store handle with the default global provenance storage root
+    /// (`~/.brick/repos/<repo_id>/provenance`). Falls back to a repo-local path
+    /// only when the global Brick home cannot be resolved.
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
         let repo_root = repo_root.into();
-        let storage_root = repo_root.join(PROVENANCE_DIR);
+        let storage_root = crate::repo_provenance_root(&repo_root)
+            .unwrap_or_else(|_| repo_root.join(PROVENANCE_DIR));
         Self {
             repo_root,
             storage_root: storage_root.clone(),
@@ -182,8 +157,6 @@ impl LocalStore {
                 )
             })?;
         }
-
-        ensure_brick_gitignore(&self.repo_root)?;
 
         Ok(())
     }
@@ -589,34 +562,6 @@ mod tests {
         ));
         fs::create_dir_all(path.join(".git")).expect("create fake git dir");
         path
-    }
-
-    #[test]
-    fn init_adds_brick_to_gitignore_once() {
-        let repo_root = temp_repo_root("gitignore-init");
-        fs::write(repo_root.join(".gitignore"), "target\n").expect("write gitignore");
-        let store = LocalStore::new(&repo_root);
-
-        store.init().expect("init store");
-        store.init().expect("init store again");
-
-        let gitignore = fs::read_to_string(repo_root.join(".gitignore")).expect("read gitignore");
-        assert!(gitignore.lines().any(|line| line == ".brick/"));
-        assert_eq!(
-            gitignore.lines().filter(|line| *line == ".brick/").count(),
-            1
-        );
-    }
-
-    #[test]
-    fn init_creates_gitignore_when_missing() {
-        let repo_root = temp_repo_root("gitignore-missing");
-        let store = LocalStore::new(&repo_root);
-
-        store.init().expect("init store");
-
-        let gitignore = fs::read_to_string(repo_root.join(".gitignore")).expect("read gitignore");
-        assert!(gitignore.lines().any(|line| line == ".brick/"));
     }
 
     fn mission_event(title: &str) -> TraceEvent {

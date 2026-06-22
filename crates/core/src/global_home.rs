@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 
 /// Environment variable that overrides the default global Brick home.
 pub const BRICK_HOME_ENV: &str = "BRICK_HOME";
@@ -16,6 +17,9 @@ pub const DEFAULT_BRICK_HOME_DIR: &str = ".brick";
 
 /// Filename of the unified Brick metadata database.
 pub const METADATA_DB_FILE: &str = "metadata.sqlite";
+
+/// Directory under the Brick home holding per-repository provenance stores.
+pub const REPOS_DIR: &str = "repos";
 
 const HOME_ENV: &str = "HOME";
 const USERPROFILE_ENV: &str = "USERPROFILE";
@@ -40,6 +44,34 @@ pub fn metadata_db_path() -> Result<PathBuf> {
 /// Returns the metadata database path for an explicit Brick home.
 pub fn metadata_db_path_in_home(brick_home: impl AsRef<Path>) -> PathBuf {
     brick_home.as_ref().join(METADATA_DB_FILE)
+}
+
+/// Derives a stable identifier for a repository from its canonical root path.
+///
+/// Used as the directory name under `~/.brick/repos/<id>/`. Path-based so a fresh
+/// checkout with no commits still gets a stable home; the canonical path keeps a
+/// symlinked root (macOS `/var`→`/private/var`) mapping to one id. Moving or
+/// renaming the repo directory yields a new id (acceptable for the dev phase).
+pub fn repo_id_for_root(repo_root: impl AsRef<Path>) -> String {
+    let root = repo_root.as_ref();
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    // 16 hex chars (64 bits) is plenty to avoid collisions across one user's repos.
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Returns the global provenance store root for a repository:
+/// `<BRICK_HOME>/repos/<repo_id>/provenance`. This replaces the legacy
+/// repo-local `<repo>/.brick/provenance` so a user has exactly one `~/.brick`
+/// and nothing is written under their working tree.
+pub fn repo_provenance_root(repo_root: impl AsRef<Path>) -> Result<PathBuf> {
+    let id = repo_id_for_root(&repo_root);
+    Ok(resolve_brick_home()?
+        .join(REPOS_DIR)
+        .join(id)
+        .join(crate::PROVENANCE_DIR))
 }
 
 fn resolve_brick_home_with_env(value: Option<PathBuf>) -> Result<PathBuf> {

@@ -53,8 +53,8 @@ flowchart LR
         Home --> OptionalBlobs
     end
 
-    subgraph Repo[Repo-local bootstrap / provenance]
-        DotBrick[.brick/]
+    subgraph Repo[Per-repo store under the global home]
+        DotBrick["repos/&lt;repo_id&gt;/provenance/"]
         Config[config.toml<br/>sources/*.toml]
         Events[provenance/events/*.jsonl<br/>append-only ledger]
         Query[provenance/cache/index.json<br/>provenance/cache/brick.sqlite<br/>provenance/views/*.md]
@@ -67,7 +67,7 @@ flowchart LR
     Events -->|rebuild projections| Query
 ```
 
-Current implementation still keeps source profile TOML files in repo-local `.brick/`. The direction is to move source profile rows and scan state into the global metadata index while preserving repo-local bootstrap/config where useful.
+Storage is zero-config and fully under the global Brick home: there is no `brick init` and nothing is written into the working tree. Each repository's provenance ledger and derived caches live under `<BRICK_HOME>/repos/<repo_id>/provenance/`, where `repo_id` is derived from the repository's canonical root path. Source profiles are optional — when none are configured, sources are auto-discovered on demand.
 
 ## History read path
 

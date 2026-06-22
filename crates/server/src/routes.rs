@@ -111,11 +111,6 @@ struct LiveQuery {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-struct AnnouncementsQuery {
-    path: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
 struct SourceIndexRequest {
     sources: Vec<String>,
 }
@@ -136,10 +131,6 @@ pub fn build_router(
         .route("/v1/sessions", get(global_sessions))
         .route("/v1/local-history/sources", get(local_history_sources))
         .route("/v1/local-history/live", get(local_history_live))
-        .route(
-            "/v1/local-history/announcements",
-            get(local_history_announcements),
-        )
         .route(
             "/v1/local-history/source-detection",
             get(local_source_detection).post(local_source_index_selected),
@@ -379,30 +370,6 @@ async fn local_history_live(
         ],
     )
     .await
-}
-
-async fn local_history_announcements(
-    State(state): State<AppState>,
-    Query(query): Query<AnnouncementsQuery>,
-) -> std::result::Result<Json<Value>, (StatusCode, String)> {
-    let mut args = vec![
-        "list".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-    ];
-    if let Some(path) = query
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-    {
-        args.push("--path".to_string());
-        args.push(path.to_string());
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = run_local_brick_command(&state, "announce", &arg_refs).await?;
-    let value = parse_local_json(&output, "local announce command")?;
-    Ok(Json(value))
 }
 
 async fn local_source_detection(

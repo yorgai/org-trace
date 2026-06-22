@@ -154,10 +154,10 @@ for one release rather than a bare error:
 ## Storage
 
 Writes (`link`, and the planning tools) append `TraceEvent`s to the local JSONL
-log under `.brick/provenance/`; reads project that log into the rebuildable
-index. Deleting the derived index or the SQLite `causal_edges` table and
-rebuilding from JSONL reproduces every causal edge exactly — JSONL is the source
-of truth.
+log under `<BRICK_HOME>/repos/<repo_id>/provenance/`; reads project that log into
+the rebuildable index. Deleting the derived index or the SQLite `causal_edges`
+table and rebuilding from JSONL reproduces every causal edge exactly — JSONL is
+the source of truth.
 
 ## Working directory and anchors
 
@@ -199,11 +199,12 @@ started outside a git repo, the planning tools fall back to a store rooted at
 failing — writes and reads land in that same store, so a mission created over
 MCP lists straight back.
 
-The **`live` field** reads source profiles from `<repo>/.brick/sources`. Because
-the server is spawned with `cwd=/`, those profiles are resolved from the repo
-the *anchor* points at — not the process cwd — so cross-session awareness fires
-on the default absolute-anchor path. With a relative anchor and no repo from
-cwd, there is nothing to resolve and `live` is simply absent (never a crash).
+The **`live` field** reads source profiles for the repo the *anchor* points at
+(resolved under the global Brick home, with zero-config auto-discovery as a
+fallback). Because the server is spawned with `cwd=/`, profiles are resolved from
+the anchor's repo — not the process cwd — so cross-session awareness fires on the
+default absolute-anchor path. With a relative anchor and no repo from cwd, there
+is nothing to resolve and `live` is simply absent (never a crash).
 
 ## Verifying
 

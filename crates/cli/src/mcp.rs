@@ -14,10 +14,10 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    capture_diff, discover_repo_root, explain_from_events, resolve_direct_anchor,
-    resolve_file_anchor, resolve_file_line_anchor, resolve_file_range_anchor,
-    source_sessions_to_steps, AnnouncementStore, CausalChain, DiffCaptureRequest, LocalStore,
-    MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH,
+    capture_diff, discover_repo_root, explain_from_events, merge_source_steps_into,
+    resolve_direct_anchor, resolve_file_anchor, resolve_file_line_anchor,
+    resolve_file_range_anchor, source_sessions_to_steps, CausalChain, DiffCaptureRequest,
+    LocalStore, MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH,
     MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
@@ -421,16 +421,19 @@ fn handle_tool_call(
     }))
 }
 
-/// One db, one explain: when a whole-file anchor resolved to NO recorded trace
-/// events, the metadata db's indexed `source_sessions` (what codex/claude/…
-/// touched) become the causal chain. Mutates `chain` in place, injecting
-/// `observed` steps (WHY filled later from each session's turn-final message).
+/// One db, one explain: merge the metadata db's indexed `source_sessions` (what
+/// codex/claude/… touched) WITH whatever JSONL causal steps the chain already
+/// has, into one deduped, time-ordered timeline. A file's history is commonly
+/// interleaved — some changes `link`ed, some only seen by an external tool — so
+/// this is a true merge, not a fill-if-empty fallback (which dropped every
+/// un-`link`ed change adjacent to a `link`ed one). Dedup is by `session_id`;
+/// see `merge_source_steps_into`.
 ///
 /// Shared by the MCP `explain` tool and the CLI `explain` command so both behave
-/// identically. Returns `Some(n)` for a file:line anchor that had no line-level
-/// record but `n` indexed sessions touched the file — the caller surfaces a hint
-/// to retry with a whole-file anchor (file:line never pulls file-level index data
-/// into the chain, which would fake line precision).
+/// identically. Returns `Some(n)` for a file:line anchor: `n` indexed sessions
+/// touched the file, so the caller surfaces a hint to retry with a whole-file
+/// anchor (file:line never pulls file-level index data into the chain, which
+/// would fake line precision).
 pub(crate) fn merge_index_sessions_into_chain(
     chain: &mut CausalChain,
     repo_root: &std::path::Path,
@@ -438,9 +441,6 @@ pub(crate) fn merge_index_sessions_into_chain(
     is_file_line: bool,
     depth: usize,
 ) -> Option<usize> {
-    if !chain.steps.is_empty() {
-        return None;
-    }
     let rel_path = anchored_path?;
     let repo_root = repo_root.to_path_buf();
     let abs_path = if std::path::Path::new(rel_path).is_absolute() {
@@ -476,13 +476,20 @@ pub(crate) fn merge_index_sessions_into_chain(
                 .unwrap_or(false)
         })
         .collect();
+    // file:line never merges: source_sessions are file-level, so folding them into
+    // a line anchor would fake line precision. Report the count so the caller can
+    // hint "re-run with a whole-file anchor", but leave the chain untouched.
     if is_file_line {
         return (!same_repo.is_empty()).then_some(same_repo.len());
     }
-    let steps = source_sessions_to_steps(&same_repo, 0);
-    if !steps.is_empty() {
-        chain.anchor.resolved_events = steps.iter().map(|s| s.event_id.clone()).collect();
-        chain.steps = steps;
+    // Whole-file anchor: merge the indexed source sessions WITH whatever JSONL
+    // steps the chain already has, into one deduped, time-ordered timeline. This
+    // is the fix for interleaved history (link, no-link, link, …) where the old
+    // fill-if-empty fallback silently dropped the un-linked changes.
+    let source_steps = source_sessions_to_steps(&same_repo, 0);
+    if !source_steps.is_empty() {
+        merge_source_steps_into(&mut chain.steps, source_steps);
+        chain.anchor.resolved_events = chain.steps.iter().map(|s| s.event_id.clone()).collect();
     }
     None
 }
@@ -514,6 +521,11 @@ is fine here."
         }));
     };
     let store = &store;
+
+    // Zero-config freshness: refresh this repo's source index before reading, so
+    // a change the agent just made is visible without the user ever running a
+    // CLI refresh. Best-effort + throttled — never blocks or fails the read.
+    crate::history::refresh_repo_sources_best_effort(store.repo_root());
 
     let events = store.read_all_events()?;
     let index = store.load_or_rebuild_index()?;
@@ -553,11 +565,37 @@ is fine here."
         is_file_line,
         depth,
     );
+    let value = finalize_explain_chain(
+        chain,
+        store,
+        Some(profiles),
+        anchored_path.as_deref(),
+        index_session_hint,
+    )?;
+    Ok(value)
+}
+
+/// Finalizes a resolved causal chain into the JSON `explain` response, applying
+/// the enrichments that make CLI and MCP answer identically: transcript pointers,
+/// observed-rationale recovery, the `live` cross-session field, and the
+/// no-record note. Shared by `explain_tool_call` (MCP) and `handle_explain`
+/// (CLI) so the same db yields the same answer from either entry point.
+///
+/// `cwd_profiles` is the profile store built from the server's process cwd, used
+/// only as a fallback for `live` when the anchor repo has no profiles of its own;
+/// the CLI passes `None` (cwd already is the repo).
+pub(crate) fn finalize_explain_chain(
+    mut chain: CausalChain,
+    store: &LocalStore,
+    cwd_profiles: Option<&SourceProfileStore>,
+    anchored_path: Option<&str>,
+    index_session_hint: Option<usize>,
+) -> Result<Value> {
     // Resolve transcript pointers from the SAME repo the anchor resolved to, not
     // the server's process cwd (which is `/` for every MCP client) — mirrors the
     // `live` profile resolution below.
     let anchor_profiles = SourceProfileStore::new(store.repo_root().to_path_buf());
-    enrich_transcripts(&anchor_profiles, profiles, &mut chain);
+    enrich_transcripts(&anchor_profiles, cwd_profiles, &mut chain);
     // For steps that have a resolved transcript but no asserted (`explicit`) note,
     // recover the turn's final assistant message as an `observed` rationale, so
     // ingested history isn't left with WHO/WHEN but zero WHY. Never overrides an
@@ -569,33 +607,21 @@ is fine here."
     // right now, surface it so the agent avoids a cross-session edit conflict.
     // This is what replaced the standalone `sessions`/`claims` coordination tools.
     if let Some(path) = anchored_path {
-        // Source profiles live under `<repo>/.brick/sources`. The `profiles`
-        // handed in here was built from the server's process cwd, which under
-        // the universal `cwd=/` MCP-client spawn resolves to `/` and finds
-        // nothing — so `live` would silently never fire. Rebuild the profile
-        // store from the SAME repo the anchor resolved to (see `store_for_anchor`
-        // above), and only fall back to the cwd-derived `profiles` when that
-        // store has no profiles of its own. This makes `live` work for the
-        // default agent path (absolute anchor + cwd=/), exactly like explain's
-        // store resolution.
-        let anchor_profiles = SourceProfileStore::new(store.repo_root().to_path_buf());
+        // Source profiles live under `<repo>/.brick/sources`. Rebuild the profile
+        // store from the SAME repo the anchor resolved to, and only fall back to
+        // the cwd-derived profiles when that store has no profiles of its own.
+        // This makes `live` work for the default agent path (absolute anchor +
+        // cwd=/), exactly like explain's store resolution.
         let live_profiles = match anchor_profiles.list_profiles() {
             Ok(found) if !found.is_empty() => found,
-            _ => profiles.list_profiles().unwrap_or_default(),
+            _ => cwd_profiles
+                .and_then(|p| p.list_profiles().ok())
+                .unwrap_or_default(),
         };
         if !live_profiles.is_empty() {
-            if let Some(broadcast) = build_live_broadcast(&live_profiles, &path, None) {
+            if let Some(broadcast) = build_live_broadcast(&live_profiles, path, None) {
                 if let Value::Object(map) = &mut value {
                     map.insert("live".to_string(), serde_json::to_value(broadcast)?);
-                }
-            }
-        }
-        if let Ok(announce_store) = AnnouncementStore::open_global() {
-            if let Ok(claims) = announce_store.matching(&path) {
-                if !claims.is_empty() {
-                    if let Value::Object(map) = &mut value {
-                        map.insert("active_claims".to_string(), serde_json::to_value(claims)?);
-                    }
                 }
             }
         }
@@ -631,6 +657,11 @@ fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
         .unwrap_or_default();
     let resolved_store = store_for_anchor(store, &anchor_hint);
     let store = resolved_store.as_ref().unwrap_or(store);
+
+    // Keep this repo's source index fresh on write too, so a follow-up `explain`
+    // (or cause-anchor resolution here) sees the agent's latest sessions.
+    // Best-effort + throttled — never blocks or fails the write.
+    crate::history::refresh_repo_sources_best_effort(store.repo_root());
 
     let events = store.read_all_events()?;
 
@@ -1181,7 +1212,7 @@ fn relation_wire(relation: CausalRelation) -> &'static str {
 /// just not openable.
 fn enrich_transcripts(
     anchor_profiles: &SourceProfileStore,
-    cwd_profiles: &SourceProfileStore,
+    cwd_profiles: Option<&SourceProfileStore>,
     chain: &mut CausalChain,
 ) {
     // Cheap exit: if no step or forward effect carries a session id, there is
@@ -1219,11 +1250,13 @@ fn enrich_transcripts(
 /// recorded on the session.
 fn build_transcript_index(
     anchor_profiles: &SourceProfileStore,
-    cwd_profiles: &SourceProfileStore,
+    cwd_profiles: Option<&SourceProfileStore>,
 ) -> std::collections::BTreeMap<String, (String, String)> {
     let profiles = match anchor_profiles.list_profiles() {
         Ok(found) if !found.is_empty() => found,
-        _ => cwd_profiles.list_profiles().unwrap_or_default(),
+        _ => cwd_profiles
+            .and_then(|p| p.list_profiles().ok())
+            .unwrap_or_default(),
     };
     let mut index = std::collections::BTreeMap::new();
     for profile in profiles {
@@ -1311,8 +1344,7 @@ fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
 }
 
 /// Builds the actor for an MCP-authored write. MCP has no logged-in human, so
-/// the actor is the calling tool: `actor_id`/`source` arg, else `mcp`. This
-/// mirrors how `announce_work` attributes claims.
+/// the actor is the calling tool: `actor_id`/`source` arg, else `mcp`.
 fn mcp_actor(args: &Value) -> ActorRef {
     let actor_id = opt_str_arg(args, "actor_id")
         .or_else(|| opt_str_arg(args, "source"))
