@@ -41,13 +41,13 @@ pub fn list_source_sessions_since(
     since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
     let mut sessions = match profile.name.as_str() {
-        SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit),
-        SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit),
-        SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit),
-        SOURCE_OPENCODE => opencode::list_sessions(profile, limit),
-        SOURCE_WINDSURF => windsurf::list_sessions(profile, limit),
+        SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit, since),
+        SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit, since),
+        SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit, since),
+        SOURCE_OPENCODE => opencode::list_sessions(profile, limit, since),
+        SOURCE_WINDSURF => windsurf::list_sessions(profile, limit, since),
         SOURCE_ORGII => orgii::list_sessions(profile, limit, since),
-        SOURCE_GEMINI => gemini::list_sessions(profile, limit),
+        SOURCE_GEMINI => gemini::list_sessions(profile, limit, since),
         _ => list_native_source_sessions(profile, limit),
     }?;
     fill_liveness(&mut sessions);

@@ -22,10 +22,12 @@ const CLAUDE_CODE_PROVIDER_SLUG: &str = "claudecode";
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
     let mut sessions = list_file_source_sessions_with_filter(
         profile,
         limit,
+        crate::since_to_system_time(since),
         extract_jsonl_metadata,
         is_claude_transcript_file,
     )?;
@@ -533,7 +535,7 @@ mod tests {
         )
         .expect("write transcript");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list sessions");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].external_session_id, "claude-session");
@@ -561,7 +563,7 @@ mod tests {
         )
         .expect("write subagent transcript");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list sessions");
         let parent = sessions
             .iter()
             .find(|session| session.external_session_id == "parent-session")
@@ -609,7 +611,7 @@ mod tests {
         )
         .expect("write claude transcript");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list sessions");
 
         assert_eq!(sessions[0].title.as_deref(), Some("Implement feature"));
         assert_eq!(sessions[0].model.as_deref(), Some("claude-sonnet"));
@@ -634,7 +636,7 @@ mod tests {
         )
         .expect("write claude transcript");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list sessions");
 
         assert_eq!(
             sessions[0].touched_files,

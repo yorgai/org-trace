@@ -25,26 +25,114 @@ use super::jsonl::truncate_title;
 use super::shell_edits::shell_edit_targets;
 
 const GEMINI_PARSER_VERSION: &str = "gemini-chat-json-v1";
+const GEMINI_PROVIDER_SLUG: &str = "gemini";
 
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
     list_file_source_sessions_with_filter(
         profile,
         limit,
+        crate::since_to_system_time(since),
         extract_chat_metadata,
         is_gemini_chat_file,
     )
 }
 
 pub(super) fn format_chunks(
-    _external_session_id: &str,
-    _source_path: Option<&Path>,
+    external_session_id: &str,
+    source_path: Option<&Path>,
 ) -> Result<Vec<crate::ActivityChunk>> {
-    // Chunk-level transcript rendering is not implemented for Gemini yet; the
-    // metadata path (touched_files for blame) is what unblocks recall.
-    Ok(Vec::new())
+    let path = source_path.ok_or_else(|| {
+        anyhow::anyhow!("Gemini source path missing for session: {external_session_id}")
+    })?;
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read Gemini chat file {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse Gemini chat JSON {}", path.display()))?;
+
+    let mut chunks = Vec::new();
+    let mut sequence = 0_usize;
+    let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) else {
+        return Ok(chunks);
+    };
+    for message in messages {
+        let created_at = message
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let kind = message.get("type").and_then(serde_json::Value::as_str);
+        match kind {
+            Some("user") => {
+                if let Some(text) = message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    chunks.push(crate::user_message_chunk(
+                        external_session_id,
+                        GEMINI_PROVIDER_SLUG,
+                        sequence,
+                        created_at,
+                        text,
+                    ));
+                    sequence += 1;
+                }
+            }
+            Some("gemini") => {
+                if let Some(text) = message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    chunks.push(crate::assistant_message_chunk(
+                        external_session_id,
+                        GEMINI_PROVIDER_SLUG,
+                        sequence,
+                        created_at,
+                        text,
+                    ));
+                    sequence += 1;
+                }
+                for tool_call in message
+                    .get("toolCalls")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let name = tool_call
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    let call = crate::ImportedToolCall {
+                        call_id: format!("{external_session_id}-{sequence}"),
+                        raw_name: name.clone(),
+                        canonical_name: name,
+                        args: tool_call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        created_at: created_at.to_string(),
+                    };
+                    chunks.push(crate::tool_call_chunk(
+                        external_session_id,
+                        GEMINI_PROVIDER_SLUG,
+                        sequence,
+                        &call,
+                        "",
+                    ));
+                    sequence += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(chunks)
 }
 
 /// Matches Gemini chat session files: `.../chats/session-*.json`.
@@ -265,7 +353,7 @@ mod tests {
         )
         .expect("write gemini chat file");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list gemini sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list gemini sessions");
 
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
@@ -283,5 +371,39 @@ mod tests {
         );
         assert_eq!(session.files_changed, Some(3));
         assert_eq!(session.parser_version, GEMINI_PARSER_VERSION);
+    }
+
+    #[test]
+    fn format_chunks_recovers_turn_final_rationale() {
+        let root = temp_root("chunks");
+        let chats_dir = root.join("projecthash").join("chats");
+        fs::create_dir_all(&chats_dir).expect("create chats dir");
+        let session = serde_json::json!({
+            "sessionId": "s-rationale",
+            "startTime": "2025-12-12T09:20:57.219Z",
+            "lastUpdated": "2025-12-12T09:40:38.334Z",
+            "messages": [
+                { "type": "user", "content": "Make it faster", "timestamp": "2025-12-12T09:21:00Z" },
+                {
+                    "type": "gemini",
+                    "content": "I cached the result to avoid the repeated scan.",
+                    "timestamp": "2025-12-12T09:39:00Z",
+                    "toolCalls": [
+                        { "name": "write_file", "args": { "file_path": "cache.py" } }
+                    ]
+                }
+            ]
+        });
+        let file = chats_dir.join("session-2025-12-12T09-20-rationale.json");
+        fs::write(&file, session.to_string()).expect("write gemini chat");
+
+        let chunks = format_chunks("s-rationale", Some(&file)).expect("render chunks");
+        // user + assistant + tool_call = 3.
+        assert_eq!(chunks.len(), 3);
+        let final_msg = crate::select_turn_final_message(&chunks, "2025-12-12T09:40:38.334Z");
+        assert_eq!(
+            final_msg.as_deref(),
+            Some("I cached the result to avoid the repeated scan.")
+        );
     }
 }

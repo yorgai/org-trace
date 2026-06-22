@@ -29,8 +29,14 @@ struct PatchImpact {
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
-    list_file_source_sessions(profile, limit, extract_jsonl_metadata)
+    list_file_source_sessions(
+        profile,
+        limit,
+        crate::since_to_system_time(since),
+        extract_jsonl_metadata,
+    )
 }
 
 pub(super) fn format_chunks(
@@ -602,7 +608,7 @@ mod tests {
         )
         .expect("write codex transcript");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list sessions");
 
         assert_eq!(sessions[0].title.as_deref(), Some("Patch bug"));
         assert_eq!(sessions[0].model.as_deref(), Some("gpt-5"));
@@ -629,7 +635,7 @@ mod tests {
         )
         .expect("write codex apply_patch transcript");
 
-        let sessions = list_sessions(&profile(root), Some(10)).expect("list sessions");
+        let sessions = list_sessions(&profile(root), Some(10), None).expect("list sessions");
 
         assert_eq!(
             sessions[0].touched_files,

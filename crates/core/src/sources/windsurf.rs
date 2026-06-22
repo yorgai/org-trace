@@ -16,8 +16,9 @@ const WINDSURF_PROVIDER_SLUG: &str = "windsurf";
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
-    list_sessions_from_composer_data(
+    let sessions = list_sessions_from_composer_data(
         profile,
         limit,
         ComposerSessionOptions {
@@ -27,7 +28,8 @@ pub(super) fn list_sessions(
             include_context_tokens: true,
             skip_best_of_n: true,
         },
-    )
+    )?;
+    Ok(crate::filter_sessions_since(sessions, since))
 }
 
 pub(super) fn format_chunks(
@@ -133,7 +135,7 @@ mod tests {
         }
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list windsurf sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list windsurf sessions");
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].external_session_id, "windsurf-composer-1");

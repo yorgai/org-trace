@@ -45,6 +45,7 @@ struct TokenTotals {
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
     let db_path = opencode_db_path(profile)?;
     let connection = open_opencode_db(&db_path)?;
@@ -85,9 +86,21 @@ pub(super) fn list_sessions(
             session_from_row(row, &db_path, &db_metadata, &app_id, &part_tokens)
         })
         .context("failed to query OpenCode sessions")?;
+    // Incremental: `time_updated` is an epoch number (ms/seconds), not RFC3339,
+    // so rather than bind a converted param we filter the cheap metadata rows in
+    // Rust on the already-parsed `session_updated_at`. The DB read is small
+    // (session table only); the real per-session cost is in `format_chunks`,
+    // which incremental runs avoid by never re-indexing skipped sessions.
+    let since = crate::since_to_system_time(since);
     let mut sessions = Vec::new();
     for row in rows {
-        sessions.push(row?);
+        let session = row?;
+        if let (Some(since), Some(updated)) = (since, session.session_updated_at) {
+            if updated <= since {
+                continue;
+            }
+        }
+        sessions.push(session);
     }
     Ok(sessions)
 }
@@ -784,7 +797,7 @@ mod tests {
             .expect("create OpenCode session fixture");
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list OpenCode sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list OpenCode sessions");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].external_session_id, "session-1");
@@ -836,7 +849,7 @@ mod tests {
             .expect("create OpenCode token fixture");
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list OpenCode sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list OpenCode sessions");
 
         assert_eq!(sessions[0].input_tokens, Some(18));
         assert_eq!(sessions[0].output_tokens, Some(11));

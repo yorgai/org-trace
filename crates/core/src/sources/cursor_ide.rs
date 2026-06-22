@@ -28,6 +28,7 @@ const CURSOR_IDE_PROVIDER_SLUG: &str = CURSOR_IDE_SOURCE_ID;
 pub(super) fn list_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
     // Composer headers are the authoritative session list and carry the rich
     // metadata (name, model, repo, branch, impact stats). The per-composer
@@ -37,7 +38,7 @@ pub(super) fn list_sessions(
     // we fall back to the composerData-only path.
     let header_sessions = list_sessions_from_composer_headers(profile, limit)?;
     if !header_sessions.is_empty() {
-        return Ok(header_sessions);
+        return Ok(crate::filter_sessions_since(header_sessions, since));
     }
     let options = ComposerSessionOptions {
         source_id: CURSOR_IDE_SOURCE_ID,
@@ -46,7 +47,8 @@ pub(super) fn list_sessions(
         include_context_tokens: true,
         skip_best_of_n: true,
     };
-    list_sessions_from_composer_data(profile, limit, options)
+    let sessions = list_sessions_from_composer_data(profile, limit, options)?;
+    Ok(crate::filter_sessions_since(sessions, since))
 }
 
 fn list_sessions_from_composer_headers(
@@ -513,7 +515,7 @@ mod tests {
         insert_cursor_kv(&connection, "composerData:composer-subagent-1", subagent);
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list cursor sessions");
 
         assert_eq!(sessions.len(), 2);
         let parent = sessions
@@ -582,7 +584,7 @@ mod tests {
         insert_cursor_kv(&connection, "composerData:child-composer-1", child);
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list cursor sessions");
         let parent = sessions
             .iter()
             .find(|session| session.external_session_id == "parent-composer-1")
@@ -639,7 +641,7 @@ mod tests {
         );
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list cursor sessions");
 
         assert_eq!(sessions.len(), 1);
         assert!(!sessions[0].listable);
@@ -671,7 +673,7 @@ mod tests {
         insert_cursor_kv(&connection, "composerData:draft-composer-1", draft_composer);
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list cursor sessions");
 
         assert_eq!(sessions.len(), 1);
         assert!(!sessions[0].listable);
@@ -722,7 +724,7 @@ mod tests {
             .expect("insert headers");
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list cursor sessions");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].external_session_id, "composer-1");
@@ -783,7 +785,7 @@ mod tests {
         insert_cursor_kv(&connection, "composerData:composer-sub-1", composer_data);
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10)).expect("list cursor sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list cursor sessions");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title.as_deref(), Some("Subagent run"));

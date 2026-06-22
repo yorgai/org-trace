@@ -113,20 +113,24 @@ pub fn list_native_source_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
 ) -> Result<Vec<NativeSourceSession>> {
-    list_file_source_sessions(profile, limit, |_| Ok(NativeSessionMetadata::default()))
+    list_file_source_sessions(profile, limit, None, |_| {
+        Ok(NativeSessionMetadata::default())
+    })
 }
 
 pub(crate) fn list_file_source_sessions(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<SystemTime>,
     extract: impl Fn(&Path) -> Result<NativeSessionMetadata>,
 ) -> Result<Vec<NativeSourceSession>> {
-    list_file_source_sessions_with_filter(profile, limit, extract, is_supported_session_file)
+    list_file_source_sessions_with_filter(profile, limit, since, extract, is_supported_session_file)
 }
 
 pub(crate) fn list_file_source_sessions_with_filter(
     profile: &SourceProfile,
     limit: Option<usize>,
+    since: Option<SystemTime>,
     extract: impl Fn(&Path) -> Result<NativeSessionMetadata>,
     include: impl Fn(&Path) -> bool,
 ) -> Result<Vec<NativeSourceSession>> {
@@ -145,7 +149,7 @@ pub(crate) fn list_file_source_sessions_with_filter(
         .unwrap_or_else(|| profile.name.clone());
     let mut sessions = Vec::new();
     for root in roots {
-        collect_session_files(&root, &app_id, &extract, &include, &mut sessions)?;
+        collect_session_files(&root, &app_id, since, &extract, &include, &mut sessions)?;
         if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
             break;
         }
@@ -160,6 +164,7 @@ pub(crate) fn list_file_source_sessions_with_filter(
 fn collect_session_files(
     root: &Path,
     app_id: &str,
+    since: Option<SystemTime>,
     extract: &impl Fn(&Path) -> Result<NativeSessionMetadata>,
     include: &impl Fn(&Path) -> bool,
     sessions: &mut Vec<NativeSourceSession>,
@@ -168,7 +173,7 @@ fn collect_session_files(
         return Ok(());
     }
     if root.is_file() {
-        if include(root) {
+        if include(root) && !skip_by_mtime(root, since) {
             sessions.push(session_from_path(root, app_id, extract)?);
         }
         return Ok(());
@@ -197,6 +202,13 @@ fn collect_session_files(
             if !include(&path) {
                 continue;
             }
+            // Incremental skip: a file whose mtime is at/under the watermark cannot
+            // have changed since the last index, so skip the (expensive) parse
+            // entirely. Conservative — mtime newer than the in-file timestamp only
+            // causes an occasional re-parse the fingerprint layer then dedupes.
+            if skip_by_mtime(&path, since) {
+                continue;
+            }
             sessions.push(session_from_path(&path, app_id, extract)?);
             if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
                 return Ok(());
@@ -204,6 +216,48 @@ fn collect_session_files(
         }
     }
     Ok(())
+}
+
+/// True when `since` is set and the file's mtime is at or before it (unchanged
+/// since the last index). Unreadable mtime → never skip (fail open).
+fn skip_by_mtime(path: &Path, since: Option<SystemTime>) -> bool {
+    let Some(since) = since else {
+        return false;
+    };
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(|mtime| mtime <= since)
+        .unwrap_or(false)
+}
+
+/// Parses an RFC3339 watermark string into a `SystemTime` for mtime comparison.
+/// Returns `None` for `None` or an unparseable string (→ full scan, fail open).
+pub(crate) fn since_to_system_time(since: Option<&str>) -> Option<SystemTime> {
+    let since = since?;
+    chrono::DateTime::parse_from_rfc3339(since)
+        .ok()
+        .map(|dt| SystemTime::from(dt.with_timezone(&chrono::Utc)))
+}
+
+/// Drops sessions at/under the `since` watermark, for SQLite-blob sources (cursor
+/// family) whose updated time lives inside a JSON blob and so cannot be filtered
+/// before parse. The blob read is unavoidable; this still shrinks the downstream
+/// upsert set and lets the watermark advance. Sessions with no known
+/// `session_updated_at` are kept (fail open).
+pub(crate) fn filter_sessions_since(
+    sessions: Vec<NativeSourceSession>,
+    since: Option<&str>,
+) -> Vec<NativeSourceSession> {
+    let Some(since) = since_to_system_time(since) else {
+        return sessions;
+    };
+    sessions
+        .into_iter()
+        .filter(|session| match session.session_updated_at {
+            Some(updated) => updated > since,
+            None => true,
+        })
+        .collect()
 }
 
 fn is_supported_session_file(path: &Path) -> bool {
