@@ -15,8 +15,9 @@ use std::str::FromStr;
 use anyhow::Result;
 use brick_core::{
     capture_diff, discover_repo_root, explain_from_events, resolve_direct_anchor,
-    resolve_file_anchor, resolve_file_line_anchor, AnnouncementStore, CausalChain,
-    DiffCaptureRequest, LocalStore, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
+    resolve_file_anchor, resolve_file_line_anchor, source_sessions_to_steps, AnnouncementStore,
+    CausalChain, DiffCaptureRequest, LocalStore, MetadataDb, SourceFileSessionBlameQuery,
+    SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -417,6 +418,72 @@ fn handle_tool_call(
     }))
 }
 
+/// One db, one explain: when a whole-file anchor resolved to NO recorded trace
+/// events, the metadata db's indexed `source_sessions` (what codex/claude/…
+/// touched) become the causal chain. Mutates `chain` in place, injecting
+/// `observed` steps (WHY filled later from each session's turn-final message).
+///
+/// Shared by the MCP `explain` tool and the CLI `explain` command so both behave
+/// identically. Returns `Some(n)` for a file:line anchor that had no line-level
+/// record but `n` indexed sessions touched the file — the caller surfaces a hint
+/// to retry with a whole-file anchor (file:line never pulls file-level index data
+/// into the chain, which would fake line precision).
+pub(crate) fn merge_index_sessions_into_chain(
+    chain: &mut CausalChain,
+    repo_root: &std::path::Path,
+    anchored_path: Option<&str>,
+    is_file_line: bool,
+    depth: usize,
+) -> Option<usize> {
+    if !chain.steps.is_empty() {
+        return None;
+    }
+    let rel_path = anchored_path?;
+    let repo_root = repo_root.to_path_buf();
+    let abs_path = if std::path::Path::new(rel_path).is_absolute() {
+        rel_path.to_string()
+    } else {
+        repo_root.join(rel_path).display().to_string()
+    };
+    let db = MetadataDb::open_global().ok()?;
+    let query = SourceFileSessionBlameQuery {
+        file_path: abs_path,
+        source_id: None,
+        repo_path: Some(repo_root.clone()),
+        limit: depth.clamp(DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH),
+    };
+    let rows = db.query_source_file_session_blame(&query).ok()?;
+    // Strict same-repo filter: source_sessions is a global table, so never let
+    // another repo's session bleed in. Canonicalize both sides so a symlinked root
+    // (macOS `/var`→`/private/var`) still matches while a genuinely different repo
+    // is excluded.
+    let want = std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
+    let same_repo: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            row.source_pointer
+                .as_ref()
+                .and_then(|p| p.get("repo_path"))
+                .and_then(|v| v.as_str())
+                .map(|rp| {
+                    let have =
+                        std::fs::canonicalize(rp).unwrap_or_else(|_| std::path::PathBuf::from(rp));
+                    have == want
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if is_file_line {
+        return (!same_repo.is_empty()).then_some(same_repo.len());
+    }
+    let steps = source_sessions_to_steps(&same_repo, 0);
+    if !steps.is_empty() {
+        chain.anchor.resolved_events = steps.iter().map(|s| s.event_id.clone()).collect();
+        chain.steps = steps;
+    }
+    None
+}
+
 /// `explain` dispatch: resolve the anchor (file:line via blame, or a direct id),
 /// walk the causal graph, then enrich with transcript pointers and the `live`
 /// coordination field.
@@ -449,22 +516,34 @@ is fine here."
     let index = store.load_or_rebuild_index()?;
 
     // file:line anchors need git + the working tree; direct ids do not.
-    let (anchor, anchored_path) = if let Some((path, line)) = parse_file_line(&anchor_input) {
+    let (anchor, anchored_path, is_file_line) = if let Some((path, line)) =
+        parse_file_line(&anchor_input)
+    {
         let repo_root = store.repo_root().to_path_buf();
         let rel_path = normalize_repo_relative(&repo_root, &path);
         let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
-        (anchor, Some(rel_path))
+        (anchor, Some(rel_path), true)
     } else if looks_like_path(&anchor_input) {
         // A whole-file anchor (no `:line`) — agents very often ask about a file,
         // not a line. Match the file's change events directly instead of treating
         // the path as an opaque id (which wrongly reported "no record").
         let rel_path = normalize_repo_relative(store.repo_root(), &anchor_input);
-        (resolve_file_anchor(&events, &rel_path), Some(rel_path))
+        (resolve_file_anchor(&events, &rel_path), Some(rel_path), false)
     } else {
-        (resolve_direct_anchor(&events, &anchor_input), None)
+        (resolve_direct_anchor(&events, &anchor_input), None, false)
     };
 
     let mut chain = explain_from_events(&index, &events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
+    // One db, one explain: when a WHOLE-FILE anchor has no recorded trace events,
+    // the metadata db's indexed `source_sessions` ARE the chain. Shared with the
+    // CLI `explain` command so both entry points behave identically.
+    let index_session_hint = merge_index_sessions_into_chain(
+        &mut chain,
+        store.repo_root(),
+        anchored_path.as_deref(),
+        is_file_line,
+        depth,
+    );
     // Resolve transcript pointers from the SAME repo the anchor resolved to, not
     // the server's process cwd (which is `/` for every MCP client) — mirrors the
     // `live` profile resolution below.
@@ -515,12 +594,18 @@ is fine here."
 
     if chain_is_empty(&chain) {
         if let Value::Object(map) = &mut value {
-            map.insert(
-                "note".to_string(),
-                json!("No Brick record for this anchor yet. Brick only records causal \
+            let note = match index_session_hint {
+                Some(count) => format!(
+                    "No line-level record for this anchor. But {count} indexed session(s) \
+touched this file — re-run `explain` with a whole-file anchor (drop the `:line`) \
+to see who changed it and why."
+                ),
+                None => "No Brick record for this anchor yet. Brick only records causal \
 edges for changes made while it was installed; fall back to git/grep here. As \
-more changes flow through Brick, explain gets richer."),
-            );
+more changes flow through Brick, explain gets richer."
+                    .to_string(),
+            };
+            map.insert("note".to_string(), json!(note));
         }
     }
 

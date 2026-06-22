@@ -420,14 +420,20 @@ fn handle_explain(
     let index = store.load_or_rebuild_index()?;
     let depth = depth.unwrap_or(brick_core::DEFAULT_EXPLAIN_DEPTH);
 
-    let resolved = if let Some((rel_path, line)) = parse_anchor_file_line(anchor) {
+    let (resolved, anchored_path, is_file_line) = if let Some((rel_path, line)) =
+        parse_anchor_file_line(anchor)
+    {
         let cwd = std::env::current_dir()?;
         let repo_root = discover_repo_root(&cwd)?;
         let rel = match std::path::Path::new(&rel_path).strip_prefix(&repo_root) {
             Ok(stripped) => stripped.to_string_lossy().into_owned(),
             Err(_) => rel_path.trim_start_matches("./").to_string(),
         };
-        brick_core::resolve_file_line_anchor(store, &repo_root, &rel, line)?
+        (
+            brick_core::resolve_file_line_anchor(store, &repo_root, &rel, line)?,
+            Some(rel),
+            true,
+        )
     } else if anchor_looks_like_path(anchor) {
         let cwd = std::env::current_dir()?;
         let rel = match discover_repo_root(&cwd) {
@@ -437,12 +443,25 @@ fn handle_explain(
             },
             Err(_) => anchor.trim_start_matches("./").to_string(),
         };
-        brick_core::resolve_file_anchor(&events, &rel)
+        (
+            brick_core::resolve_file_anchor(&events, &rel),
+            Some(rel),
+            false,
+        )
     } else {
-        brick_core::resolve_direct_anchor(&events, anchor)
+        (brick_core::resolve_direct_anchor(&events, anchor), None, false)
     };
 
-    let chain = brick_core::explain_from_events(&index, &events, resolved, depth);
+    let mut chain = brick_core::explain_from_events(&index, &events, resolved, depth);
+    // One db, one explain: share the metadata-db index fallback with the MCP
+    // surface so `brick explain` answers identically for indexed-only history.
+    mcp::merge_index_sessions_into_chain(
+        &mut chain,
+        store.repo_root(),
+        anchored_path.as_deref(),
+        is_file_line,
+        depth,
+    );
     history::print_json(&chain)
 }
 

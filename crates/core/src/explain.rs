@@ -23,11 +23,15 @@ use brick_protocol::{EventType, TraceEvent};
 
 use crate::blame::blame_file;
 use crate::store::LocalStore;
-use crate::{CausalEdge, TraceIndex};
+use crate::{CausalEdge, FileSessionBlameRow, TraceIndex};
 
 /// Default backward traversal depth, and the hard cap callers cannot exceed.
 pub const DEFAULT_EXPLAIN_DEPTH: usize = 3;
 pub const MAX_EXPLAIN_DEPTH: usize = 8;
+
+/// Synthetic event type for a CTP step derived from a metadata-db source session
+/// (file-level provenance) rather than a real recorded trace event.
+pub const EVENT_TYPE_SOURCE_SESSION: &str = "source.session";
 
 /// How an anchor string was resolved to one or more starting events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,16 +115,74 @@ pub struct CausalChain {
     pub truncated: bool,
 }
 
+/// Builds CTP steps from metadata-db source-session rows (file-level provenance).
+///
+/// This is the read-time half of "one db, one explain": when the file anchor has
+/// no recorded trace events, the metadata db's `source_sessions` (what codex /
+/// claude / … touched, already indexed) become the chain. Each row → a step with
+/// `confidence="observed"` and a transcript pointer; the WHY (`note`) is left
+/// `None` for the CLI/MCP layer to fill from the turn-final assistant message.
+///
+/// Pure (no I/O) so it unit-tests without a db. `start_depth` lets the caller
+/// place these after any real-event steps.
+pub fn source_sessions_to_steps(
+    rows: &[FileSessionBlameRow],
+    start_depth: usize,
+) -> Vec<CausalStep> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut steps = Vec::new();
+    for row in rows {
+        let external = row.external_session_id.clone().unwrap_or_default();
+        let source = row
+            .app_id
+            .clone()
+            .or_else(|| row.source_id.clone())
+            .unwrap_or_default();
+        // Stable synthetic id so repeated rows / re-queries dedupe idempotently.
+        let event_id = format!("source-session:{source}:{external}");
+        if !seen.insert(event_id.clone()) {
+            continue;
+        }
+        let source_path = row
+            .source_pointer
+            .as_ref()
+            .and_then(|pointer| pointer.get("source_path"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        let file_name = row
+            .file_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(row.file_path.as_str());
+        steps.push(CausalStep {
+            event_id,
+            event_type: EVENT_TYPE_SOURCE_SESSION.to_string(),
+            what: Some(format!("touched {file_name} in {source} session")),
+            actor_type: row.actor_type.clone(),
+            actor_id: row.actor_id.clone().or_else(|| Some(source.clone())),
+            session_id: (!external.is_empty()).then(|| external.clone()),
+            mission_id: None,
+            mission_title: None,
+            occurred_at: row.last_seen_at.clone(),
+            relation: None,
+            note: None,
+            confidence: "observed".to_string(),
+            transcript: Some(TranscriptPointer {
+                source: (!source.is_empty()).then(|| source.clone()),
+                session_ref: source_path,
+                session_id: (!external.is_empty()).then(|| external.clone()),
+            }),
+            depth: start_depth + steps.len(),
+        });
+    }
+    steps
+}
+
 /// Resolves a direct (non-file) anchor string to its starting event-ids.
 ///
 /// - an `event_id` (a raw UUID) resolves to itself if present in the stream;
 /// - an `artifact_*` id resolves to the events carrying that artifact;
 /// - a `mission_*` id resolves to the events carrying that mission.
-///
-/// The `file:line` branch lives in the CLI/store layer because it needs git +
-/// the working tree (`blame`); it produces event-ids that are then passed to
-/// [`explain_from_events`]. Keeping the graph traversal git-free keeps it unit
-/// testable.
 pub fn resolve_direct_anchor(events: &[TraceEvent], input: &str) -> ExplainAnchor {
     let trimmed = input.trim();
 
@@ -934,5 +996,67 @@ mod tests {
             Some("Harden token refresh"),
             "mission title must be resolved for the agent"
         );
+    }
+
+    fn blame_row(source: &str, external: &str, file: &str, repo: &str) -> FileSessionBlameRow {
+        FileSessionBlameRow {
+            file_path: file.to_string(),
+            session_id: None,
+            external_session_id: Some(external.to_string()),
+            source_id: Some(source.to_string()),
+            app_id: Some(source.to_string()),
+            actor_id: Some("agent-x".to_string()),
+            actor_type: Some("agent".to_string()),
+            evidence_kind: crate::FileSessionBlameEvidenceKind::SourceMetadata,
+            last_seen_at: "2026-06-20T10:00:00+00:00".to_string(),
+            lines_added: Some(3),
+            lines_removed: Some(1),
+            files_changed: Some(1),
+            confidence: Some("metadata_only".to_string()),
+            source_pointer: Some(serde_json::json!({
+                "source_path": format!("/sessions/{external}.jsonl"),
+                "repo_path": repo,
+            })),
+        }
+    }
+
+    #[test]
+    fn source_sessions_to_steps_maps_rows_to_observed_steps() {
+        let rows = vec![blame_row(
+            "codex_app",
+            "sess-1",
+            "/repo/src/merge.rs",
+            "/repo",
+        )];
+        let steps = source_sessions_to_steps(&rows, 0);
+        assert_eq!(steps.len(), 1);
+        let step = &steps[0];
+        assert_eq!(step.event_type, EVENT_TYPE_SOURCE_SESSION);
+        assert_eq!(step.confidence, "observed");
+        assert_eq!(step.what.as_deref(), Some("touched merge.rs in codex_app session"));
+        assert_eq!(step.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(step.note, None, "WHY is filled later from the transcript");
+        let transcript = step.transcript.as_ref().expect("transcript pointer");
+        assert_eq!(transcript.source.as_deref(), Some("codex_app"));
+        assert_eq!(transcript.session_ref.as_deref(), Some("/sessions/sess-1.jsonl"));
+        assert_eq!(transcript.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn source_sessions_to_steps_dedupes_by_synthetic_id_and_honors_start_depth() {
+        let rows = vec![
+            blame_row("codex_app", "dup", "/repo/a.rs", "/repo"),
+            blame_row("codex_app", "dup", "/repo/a.rs", "/repo"), // same source+external
+            blame_row("claude_code", "other", "/repo/a.rs", "/repo"),
+        ];
+        let steps = source_sessions_to_steps(&rows, 5);
+        assert_eq!(steps.len(), 2, "duplicate synthetic ids collapse");
+        assert_eq!(steps[0].depth, 5);
+        assert_eq!(steps[1].depth, 6);
+    }
+
+    #[test]
+    fn source_sessions_to_steps_empty_input_is_empty() {
+        assert!(source_sessions_to_steps(&[], 0).is_empty());
     }
 }

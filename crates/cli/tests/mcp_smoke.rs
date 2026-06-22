@@ -174,6 +174,19 @@ fn write_codex(dir: &Path, sid: &str, repo: &Path, file: &str) {
     write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
 }
 
+/// Like `write_codex` but with a caller-chosen turn-final `agent_message`, used
+/// to assert the indexed-session CTP recovers a specific WHY from the transcript.
+fn write_codex_with_final(dir: &Path, sid: &str, repo: &Path, file: &str, final_msg: &str) {
+    let patch = format!("diff --git a/{file} b/{file}\n+++ b/{file}\n+// edited\n");
+    let lines = vec![
+        json!({"timestamp":iso(-30),"payload":{"type":"user_message","message":"Make the change","cwd":repo.display().to_string(),"model":"gpt-5"}}),
+        json!({"timestamp":iso(-20),"payload":{"type":"function_call","call_id":"c1","name":"apply_patch","arguments": json!({"patch": patch}).to_string()}}),
+        json!({"timestamp":iso(-19),"payload":{"type":"function_call_output","call_id":"c1","output":"applied"}}),
+        json!({"timestamp":iso(-15),"payload":{"type":"agent_message","message": final_msg}}),
+    ];
+    write_lines(&dir.join(format!("{sid}.jsonl")), &lines);
+}
+
 /// A finished Claude session (assistant stop_reason set → Idle).
 fn write_claude(dir: &Path, sid: &str, repo: &Path, file: &str) {
     let lines = vec![
@@ -1419,4 +1432,120 @@ fn explain_is_honest_when_no_record_exists() {
 #[allow(dead_code)]
 fn finished_claude(dir: &Path, sid: &str, repo: &Path, file: &str) {
     write_claude(dir, sid, repo, file);
+}
+
+/// Indexes the configured native sources into the metadata db. In a non-TTY
+/// context `import native pick` indexes every discovered session, then prints
+/// guidance instead of prompting — exactly the index step we need.
+fn index_sources(home: &Path, repo: &Path, source: &str) {
+    let out = brick(home, repo, &["--source", source, "import", "native", "pick"]);
+    assert!(
+        out.status.success(),
+        "index ({source}) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// One db, one explain: a repo with ZERO captured trace events but an indexed
+/// codex session that touched the file must still get a CTP — the metadata db's
+/// `source_sessions` ARE the chain, and the turn-final assistant message becomes
+/// the `observed` WHY.
+#[test]
+fn explain_synthesizes_ctp_from_indexed_session_when_no_events() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-index-only");
+    let sid = "codex-index-only-001";
+    let file = "src/commands_git.rs";
+    // A real codex session that edited the file; its turn-final agent_message
+    // carries a WHY present ONLY in the transcript.
+    let why = "Switched to a bounded channel because the unbounded one let a slow \
+consumer OOM the process under backpressure.";
+    write_codex_with_final(&codex_dir, sid, &repo, file, why);
+
+    // Index the session into the metadata db. NO capture, NO link — pure index.
+    index_sources(&home, &repo, "codex_app");
+
+    let mut m = Mcp::spawn(&home, &repo);
+    let chain = m.call("explain", json!({ "anchor": file }));
+
+    let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !steps.is_empty(),
+        "indexed session must synthesize a CTP step: {chain}"
+    );
+    let step = steps
+        .iter()
+        .find(|s| s["event_type"] == "source.session")
+        .unwrap_or_else(|| panic!("expected a source.session step: {chain}"));
+    assert_eq!(step["confidence"].as_str(), Some("observed"), "{chain}");
+    assert_eq!(
+        step["note"].as_str(),
+        Some(why),
+        "WHY must be recovered from the indexed session's turn-final message: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Explicit always wins: when the repo has a real `diff.captured` (via the hook
+/// path) the index fallback must NOT fire — the genuine event chain stands.
+#[test]
+fn explain_prefers_real_events_over_indexed_sessions() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-explicit-wins");
+    let sid = "codex-explicit-wins-001";
+    let file = "src/commands_git.rs";
+    write_codex_with_final(&codex_dir, sid, &repo, file, "indexed session WHY");
+    index_sources(&home, &repo, "codex_app");
+
+    // Now create a REAL captured diff bound to a link rationale on the same file.
+    assert!(git(&repo, &["add", "-A"]).success());
+    assert!(git(&repo, &["-c", "user.email=t@t.io", "-c", "user.name=t", "commit", "-qm", "base"]).success());
+    std::fs::write(repo.join(file), "// real file\nfn changed() {}\n").unwrap();
+    let mut m = Mcp::spawn(&home, &repo);
+    let linked = m.call(
+        "link",
+        json!({ "effect": file, "relation": "rationale", "note": "explicit asserted reason" }),
+    );
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+
+    let chain = m.call("explain", json!({ "anchor": file }));
+    let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
+    // The genuine event chain stands; no synthesized source.session step appears.
+    assert!(
+        steps.iter().all(|s| s["event_type"] != "source.session"),
+        "real events must suppress the index fallback: {chain}"
+    );
+    assert!(
+        steps.iter().any(|s| s["note"].as_str() == Some("explicit asserted reason")
+            && s["confidence"].as_str() == Some("explicit")),
+        "explicit link note must win: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Cross-repo isolation: an indexed session whose `repo_path` is a DIFFERENT repo
+/// must never appear in this repo's explain answer (source_sessions is global).
+#[test]
+fn explain_index_fallback_isolates_by_repo() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-xrepo");
+    let sid = "codex-other-repo-001";
+    let file = "src/commands_git.rs";
+    // The session's cwd (→ repo_path) points at an UNRELATED repo path.
+    let other_repo = root.join("other-repo");
+    std::fs::create_dir_all(other_repo.join("src")).unwrap();
+    write_codex_with_final(&codex_dir, sid, &other_repo, file, "other repo WHY");
+    index_sources(&home, &repo, "codex_app");
+
+    let mut m = Mcp::spawn(&home, &repo);
+    let chain = m.call("explain", json!({ "anchor": file }));
+    let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
+    assert!(
+        steps.iter().all(|s| s["event_type"] != "source.session"),
+        "a different repo's indexed session must not bleed in: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
 }
