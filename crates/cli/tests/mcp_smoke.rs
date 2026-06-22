@@ -1307,6 +1307,82 @@ fn explain_resolves_transcript_pointer_to_session_path() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Ingested history with WHO/WHEN/what but no asserted note must still surface a
+/// WHY: explain recovers the origin turn's final assistant message as an
+/// `observed` rationale. A `diff.captured` bound to a real codex session (no
+/// `link` note) gets its rationale lifted from the transcript at read time.
+#[test]
+fn explain_recovers_observed_rationale_from_turn_final_message() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-observed");
+    let sid = "codex-observed-001";
+    // The turn's closing narration carries a WHY the diff alone can't express.
+    let why = "Switched to a bounded channel because the unbounded one let a slow \
+consumer OOM the process under backpressure.";
+    let patch =
+        "diff --git a/src/commands_git.rs b/src/commands_git.rs\n+++ b/src/commands_git.rs\n+// q\n";
+    let lines = vec![
+        json!({"timestamp":iso(-30),"payload":{"type":"user_message","message":"Fix the queue backpressure","cwd":repo.display().to_string(),"model":"gpt-5"}}),
+        json!({"timestamp":iso(-25),"payload":{"type":"agent_reasoning","text":"**Looking at the channel**"}}),
+        json!({"timestamp":iso(-20),"payload":{"type":"function_call","call_id":"c1","name":"apply_patch","arguments": json!({"patch": patch}).to_string()}}),
+        json!({"timestamp":iso(-19),"payload":{"type":"function_call_output","call_id":"c1","output":"applied"}}),
+        json!({"timestamp":iso(-15),"payload":{"type":"agent_message","message": why}}),
+    ];
+    write_lines(&codex_dir.join(format!("{sid}.jsonl")), &lines);
+
+    // Commit a baseline so the edit is a real working diff the capture can see.
+    assert!(git(&repo, &["add", "-A"]).success());
+    assert!(git(&repo, &["-c", "user.email=t@t.io", "-c", "user.name=t", "commit", "-qm", "base"]).success());
+
+    // Capture a diff bound to the codex session id — the hook/ingest shape:
+    // WHO/WHEN/what, but NO note (no `link`).
+    std::fs::write(repo.join("src/commands_git.rs"), "// real file\nfn q() {}\n").unwrap();
+    let artifact = extract(
+        &brick(
+            &home,
+            &repo,
+            &[
+                "--actor-type", "agent", "--actor-id", "codex_app", "artifact", "create",
+                "--kind", "patch", "q",
+            ],
+        ),
+        "artifact_id",
+    )
+    .expect("artifact");
+    let out = brick(
+        &home,
+        &repo,
+        &[
+            "--actor-type", "agent", "--actor-id", "codex_app", "evidence", "diff",
+            "--artifact", &artifact, "--session", sid, "--target", "working",
+        ],
+    );
+    assert!(out.status.success(), "diff capture failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let abs = format!("{}/src/commands_git.rs", repo.display());
+    let mut m = Mcp::spawn(&home, &elsewhere);
+    let chain = m.call("explain", json!({ "anchor": abs }));
+
+    let step = chain["causal_chain"]
+        .as_array()
+        .and_then(|steps| steps.iter().find(|s| s["transcript"].is_object()).cloned())
+        .unwrap_or_else(|| panic!("expected a step with a transcript pointer: {chain}"));
+    assert_eq!(
+        step["note"].as_str(),
+        Some(why),
+        "observed rationale must be the turn's final assistant message: {chain}"
+    );
+    assert_eq!(
+        step["confidence"].as_str(),
+        Some("observed"),
+        "recovered rationale must be marked observed, not explicit: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn explain_is_honest_when_no_record_exists() {
     let (root, home, repo, _codex_dir, _claude_dir) = setup_world("explain-empty");

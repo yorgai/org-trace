@@ -470,6 +470,11 @@ is fine here."
     // `live` profile resolution below.
     let anchor_profiles = SourceProfileStore::new(store.repo_root().to_path_buf());
     enrich_transcripts(&anchor_profiles, profiles, &mut chain);
+    // For steps that have a resolved transcript but no asserted (`explicit`) note,
+    // recover the turn's final assistant message as an `observed` rationale, so
+    // ingested history isn't left with WHO/WHEN but zero WHY. Never overrides an
+    // explicit `link` note.
+    enrich_observed_rationale(&mut chain);
 
     let mut value = serde_json::to_value(&chain)?;
     // `live` field: if another running session is touching the anchored file
@@ -1129,6 +1134,44 @@ fn build_transcript_index(
         }
     }
     index
+}
+
+/// Recovers an `observed` rationale for steps that have a resolved transcript but
+/// no asserted note: reads the origin session and lifts that turn's final
+/// assistant message (see [`brick_core::turn_final_assistant_message`]). This is
+/// the read-time half of "ingested history should still have a WHY" — the diff
+/// gives WHO/WHEN/what, the turn's closing narration gives the WHY the code can't.
+///
+/// Invariants:
+/// - never touches a step that already has a note (an `explicit` `link` always wins);
+/// - sets `confidence = "observed"` so the agent can weigh it accordingly;
+/// - is best-effort: a missing/unreadable transcript leaves the step unchanged.
+fn enrich_observed_rationale(chain: &mut CausalChain) {
+    for step in &mut chain.steps {
+        if step.note.is_some() {
+            continue;
+        }
+        let Some(transcript) = step.transcript.as_ref() else {
+            continue;
+        };
+        let (Some(source), Some(session_ref), Some(session_id)) = (
+            transcript.source.as_deref(),
+            transcript.session_ref.as_deref(),
+            transcript.session_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let recovered = brick_core::turn_final_assistant_message(
+            source,
+            session_id,
+            Some(std::path::Path::new(session_ref)),
+            &step.occurred_at,
+        );
+        if let Ok(Some(message)) = recovered {
+            step.note = Some(message);
+            step.confidence = "observed".to_string();
+        }
+    }
 }
 
 /// Whether `explain` found genuinely nothing to say. A chain is empty ONLY when
