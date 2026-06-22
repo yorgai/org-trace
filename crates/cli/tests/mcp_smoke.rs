@@ -1231,6 +1231,82 @@ fn explain_live_fires_with_absolute_anchor_when_cwd_is_unrelated() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The transcript pointer must be resolved to an openable on-disk location, not
+/// left as a bare session id. When `link` records a change with a `session` arg
+/// matching a configured source session, a later `explain` on that file must
+/// return `transcript.source` + `transcript.session_ref` (the .jsonl path) so a
+/// curious agent can open the original session — the whole point of the pointer.
+/// Runs with an unrelated cwd to prove resolution uses the anchor's repo, not
+/// the server's process cwd (the universal `cwd=/` MCP-client case).
+#[test]
+fn explain_resolves_transcript_pointer_to_session_path() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-transcript");
+    // A real Codex session file exists on disk; its external id is the file stem.
+    let sid = "codex-transcript-001";
+    write_codex(&codex_dir, sid, &repo, "src/commands_git.rs");
+
+    // Commit the baseline so the subsequent edit is a real working diff.
+    assert!(git(&repo, &["add", "-A"]).success());
+    assert!(git(&repo, &["-c", "user.email=t@t.io", "-c", "user.name=t", "commit", "-qm", "base"]).success());
+
+    // The agent edits the file, then records WHY bound to that session id.
+    std::fs::write(
+        repo.join("src/commands_git.rs"),
+        "// real file\nfn cache_status() {}\n",
+    )
+    .unwrap();
+    let mut m = Mcp::spawn(&home, &repo);
+    let linked = m.call(
+        "link",
+        json!({
+            "effect": "src/commands_git.rs",
+            "relation": "rationale",
+            "note": "cache git status lookups",
+            "source": "codex_app",
+            "session": sid
+        }),
+    );
+    assert_eq!(linked["linked"], json!(true), "{linked}");
+    drop(m);
+
+    // Spawn from an unrelated cwd and explain via an absolute anchor.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let abs = format!("{}/src/commands_git.rs", repo.display());
+    let mut m = Mcp::spawn(&home, &elsewhere);
+    let chain = m.call("explain", json!({ "anchor": abs }));
+
+    let step = chain["causal_chain"]
+        .as_array()
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|s| s["transcript"].is_object())
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("expected a step with a transcript pointer: {chain}"));
+    assert_eq!(
+        step["transcript"]["session_id"].as_str(),
+        Some(sid),
+        "transcript must carry the session id the link recorded: {chain}"
+    );
+    assert_eq!(
+        step["transcript"]["source"].as_str(),
+        Some("codex_app"),
+        "transcript must resolve the source app: {chain}"
+    );
+    let session_ref = step["transcript"]["session_ref"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        session_ref.ends_with(&format!("{sid}.jsonl")),
+        "transcript must resolve to the on-disk session file, got {session_ref:?}: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn explain_is_honest_when_no_record_exists() {
     let (root, home, repo, _codex_dir, _claude_dir) = setup_world("explain-empty");

@@ -207,6 +207,14 @@ for a standalone reason (no cause).",
                 "note": {
                     "type": "string",
                     "description": "One line: WHY. Required when there is no cause."
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Optional: the id of the coding session you are \
+working in (your tool's session/conversation id). Brick records it on the \
+change so a later `explain` can hand the next agent a transcript pointer back \
+to this session — the original context behind the change. Omit if you don't \
+have one."
                 }
             },
             "required": []
@@ -457,7 +465,11 @@ is fine here."
     };
 
     let mut chain = explain_from_events(&index, &events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
-    enrich_transcripts(profiles, &mut chain);
+    // Resolve transcript pointers from the SAME repo the anchor resolved to, not
+    // the server's process cwd (which is `/` for every MCP client) — mirrors the
+    // `live` profile resolution below.
+    let anchor_profiles = SourceProfileStore::new(store.repo_root().to_path_buf());
+    enrich_transcripts(&anchor_profiles, profiles, &mut chain);
 
     let mut value = serde_json::to_value(&chain)?;
     // `live` field: if another running session is touching the anchored file
@@ -664,7 +676,7 @@ fn capture_working_diff_event(
     let event = TraceEvent::diff_captured(
         mcp_actor(args),
         ArtifactId::new(),
-        None,
+        link_session_id(args),
         None,
         payload,
     )?;
@@ -1046,13 +1058,77 @@ fn relation_wire(relation: CausalRelation) -> &'static str {
 /// file path for file-backed sources (Claude/Codex/Gemini), or a sqlite ref for
 /// db-backed ones (Cursor/ORGII). The core only knows the session id; the CLI
 /// layer has the profiles to resolve it.
-fn enrich_transcripts(_profiles: &SourceProfileStore, chain: &mut CausalChain) {
-    // The core already populated `session_id` on each step's transcript pointer.
-    // Resolving session_id → concrete path requires per-source lookups that vary
-    // by tool; for now we keep the session_id pointer (the agent can open it via
-    // its own tooling) and leave richer path resolution to a follow-up. This
-    // function is the seam where that resolution lands.
-    let _ = chain;
+///
+/// Resolution: enumerate every configured source's sessions once, building an
+/// `external_session_id → (source_app_id, on-disk path)` map, then stamp each
+/// step (and forward effect) whose `session_id` matches. `anchor_profiles` is
+/// the repo the anchor resolved to (the right place to look); `cwd_profiles` is
+/// the fallback for when the server happens to run inside a repo. A session id
+/// that resolves to no known source is left as a bare id pointer — still useful,
+/// just not openable.
+fn enrich_transcripts(
+    anchor_profiles: &SourceProfileStore,
+    cwd_profiles: &SourceProfileStore,
+    chain: &mut CausalChain,
+) {
+    // Cheap exit: if no step or forward effect carries a session id, there is
+    // nothing to resolve and we skip the (potentially slow) source scan.
+    let needs_resolution = chain
+        .steps
+        .iter()
+        .any(|step| step.transcript.as_ref().and_then(|t| t.session_id.as_ref()).is_some())
+        || chain.forward.iter().any(|f| f.session_id.is_some());
+    if !needs_resolution {
+        return;
+    }
+
+    let index = build_transcript_index(anchor_profiles, cwd_profiles);
+    if index.is_empty() {
+        return;
+    }
+
+    for step in &mut chain.steps {
+        if let Some(pointer) = step.transcript.as_mut() {
+            if let Some(session_id) = pointer.session_id.clone() {
+                if let Some((source, session_ref)) = index.get(&session_id) {
+                    pointer.source = Some(source.clone());
+                    pointer.session_ref = Some(session_ref.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Builds `external_session_id → (source_app_id, on-disk ref)` from the configured
+/// sources. Prefers the anchor's repo; only falls back to the cwd-derived store
+/// when the anchor repo has no profiles. The on-disk ref is the transcript file
+/// path (file sources) or sqlite db path (db sources) — whatever the provider
+/// recorded on the session.
+fn build_transcript_index(
+    anchor_profiles: &SourceProfileStore,
+    cwd_profiles: &SourceProfileStore,
+) -> std::collections::BTreeMap<String, (String, String)> {
+    let profiles = match anchor_profiles.list_profiles() {
+        Ok(found) if !found.is_empty() => found,
+        _ => cwd_profiles.list_profiles().unwrap_or_default(),
+    };
+    let mut index = std::collections::BTreeMap::new();
+    for profile in profiles {
+        let Ok(sessions) = brick_core::list_source_sessions(&profile, None) else {
+            continue;
+        };
+        for session in sessions {
+            index
+                .entry(session.external_session_id.clone())
+                .or_insert_with(|| {
+                    (
+                        session.source_app_id.clone(),
+                        session.path.display().to_string(),
+                    )
+                });
+        }
+    }
+    index
 }
 
 /// Whether `explain` found genuinely nothing to say. A chain is empty ONLY when
@@ -1095,6 +1171,17 @@ fn mcp_actor(args: &Value) -> ActorRef {
         actor_id,
         display_name: None,
     }
+}
+
+/// The session a `link` write belongs to, if the caller named one. Lets the
+/// recorded `diff.captured` carry a `session_id`, which `explain` later turns
+/// into a transcript pointer — the seam that lets a curious agent open the
+/// original session that produced a change. Accepts `session` or the more
+/// explicit `session_id` arg; an empty/blank value resolves to `None`.
+fn link_session_id(args: &Value) -> Option<SessionId> {
+    opt_str_arg(args, "session")
+        .or_else(|| opt_str_arg(args, "session_id"))
+        .and_then(|value| SessionId::from_str(&value).ok())
 }
 
 /// snake_case wire string for a mission status (matches the serde rename).
