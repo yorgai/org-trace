@@ -8,11 +8,14 @@ use crate::{
 };
 
 use super::liveness::probe_liveness;
-use super::{claude_code, codex_app, cursor_ide, gemini, opencode, orgii, windsurf};
+use super::{
+    claude_code, codex_app, cursor_agent, cursor_ide, gemini, opencode, orgii, windsurf,
+};
 
 const SOURCE_CLAUDE_CODE: &str = "claude_code";
 const SOURCE_CODEX_APP: &str = "codex_app";
 const SOURCE_CURSOR_IDE: &str = "cursor_ide";
+const SOURCE_CURSOR_AGENT: &str = "cursor_agent";
 const SOURCE_OPENCODE: &str = "opencode";
 const SOURCE_WINDSURF: &str = "windsurf";
 const SOURCE_ORGII: &str = "orgii";
@@ -44,6 +47,7 @@ pub fn list_source_sessions_since(
         SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit, since),
         SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit, since),
         SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit, since),
+        SOURCE_CURSOR_AGENT => cursor_agent::list_sessions(profile, limit, since),
         SOURCE_OPENCODE => opencode::list_sessions(profile, limit, since),
         SOURCE_WINDSURF => windsurf::list_sessions(profile, limit, since),
         SOURCE_ORGII => orgii::list_sessions(profile, limit, since),
@@ -128,6 +132,7 @@ pub fn format_source_session_chunks(
         SOURCE_CLAUDE_CODE => claude_code::format_chunks(external_session_id, source_path),
         SOURCE_CODEX_APP => codex_app::format_chunks(external_session_id, source_path),
         SOURCE_CURSOR_IDE => cursor_ide::format_chunks(external_session_id, source_path),
+        SOURCE_CURSOR_AGENT => cursor_agent::format_chunks(external_session_id, source_path),
         SOURCE_OPENCODE => opencode::format_chunks(external_session_id, source_path),
         SOURCE_WINDSURF => windsurf::format_chunks(external_session_id, source_path),
         SOURCE_ORGII => orgii::format_chunks(external_session_id, source_path),

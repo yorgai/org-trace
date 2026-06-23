@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub enum DiscoveredSourceKind {
     Orgii,
     Cursor,
+    CursorAgent,
     ClaudeCode,
     Codex,
     Windsurf,
@@ -29,6 +30,7 @@ impl DiscoveredSourceKind {
         match self {
             DiscoveredSourceKind::Orgii => "orgii",
             DiscoveredSourceKind::Cursor => "cursor_ide",
+            DiscoveredSourceKind::CursorAgent => "cursor_agent",
             DiscoveredSourceKind::ClaudeCode => "claude_code",
             DiscoveredSourceKind::Codex => "codex_app",
             DiscoveredSourceKind::Windsurf => "windsurf",
@@ -47,6 +49,7 @@ impl DiscoveredSourceKind {
         match self {
             DiscoveredSourceKind::Orgii => "ORGII",
             DiscoveredSourceKind::Cursor => "Cursor",
+            DiscoveredSourceKind::CursorAgent => "cursor-agent CLI",
             DiscoveredSourceKind::ClaudeCode => "Claude Code",
             DiscoveredSourceKind::Codex => "Codex",
             DiscoveredSourceKind::Windsurf => "Windsurf",
@@ -109,6 +112,11 @@ pub fn discover_sources() -> Vec<DiscoveredSource> {
         &mut sources,
         DiscoveredSourceKind::Cursor,
         cursor_paths(&home),
+    );
+    push_source(
+        &mut sources,
+        DiscoveredSourceKind::CursorAgent,
+        cursor_agent_paths(&home),
     );
     push_source(
         &mut sources,
@@ -188,6 +196,22 @@ fn cursor_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
         DiscoveredPathKind::CursorStateDatabase,
         cursor_state_db_path(home),
     )]
+}
+
+fn cursor_agent_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
+    // The cursor-agent CLI keeps one SQLite store per session under a `chats`
+    // directory. Probe the known roots; only existing ones are reported.
+    cursor_agent_chats_candidates(home)
+        .into_iter()
+        .map(|candidate| path(DiscoveredPathKind::SessionLogRoot, candidate))
+        .collect()
+}
+
+fn cursor_agent_chats_candidates(home: &Path) -> Vec<PathBuf> {
+    unique_paths(vec![
+        home.join(".cursor/chats"),
+        home.join(".config/cursor/chats"),
+    ])
 }
 
 fn claude_code_paths(home: &Path) -> Vec<DiscoveredSourcePath> {
