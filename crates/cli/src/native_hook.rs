@@ -12,9 +12,7 @@ use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 use crate::claude_hook::HookAction;
 
-const RECALL_MARKER: &str = "brick metadata recall-hook";
-const EXPLAIN_MARKER: &str = "brick metadata explain-hook";
-const CODEX_RECALL_MATCHER: &str = "Edit|Write|apply_patch";
+const EXPLAIN_MARKER: &str = "brick hook-explain";
 const CODEX_EXPLAIN_MATCHER: &str = "Read|Grep|Glob|mcp__.*read.*|mcp__.*grep.*|mcp__.*glob.*";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,16 +56,12 @@ pub fn status(client: HookClient, path: &Path, brick_bin: &str) -> Result<HookAc
     }
 }
 
-fn recall_command(brick_bin: &str) -> String {
-    format!("{brick_bin} metadata recall-hook")
-}
-
 fn explain_command(brick_bin: &str) -> String {
-    format!("{brick_bin} metadata explain-hook")
+    format!("{brick_bin} hook-explain")
 }
 
 fn is_brick_command(command: &str) -> bool {
-    command.contains(RECALL_MARKER) || command.contains(EXPLAIN_MARKER)
+    command.contains(EXPLAIN_MARKER)
 }
 
 // ---- Codex TOML hooks ------------------------------------------------------
@@ -111,18 +105,11 @@ fn codex_hook_table(matcher: &str, command: String, status_message: &str) -> Tab
 }
 
 fn codex_desired(brick_bin: &str) -> Vec<Table> {
-    vec![
-        codex_hook_table(
-            CODEX_RECALL_MATCHER,
-            recall_command(brick_bin),
-            "Loading Brick memory",
-        ),
-        codex_hook_table(
-            CODEX_EXPLAIN_MATCHER,
-            explain_command(brick_bin),
-            "Loading Brick causal context",
-        ),
-    ]
+    vec![codex_hook_table(
+        CODEX_EXPLAIN_MATCHER,
+        explain_command(brick_bin),
+        "Loading Brick causal context",
+    )]
 }
 
 fn codex_install(path: &Path, brick_bin: &str, force: bool) -> Result<HookAction> {
@@ -215,22 +202,29 @@ fn codex_matches(doc: &DocumentMut, brick_bin: &str) -> bool {
     else {
         return false;
     };
-    let desired = [
-        (
-            CODEX_RECALL_MATCHER,
-            recall_command(brick_bin),
-            "Loading Brick memory",
-        ),
-        (
-            CODEX_EXPLAIN_MATCHER,
-            explain_command(brick_bin),
-            "Loading Brick causal context",
-        ),
-    ];
-    desired.iter().all(|(matcher, command, status)| {
-        entries
-            .iter()
-            .any(|entry| codex_entry_matches(entry, matcher, command, status))
+    let desired = codex_desired(brick_bin);
+    desired.iter().all(|desired| {
+        desired
+            .get("matcher")
+            .and_then(Item::as_str)
+            .is_some_and(|matcher| {
+                desired
+                    .get("hooks")
+                    .and_then(Item::as_array_of_tables)
+                    .and_then(|hooks| hooks.iter().next())
+                    .and_then(|hook| {
+                        Some((
+                            matcher,
+                            hook.get("command")?.as_str()?,
+                            hook.get("statusMessage")?.as_str()?,
+                        ))
+                    })
+                    .is_some_and(|(matcher, command, status)| {
+                        entries
+                            .iter()
+                            .any(|entry| codex_entry_matches(entry, matcher, command, status))
+                    })
+            })
     })
 }
 
@@ -313,10 +307,7 @@ fn windsurf_entry(command: String) -> Value {
 }
 
 fn windsurf_desired(brick_bin: &str) -> Vec<(&'static str, Value)> {
-    vec![
-        ("pre_write_code", windsurf_entry(recall_command(brick_bin))),
-        ("pre_read_code", windsurf_entry(explain_command(brick_bin))),
-    ]
+    vec![("pre_read_code", windsurf_entry(explain_command(brick_bin)))]
 }
 
 fn windsurf_install(path: &Path, brick_bin: &str, force: bool) -> Result<HookAction> {
@@ -457,7 +448,7 @@ command = "echo user"
         let doc = read_toml(&path).unwrap();
         assert_eq!(doc["model"].as_str(), Some("gpt-5"));
         let entries = doc["hooks"]["PreToolUse"].as_array_of_tables().unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert_eq!(
             status(HookClient::Codex, &path, "/bin/brick").unwrap(),
             HookAction::Present
@@ -507,7 +498,6 @@ command = "echo user"
             root["hooks"]["pre_run_command"].as_array().unwrap().len(),
             1
         );
-        assert_eq!(root["hooks"]["pre_write_code"].as_array().unwrap().len(), 1);
         assert_eq!(root["hooks"]["pre_read_code"].as_array().unwrap().len(), 1);
         assert_eq!(
             status(HookClient::Windsurf, &path, "/bin/brick").unwrap(),

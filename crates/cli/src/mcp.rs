@@ -671,6 +671,10 @@ more changes flow through Brick, explain gets richer."
 
 /// `link` dispatch: write a `causal.linked` event. Supports a standalone
 /// rationale (note only) or a cross-event edge (cause anchor + relation).
+pub(crate) fn link_for_cli(store: &LocalStore, args: &Value) -> Result<Value> {
+    link_tool_call(store, args)
+}
+
 fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
     // Resolve the store from the effect anchor (or cause) so a server spawned
     // with `cwd=/` still writes into the agent's actual repo, not `/.brick`.

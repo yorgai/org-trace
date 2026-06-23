@@ -66,14 +66,11 @@ cargo run -p brick-server -- rebuild-index --data-dir .brick-server --repo-id re
 
 `rebuild-index` prints status JSON and does not write a cache yet.
 
-## Cursor notes
+## Source notes
 
-Cursor support is explicit-file based. Brick does not inspect private Cursor workspace databases. Configure a source profile for stable actor/app defaults, then pass exported JSONL, text, or Markdown files to the importer:
-
-```bash
-cargo run -p brick -- source configure --name cursor --app-id cursor --actor-id cursor-agent --actor-type agent --session-log-path ./exports/cursor-session.jsonl --notes "Cursor import defaults"
-cargo run -p brick -- import cursor --path ./exports/cursor-session.jsonl --mission <mission-id> --session <session-id> --app-session-id <cursor-native-session> --app-session-name "Cursor task"
-```
+Brick's current user-facing path is `explain` / `link`. Native AI-tool history is
+refreshed automatically as part of those calls when available; the old public
+`source` and `import` commands are no longer part of the supported CLI surface.
 
 ## Smoke verification
 

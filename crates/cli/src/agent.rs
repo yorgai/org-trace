@@ -4,9 +4,9 @@
 //! standing context: `CLAUDE.md` (Claude Code), `AGENTS.md` (Codex, Cursor,
 //! Copilot, OpenCode, …), `GEMINI.md` (Gemini). This module append/replaces a
 //! sentinel-delimited managed block into those files telling the agent to call
-//! `brick history` to recall what past sessions did to the files it is about to
-//! touch. Edits are confined to the managed region and written atomically, so a
-//! user's existing memory file is never corrupted.
+//! `brick explain` before reasoning from code alone. Edits are confined to the
+//! managed region and written atomically, so a user's existing memory file is
+//! never corrupted.
 //!
 //! The markdown block is a *soft* nudge. For Claude Code, `install` additionally
 //! registers a `PreToolUse` hook (see [`crate::claude_hook`]) so recall fires

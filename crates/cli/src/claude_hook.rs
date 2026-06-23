@@ -1,33 +1,24 @@
 //! Claude Code `PreToolUse` hook management for `brick agent`.
 //!
-//! The agent-awareness markdown block is a *soft* nudge — the agent has to
-//! remember to call `brick metadata recall`. A Claude Code hook makes recall
-//! *automatic*: before every `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, Claude
-//! runs `brick metadata recall-hook`, which recalls the target file and injects
-//! the result into Claude's context. This module merges a Brick-owned hook entry
-//! into `settings.json` without disturbing the user's other hooks, keyed by a
-//! stable marker command so install is idempotent and uninstall is exact.
+//! The agent-awareness markdown block is a soft nudge. A Claude Code hook makes
+//! explain context automatic: before read/search tools, Claude runs
+//! `brick hook-explain`, which injects the target file's causal context. This
+//! module merges a Brick-owned hook entry into `settings.json` without disturbing
+//! the user's other hooks, keyed by a stable marker command so install is
+//! idempotent and uninstall is exact.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-/// Tool names whose edits should trigger a recall. Kept to the file-mutating
-/// tools so reads/searches/Bash don't spam context.
-const HOOK_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
-
 /// Tool names whose reads should trigger an explain push: when the agent is
 /// about to inspect a file, surface Brick's WHY before it concludes from code.
 const EXPLAIN_HOOK_MATCHER: &str = "Read|Grep|Glob";
 
 /// Stable marker so we can find (and only touch) the Brick-owned hook entry even
-/// if the user reorders or adds their own hooks. The actual command embeds the
-/// resolved `brick` path; this substring identifies ours.
-const HOOK_COMMAND_MARKER: &str = "brick metadata recall-hook";
-
-/// Marker for the Brick-owned explain (Read/Grep/Glob) hook entry.
-const EXPLAIN_HOOK_COMMAND_MARKER: &str = "brick metadata explain-hook";
+/// if the user reorders or adds their own hooks.
+const EXPLAIN_HOOK_COMMAND_MARKER: &str = "brick hook-explain";
 
 /// Result of an install/uninstall/status operation on the hook config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,28 +59,8 @@ pub fn settings_path(global: bool, dir: Option<&Path>, home: Option<&Path>) -> O
     Some(base.join(".claude").join("settings.json"))
 }
 
-/// The exact command string the recall hook runs, embedding the current `brick`
-/// binary path so the hook works regardless of `PATH`.
-fn hook_command(brick_bin: &str) -> String {
-    format!("{brick_bin} metadata recall-hook")
-}
-
-/// The exact command string the explain hook runs.
 fn explain_hook_command(brick_bin: &str) -> String {
-    format!("{brick_bin} metadata explain-hook")
-}
-
-/// Builds the Brick-owned `PreToolUse` recall (edit) matcher block.
-fn brick_hook_entry(brick_bin: &str) -> Value {
-    json!({
-        "matcher": HOOK_MATCHER,
-        "hooks": [
-            {
-                "type": "command",
-                "command": hook_command(brick_bin),
-            }
-        ]
-    })
+    format!("{brick_bin} hook-explain")
 }
 
 /// Builds the Brick-owned `PreToolUse` explain (read/search) matcher block.
@@ -121,40 +92,30 @@ fn entry_has_marker(entry: &Value, marker: &str) -> bool {
 
 /// Whether a `PreToolUse` matcher entry is any Brick-owned one (recall or explain).
 fn is_brick_entry(entry: &Value) -> bool {
-    entry_has_marker(entry, HOOK_COMMAND_MARKER)
-        || entry_has_marker(entry, EXPLAIN_HOOK_COMMAND_MARKER)
+    entry_has_marker(entry, EXPLAIN_HOOK_COMMAND_MARKER)
 }
 
-/// Installs or refreshes both Brick `PreToolUse` hooks (recall on edits, explain
-/// on reads/searches) in `settings.json`, leaving all other settings and hooks
-/// untouched. Creates the file if absent.
+/// Installs or refreshes the Brick `PreToolUse` explain hook in `settings.json`,
+/// leaving all other settings and hooks untouched. Creates the file if absent.
 pub fn install(path: &Path, brick_bin: &str, force: bool) -> Result<HookAction> {
     let mut root = read_settings(path)?;
     let pre_tool_use = ensure_pre_tool_use_array(&mut root)?;
 
-    let recall = upsert_entry(
-        pre_tool_use,
-        HOOK_COMMAND_MARKER,
-        brick_hook_entry(brick_bin),
-        force,
-    );
-    let explain = upsert_entry(
+    let change = upsert_entry(
         pre_tool_use,
         EXPLAIN_HOOK_COMMAND_MARKER,
         brick_explain_hook_entry(brick_bin),
         force,
     );
 
-    // If neither entry changed, report Unchanged and skip the write.
-    if recall == EntryChange::Unchanged && explain == EntryChange::Unchanged {
+    if change == EntryChange::Unchanged {
         return Ok(HookAction::Unchanged);
     }
     write_settings(path, &root)?;
-    // Installed if either was newly added; otherwise Updated.
-    if recall == EntryChange::Installed || explain == EntryChange::Installed {
-        Ok(HookAction::Installed)
-    } else {
-        Ok(HookAction::Updated)
+    match change {
+        EntryChange::Installed => Ok(HookAction::Installed),
+        EntryChange::Updated => Ok(HookAction::Updated),
+        EntryChange::Unchanged => Ok(HookAction::Unchanged),
     }
 }
 
@@ -329,10 +290,8 @@ mod tests {
         );
         let value = read_settings(&path).unwrap();
         let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
-        // Two Brick entries: recall (edits) + explain (reads/searches).
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
         assert!(entries.iter().all(is_brick_entry));
-        assert!(entries.iter().any(|e| e["matcher"] == HOOK_MATCHER));
         assert!(entries.iter().any(|e| e["matcher"] == EXPLAIN_HOOK_MATCHER));
     }
 
@@ -345,7 +304,7 @@ mod tests {
             HookAction::Unchanged
         );
         let value = read_settings(&path).unwrap();
-        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -369,9 +328,9 @@ mod tests {
         let value = read_settings(&path).unwrap();
         assert_eq!(value["model"], "claude-opus-4");
         let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 3); // user's Bash hook + 2 Brick hooks
+        assert_eq!(pre.len(), 2); // user's Bash hook + Brick explain hook
         assert!(pre.iter().any(|e| e["matcher"] == "Bash"));
-        assert_eq!(pre.iter().filter(|e| is_brick_entry(e)).count(), 2);
+        assert_eq!(pre.iter().filter(|e| is_brick_entry(e)).count(), 1);
         assert_eq!(value["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
     }
 
@@ -387,7 +346,7 @@ mod tests {
         let cmd = value["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert_eq!(cmd, "/new/brick metadata recall-hook");
+        assert_eq!(cmd, "/new/brick hook-explain");
     }
 
     #[test]

@@ -46,8 +46,8 @@ brick agent status             # see which agents are wired up
 ## Use it directly
 
 ```sh
-brick explain src/main.rs:42   # who changed this line & why
-brick history sessions         # browse indexed sessions across your AI tools
+brick explain src/main.rs:42                 # why this code looks this way
+brick link --note "Reason for this change"  # record why after a change
 ```
 
 ## Environment variables

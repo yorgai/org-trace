@@ -127,13 +127,11 @@ GET /v1/sessions?limit=20&app_id=cursor&actor_id=agent-1
 GET /v1/repos/{repo_id}/sessions?limit=20&app_id=cursor
 ```
 
-Local query commands use equivalent rebuildable local projections:
+Local query is intentionally through the core surface now:
 
 ```bash
-cargo run -p brick -- maintenance index rebuild
-cargo run -p brick -- maintenance db rebuild
-cargo run -p brick -- maintenance db sessions --limit 20
-cargo run -p brick -- maintenance db artifacts --limit 20
+cargo run -p brick -- explain <path>:<line>
+cargo run -p brick -- link --note "Why this change was made"
 ```
 
 ## Importer semantics

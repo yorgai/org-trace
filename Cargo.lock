@@ -178,7 +178,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "brick-core",
- "brick-importers",
  "brick-protocol",
  "brick-sync",
  "chrono",
