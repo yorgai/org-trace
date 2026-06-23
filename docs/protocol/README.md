@@ -58,13 +58,11 @@ Artifact kinds are `decision`, `file_ref`, `patch`, `review`, `test_result`, `ac
 ### Causal events
 
 - `causal.linked`: a directed causal edge that turns the time-ordered event stream into a **causal graph** — the core of `explain` (WHY), as opposed to a mere timeline (`git log`). Payload fields:
-  - `effect_event` (UUID, optional): the event that happened (usually a `diff.captured`). The highest-precision effect anchor.
-  - `effect_path` (string, optional): a repo-relative file path used as the effect anchor when no `effect_event` exists — i.e. the agent edited a file with its own tools and recorded a rationale against it without capturing a Brick diff. The next-lower anchor precision after `effect_event`.
-  - `repo_context_id` (optional): the lowest-precision anchor — a repo-level standalone rationale (a bare `note` with no file or event). The effect-anchor ladder is `effect_event` → `effect_path` → `repo_context_id`.
+  - `effect_event` (UUID, required): the event that happened (usually a `diff.captured`).
   - `cause_events` (UUID list, may be empty): zero or more upstream events that caused it. Any `event_id` — a diff, an artifact, another session's event, a mission. Mission is just one possible cause, not a requirement.
   - `relation` (enum): `triggered_by` (set in motion by the cause, e.g. an A2A `previous_actions` step), `derived_from` (built from the cause, e.g. a test covering a fix), `supersedes` (corrects/replaces the cause), `responds_to` (a response to a request), or `rationale` (a standalone reason with no upstream event — the WHY that cannot be reverse-engineered from the code).
   - `note` (optional string): the one-line WHY.
-  - **Invariant:** the edge must carry information — at least one of `effect_event`, `effect_path`, a non-empty `cause_events`, or a non-empty `note`. An edge with none of these is rejected as noise.
+  - **Invariant:** at least one of `cause_events` (non-empty) or `note` (non-empty) must carry information; an edge with neither is rejected as noise.
 
   The event's `confidence` distinguishes how the edge was produced: `explicit` (an agent or human asserted it via `link`), `observed` (a hook captured it from session context), or `inferred` (a fallback heuristic, used only when no explicit edge exists). Edges are projected into the rebuildable `causes` / `effects` adjacency tables at index time; the *chains* are traversed at query time by `explain` (a chain is relative to an anchor + depth, so materializing all chains would combinatorially explode). The adjacency tables and the SQLite `causal_edges` table are derived data — deleting them and rebuilding from JSONL reproduces them exactly.
 

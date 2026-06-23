@@ -140,21 +140,21 @@ reasoning with `explain`. Two forms:
   `responds_to`, `rationale` (defaults to `derived_from` with a cause, else
   `rationale`).
 - **Invariant:** at least one of `cause` or `note` must be present.
-- **Effect resolution (anchor ladder).** `link` resolves the effect at the
-  highest precision available and falls back instead of failing, so the
-  documented standalone-rationale shape always lands:
-  1. `effect` resolves to a real Brick event → bound to that **event**;
-  2. else a working/staged diff is captured → bound to that new diff **event**
-     (a real diff still wins);
-  3. else `effect` is a path with no event and a clean tree → recorded as a
-     **file**-level rationale keyed by that path;
-  4. else (no `effect`, clean tree) → recorded as a **repo**-level rationale.
-  The response's `anchored_to` field reports which level it landed on
-  (`event` / `file` / `repo`) so the rationale is never silently dropped. The
-  only hard error is a **non-path** `effect` that resolves to nothing (a stale
-  id) — fix or drop it. File- and repo-level rationales are surfaced by `explain`
-  on the matching file / repo anchor (a `path:line` anchor does not fold them in,
-  to avoid faking line precision).
+- **Effect = an existing change, or omit it.** A `link` edge always binds to one
+  real change event. Two ways to get there:
+  - **Omit `effect`** (the common case): call `link` *before* you commit and
+    Brick captures your uncommitted diff, binding the reason to exactly those
+    files. This is the recommended shape for a rationale.
+  - **Pass `effect`** only to point at a change Brick has *already* recorded — an
+    event id, or a `path`/`path:line` that resolves through blame to an existing
+    change event.
+
+  An `effect` that resolves to nothing is a **hard error**, not a free-floating
+  note and not a silent redirect into a broad working capture (which could bind
+  the reason to unrelated files). The error tells you to omit `effect` and let
+  Brick capture the diff. Likewise, omitting `effect` on a **clean tree** (already
+  committed — nothing to capture) is an error: there is no change to attach a
+  reason to. Fix either by calling `link` while your edits are still uncommitted.
 
 Edges recorded via `link` carry `confidence: explicit`.
 
