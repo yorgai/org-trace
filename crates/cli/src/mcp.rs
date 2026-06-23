@@ -494,6 +494,51 @@ pub(crate) fn merge_index_sessions_into_chain(
     None
 }
 
+/// Merges standalone `link` rationales (no concrete `effect_event` — recorded
+/// against a file the agent edited or against the repo as a whole) into the
+/// chain, mirroring `merge_index_sessions_into_chain` for the source-session
+/// half. A `file:line` anchor never folds these in (it would fake line
+/// precision); a whole-file anchor pulls both its own `file:<path>` rationales
+/// and the repo-level `repo:<id>` rationales; a repo/direct anchor pulls only
+/// the repo-level ones.
+///
+/// Building the lookup keys here (not inside core) keeps `explain_from_events` a
+/// pure event-id graph walk and puts every anchor-precision decision in one
+/// place — the same layering as the source-session merge.
+pub(crate) fn merge_standalone_rationales_into_chain(
+    chain: &mut CausalChain,
+    index: &brick_core::TraceIndex,
+    repo_root: &std::path::Path,
+    anchored_path: Option<&str>,
+    is_file_line: bool,
+) {
+    if is_file_line {
+        return;
+    }
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(path) = anchored_path {
+        let rel = normalize_repo_relative(repo_root, path);
+        keys.push(format!("{}{rel}", brick_core::EFFECT_KEY_FILE_PREFIX));
+    }
+    // Repo-level rationales: every repo context this repo recorded. The keys are
+    // `repo:<id>`; collect them from the index's known repo contexts.
+    for repo_id in index.repo_contexts.keys() {
+        keys.push(format!("{}{repo_id}", brick_core::EFFECT_KEY_REPO_PREFIX));
+    }
+    if keys.is_empty() {
+        return;
+    }
+    let start_depth = chain.steps.len();
+    let steps = brick_core::standalone_rationales_to_steps(index, &keys, start_depth);
+    if steps.is_empty() {
+        return;
+    }
+    // Reuse the source-step merge: it dedups by session_id (rationales have none,
+    // so all are kept) and re-sorts the unified timeline by occurred_at.
+    merge_source_steps_into(&mut chain.steps, steps);
+    chain.anchor.resolved_events = chain.steps.iter().map(|s| s.event_id.clone()).collect();
+}
+
 /// `explain` dispatch: resolve the anchor (file:line via blame, or a direct id),
 /// walk the causal graph, then enrich with transcript pointers and the `live`
 /// coordination field.
@@ -564,6 +609,15 @@ is fine here."
         anchored_path.as_deref(),
         is_file_line,
         depth,
+    );
+    // Standalone `link` rationales (file/repo-level, no diff event) live in the
+    // in-memory index, not the metadata db — merge them on the same anchor rules.
+    merge_standalone_rationales_into_chain(
+        &mut chain,
+        &index,
+        store.repo_root(),
+        anchored_path.as_deref(),
+        is_file_line,
     );
     let value = finalize_explain_chain(
         chain,
@@ -670,44 +724,11 @@ fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
     // whatever it could resolve, which used to be an unrelated stale diff).
     let mut captured_files: Vec<String> = Vec::new();
 
-    let effect_event = match opt_str_arg(args, "effect") {
-        Some(anchor) => match resolve_anchor_to_event(store, &events, &anchor)? {
-            Some(event_id) => event_id,
-            // The anchor resolved to nothing. If it's a file path, the agent is
-            // pointing at code it JUST edited with its own tools (no Brick event
-            // yet) — capture the working diff and bind to that, exactly like the
-            // no-effect path, instead of hard-erroring on a perfectly reasonable
-            // anchor. Only a non-path anchor (a stale id) is a real error.
-            None if looks_like_path(&anchor) => {
-                match capture_working_diff_event(store, args, &mut captured_files)? {
-                    Some(event_id) => event_id,
-                    None => latest_diff_event(&events).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "effect anchor '{anchor}' has no Brick event and there are no \
-uncommitted changes to capture"
-                        )
-                    })?,
-                }
-            }
-            None => {
-                return Err(anyhow::anyhow!("could not resolve effect anchor: {anchor}"));
-            }
-        },
-        // No explicit effect: the agent just changed code with its own edit tools
-        // (which produce no Brick event), so capture the current working diff and
-        // bind the rationale to THAT — the files actually touched — instead of
-        // guessing at the most recent prior diff (which mis-attributed the note).
-        None => match capture_working_diff_event(store, args, &mut captured_files)? {
-            Some(event_id) => event_id,
-            // Working tree clean (e.g. already committed) — fall back to the most
-            // recent captured diff so a follow-up rationale still lands somewhere.
-            None => latest_diff_event(&events).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no effect given, no uncommitted changes to capture, and no recent diff to bind to"
-                )
-            })?,
-        },
-    };
+    // Resolve the effect anchor at the highest precision available, falling back
+    // through the ladder instead of hard-erroring on a clean working tree (which
+    // broke the documented standalone-rationale call shape). See
+    // `resolve_effect_target`.
+    let effect = resolve_effect_target(store, args, &events, &mut captured_files)?;
 
     let cause_anchor = opt_str_arg(args, "cause");
     let cause_events = match &cause_anchor {
@@ -720,23 +741,36 @@ uncommitted changes to capture"
     let note = opt_str_arg(args, "note");
     let relation = parse_relation(args.get("relation").and_then(Value::as_str), &cause_events)?;
 
-    // Invariant mirror: a standalone edge needs a note.
+    // The `link` tool records WHY: a standalone rationale (`note`) or a causal
+    // edge (`cause`). An effect anchor alone — even a freshly captured diff — adds
+    // no reason and no connection, so require note-or-cause regardless of where
+    // the effect anchored. (The protocol-level invariant is looser; the tool is
+    // deliberately stricter so a reason-free edge never enters the log.)
     if cause_events.is_empty() && note.is_none() {
         return Err(anyhow::anyhow!(
             "link needs either a cause anchor or a note explaining the change"
         ));
     }
 
+    // For a repo-level standalone rationale, anchor to this repo's context so a
+    // later whole-file / repo `explain` can surface it. Event/file targets carry
+    // their own anchor (the effect_event uuid or the effect_path).
+    let repo_context_id = match &effect {
+        EffectTarget::Repo => Some(append_repo_context_for_link(store, args)?),
+        _ => None,
+    };
+
     // Confidence is `explicit` — the agent asserted this edge directly.
     let event = TraceEvent::causal_linked(
         mcp_actor(args),
         ConfidenceLevel::Explicit,
         CausalLinkedPayload {
-            effect_event,
+            effect_event: effect.event(),
+            effect_path: effect.path(),
             cause_events: cause_events.clone(),
             relation,
             note: note.clone(),
-            repo_context_id: None,
+            repo_context_id,
         },
     )
     .map_err(|err| anyhow::anyhow!("invalid causal edge: {err}"))?;
@@ -744,13 +778,115 @@ uncommitted changes to capture"
 
     Ok(json!({
         "linked": true,
-        "effect_event": effect_event.to_string(),
+        "effect_event": effect.event().map(|id| id.to_string()),
+        "effect_path": effect.path(),
+        "anchored_to": effect.anchored_to(),
         "cause_events": cause_events.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "relation": relation_wire(relation),
         "note": note,
         "captured_files": captured_files,
         "note_hint": "Recorded. The next agent can recover this with `explain`."
     }))
+}
+
+/// Where a `link` rationale anchored, highest precision first. This single
+/// resolver replaces the old duplicated effect/no-effect branches so the
+/// fallback ladder lives in exactly one place and can grow new anchor kinds
+/// (symbol, line-range, mission) without touching the call site.
+enum EffectTarget {
+    /// A concrete Brick event (an `effect` id that resolved, or a diff captured
+    /// from the working tree).
+    Event(uuid::Uuid),
+    /// A repo-relative file path the agent edited with no Brick event.
+    File(String),
+    /// No file/event anchor — a repo-level standalone rationale (bare `note`).
+    Repo,
+}
+
+impl EffectTarget {
+    fn event(&self) -> Option<uuid::Uuid> {
+        match self {
+            EffectTarget::Event(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn path(&self) -> Option<String> {
+        match self {
+            EffectTarget::File(path) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// Human-readable precision label for the `link` response, so the agent knows
+    /// the rationale landed and at what granularity (never silently dropped).
+    fn anchored_to(&self) -> &'static str {
+        match self {
+            EffectTarget::Event(_) => "event",
+            EffectTarget::File(_) => "file",
+            EffectTarget::Repo => "repo",
+        }
+    }
+}
+
+/// Resolves the `link` effect anchor through the precision ladder:
+/// 1. an `effect` id that resolves to a real event → `Event`;
+/// 2. else a captured working/staged diff → `Event` (a real diff still wins);
+/// 3. else a path-shaped `effect` → `File` (file-level standalone rationale);
+/// 4. else → `Repo` (repo-level standalone rationale).
+///
+/// The only hard error is a non-path `effect` anchor that resolves to nothing —
+/// a stale id the agent should fix. A clean working tree is NOT an error: it
+/// degrades to a file or repo rationale so the documented `note`-only call shape
+/// always lands.
+fn resolve_effect_target(
+    store: &LocalStore,
+    args: &Value,
+    events: &[TraceEvent],
+    captured_files: &mut Vec<String>,
+) -> Result<EffectTarget> {
+    match opt_str_arg(args, "effect") {
+        Some(anchor) => match resolve_anchor_to_event(store, events, &anchor)? {
+            Some(event_id) => Ok(EffectTarget::Event(event_id)),
+            // A path anchor with no Brick event: prefer a freshly captured diff,
+            // else record a file-level rationale keyed by the path.
+            None if looks_like_path(&anchor) => {
+                match capture_working_diff_event(store, args, captured_files)? {
+                    Some(event_id) => Ok(EffectTarget::Event(event_id)),
+                    None => Ok(EffectTarget::File(normalize_link_effect_path(store, &anchor))),
+                }
+            }
+            // A non-path anchor that resolves to nothing is a stale id — the one
+            // genuine error left.
+            None => Err(anyhow::anyhow!("could not resolve effect anchor: {anchor}")),
+        },
+        // No explicit effect: capture the working diff if any, else a repo-level
+        // standalone rationale (the bare `note` case).
+        None => match capture_working_diff_event(store, args, captured_files)? {
+            Some(event_id) => Ok(EffectTarget::Event(event_id)),
+            None => Ok(EffectTarget::Repo),
+        },
+    }
+}
+
+/// Normalizes a path-shaped `effect` anchor to the repo-relative form used as the
+/// `effect_path` key, so `explain <file>` rebuilds the same key.
+fn normalize_link_effect_path(store: &LocalStore, anchor: &str) -> String {
+    normalize_repo_relative(store.repo_root(), anchor)
+}
+
+/// Appends a repo-context event for a repo-level standalone rationale and returns
+/// its id, mirroring the CLI write path so the rationale anchors to this repo.
+fn append_repo_context_for_link(
+    store: &LocalStore,
+    args: &Value,
+) -> Result<brick_protocol::RepoContextId> {
+    let repo_root = store.repo_root().to_path_buf();
+    let repo_context_id = brick_protocol::RepoContextId::new();
+    let payload = brick_core::capture_repo_context(&repo_root, &repo_root);
+    let event = TraceEvent::repo_context_captured(mcp_actor(args), repo_context_id.clone(), payload)?;
+    store.append_event(&event)?;
+    Ok(repo_context_id)
 }
 
 /// When `link` is called with no `effect`, the agent has just edited code with
@@ -1154,16 +1290,6 @@ fn resolve_anchor_to_event(
         .resolved_events
         .first()
         .and_then(|id| uuid::Uuid::parse_str(id).ok()))
-}
-
-/// The most recent `diff.captured` event, used as the default `link` effect when
-/// the agent doesn't name one (it just changed something).
-fn latest_diff_event(events: &[brick_protocol::TraceEvent]) -> Option<uuid::Uuid> {
-    events
-        .iter()
-        .filter(|event| event.event_type == brick_protocol::EventType::DiffCaptured)
-        .max_by_key(|event| event.occurred_at)
-        .map(|event| event.event_id)
 }
 
 /// Parses the `relation` arg, defaulting to `derived_from` when a cause is given

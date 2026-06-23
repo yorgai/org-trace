@@ -140,13 +140,21 @@ reasoning with `explain`. Two forms:
   `responds_to`, `rationale` (defaults to `derived_from` with a cause, else
   `rationale`).
 - **Invariant:** at least one of `cause` or `note` must be present.
-- **Effect resolution:** when `effect` is a file path the agent just edited with
-  its own tools (no Brick event yet), `link` binds the rationale to the current
-  uncommitted changes in that file's repo. If the file has no Brick event **and**
-  there are no uncommitted changes to capture, `link` fails with that message —
-  it has nowhere to anchor. Fixes: omit `effect` for a standalone `note`, run
-  `link` while the change is still uncommitted, or point `effect` at an anchor
-  Brick already has an event for.
+- **Effect resolution (anchor ladder).** `link` resolves the effect at the
+  highest precision available and falls back instead of failing, so the
+  documented standalone-rationale shape always lands:
+  1. `effect` resolves to a real Brick event → bound to that **event**;
+  2. else a working/staged diff is captured → bound to that new diff **event**
+     (a real diff still wins);
+  3. else `effect` is a path with no event and a clean tree → recorded as a
+     **file**-level rationale keyed by that path;
+  4. else (no `effect`, clean tree) → recorded as a **repo**-level rationale.
+  The response's `anchored_to` field reports which level it landed on
+  (`event` / `file` / `repo`) so the rationale is never silently dropped. The
+  only hard error is a **non-path** `effect` that resolves to nothing (a stale
+  id) — fix or drop it. File- and repo-level rationales are surfaced by `explain`
+  on the matching file / repo anchor (a `path:line` anchor does not fold them in,
+  to avoid faking line precision).
 
 Edges recorded via `link` carry `confidence: explicit`.
 

@@ -554,9 +554,20 @@ impl TraceIndex {
     /// itself is recorded here (index time); the chain is walked later by
     /// `explain` (query time). A standalone `Rationale` has no cause, so it only
     /// lands in `causes` (keyed by the effect) with `cause_event = None`.
+    ///
+    /// The effect key follows the anchor-precision ladder: a concrete
+    /// `effect_event` uuid, else a `file:<path>` synthetic key (a file the agent
+    /// edited with no Brick event), else a `repo:<id>` key (a repo-level
+    /// standalone rationale). This keeps `causes` a single uniform table that
+    /// `explain` reads the same way for every anchor precision.
     fn apply_causal_linked(&mut self, event: &TraceEvent) -> Result<()> {
         let payload = payload::<CausalLinkedPayload>(event)?;
-        let effect = payload.effect_event.to_string();
+        let Some(effect) = effect_key(&payload) else {
+            // No effect anchor at any precision — nothing to key a backward edge
+            // by. The `causal_linked` invariant prevents a fully-empty edge, so
+            // this only skips the exotic cause-only-with-no-effect shape.
+            return Ok(());
+        };
         let confidence = confidence_name(event.confidence).to_string();
         let source_event_id = event.event_id.to_string();
 
@@ -722,6 +733,27 @@ fn new_session(session_id: &SessionId, event: &TraceEvent) -> IndexedSession {
 
 fn new_artifact(artifact_id: &ArtifactId, event: &TraceEvent) -> IndexedArtifact {
     IndexedArtifact::blank(artifact_id.to_string(), event.recorded_at)
+}
+
+/// The `causes`-table key for a `causal.linked` effect, at the highest available
+/// anchor precision: `effect_event` uuid → `file:<path>` → `repo:<id>`. `None`
+/// only when the edge carries no effect anchor at any level.
+fn effect_key(payload: &CausalLinkedPayload) -> Option<String> {
+    if let Some(event) = payload.effect_event {
+        return Some(event.to_string());
+    }
+    if let Some(path) = payload
+        .effect_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        return Some(format!("{}{path}", crate::EFFECT_KEY_FILE_PREFIX));
+    }
+    payload
+        .repo_context_id
+        .as_ref()
+        .map(|repo| format!("{}{repo}", crate::EFFECT_KEY_REPO_PREFIX))
 }
 
 fn payload<T>(event: &TraceEvent) -> Result<T>
@@ -972,7 +1004,8 @@ mod tests {
             actor(),
             ConfidenceLevel::Observed,
             CausalLinkedPayload {
-                effect_event: e2,
+                effect_event: Some(e2),
+                effect_path: None,
                 cause_events: vec![],
                 relation: CausalRelation::Rationale,
                 note: Some("token refresh race".to_string()),
@@ -986,7 +1019,8 @@ mod tests {
             actor(),
             ConfidenceLevel::Explicit,
             CausalLinkedPayload {
-                effect_event: e4,
+                effect_event: Some(e4),
+                effect_path: None,
                 cause_events: vec![e2],
                 relation: CausalRelation::DerivedFrom,
                 note: Some("covers the race fix".to_string()),

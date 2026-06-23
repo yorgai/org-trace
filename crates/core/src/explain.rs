@@ -33,6 +33,10 @@ pub const MAX_EXPLAIN_DEPTH: usize = 8;
 /// (file-level provenance) rather than a real recorded trace event.
 pub const EVENT_TYPE_SOURCE_SESSION: &str = "source.session";
 
+/// Synthetic event type for a standalone `link` rationale that was recorded
+/// against a file or repo (no concrete `effect_event`) rather than a diff.
+pub const EVENT_TYPE_STANDALONE_RATIONALE: &str = "standalone.rationale";
+
 /// How an anchor string was resolved to one or more starting events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +235,59 @@ pub fn merge_source_steps_into(chain_steps: &mut Vec<CausalStep>, source_steps: 
     for (depth, step) in chain_steps.iter_mut().enumerate() {
         step.depth = depth;
     }
+}
+
+/// Builds CTP steps from standalone `link` rationales keyed by a synthetic
+/// `file:<path>` or `repo:<id>` effect key — the rationales the agent recorded
+/// with `link` against a file it edited (no Brick diff event) or against the
+/// repo as a whole (a bare `note`). These live in the same `index.causes` table
+/// as event-keyed edges, so this is a thin lookup that mirrors
+/// `source_sessions_to_steps`: same shape, different source.
+///
+/// `keys` are the effect keys to surface, highest precision first (file key
+/// before repo key). Each cause-less edge under a key becomes an `explicit`
+/// step carrying the recorded `note` as WHY. Pure (no I/O) so it unit-tests
+/// without a db.
+pub fn standalone_rationales_to_steps(
+    index: &TraceIndex,
+    keys: &[String],
+    start_depth: usize,
+) -> Vec<CausalStep> {
+    let mut steps = Vec::new();
+    for key in keys {
+        let Some(edges) = index.causes.get(key) else {
+            continue;
+        };
+        for edge in edges {
+            // Only cause-less edges are standalone rationales; cross-event edges
+            // are walked by `explain_from_events` from their real effect event.
+            if edge.cause_event.is_some() {
+                continue;
+            }
+            let what = if key.starts_with(crate::EFFECT_KEY_FILE_PREFIX) {
+                "file rationale".to_string()
+            } else {
+                "repo rationale".to_string()
+            };
+            steps.push(CausalStep {
+                event_id: edge.source_event_id.clone(),
+                event_type: EVENT_TYPE_STANDALONE_RATIONALE.to_string(),
+                what: Some(what),
+                actor_type: None,
+                actor_id: None,
+                session_id: None,
+                mission_id: None,
+                mission_title: None,
+                occurred_at: edge.recorded_at.to_rfc3339(),
+                relation: Some(relation_name(edge)),
+                note: edge.note.clone(),
+                confidence: edge.confidence.clone(),
+                transcript: None,
+                depth: start_depth + steps.len(),
+            });
+        }
+    }
+    steps
 }
 
 /// Resolves a direct (non-file) anchor string to its starting event-ids.
@@ -864,7 +921,8 @@ mod tests {
             actor(),
             confidence,
             CausalLinkedPayload {
-                effect_event: effect,
+                effect_event: Some(effect),
+                effect_path: None,
                 cause_events: causes,
                 relation,
                 note: Some(note.to_string()),
@@ -1252,5 +1310,66 @@ mod tests {
         let source = vec![step("source-session:codex:sX", Some("sX"), "2026-06-22T10:00:30Z", "observed")];
         merge_source_steps_into(&mut chain, source);
         assert_eq!(chain.len(), 2, "no session_id means no dedup — keep both");
+    }
+
+    /// Builds a standalone (cause-less) `causal.linked` event whose effect is a
+    /// file path or repo, exercising the optional-effect anchor ladder.
+    fn standalone_rationale(
+        effect_path: Option<&str>,
+        repo_context_id: Option<brick_protocol::RepoContextId>,
+        note: &str,
+    ) -> TraceEvent {
+        TraceEvent::causal_linked(
+            actor(),
+            ConfidenceLevel::Explicit,
+            CausalLinkedPayload {
+                effect_event: None,
+                effect_path: effect_path.map(ToString::to_string),
+                cause_events: vec![],
+                relation: CausalRelation::Rationale,
+                note: Some(note.to_string()),
+                repo_context_id,
+            },
+        )
+        .expect("standalone rationale")
+    }
+
+    #[test]
+    fn standalone_file_rationale_surfaces_for_file_key() {
+        let event = standalone_rationale(Some("src/auth.rs"), None, "serialized token refresh");
+        let index = TraceIndex::build(&[event.clone()]).expect("index");
+        let key = format!("{}src/auth.rs", crate::EFFECT_KEY_FILE_PREFIX);
+
+        let steps = standalone_rationales_to_steps(&index, &[key], 0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].event_type, EVENT_TYPE_STANDALONE_RATIONALE);
+        assert_eq!(steps[0].what.as_deref(), Some("file rationale"));
+        assert_eq!(steps[0].note.as_deref(), Some("serialized token refresh"));
+        assert_eq!(steps[0].confidence, "explicit");
+        assert_eq!(steps[0].event_id, event.event_id.to_string());
+    }
+
+    #[test]
+    fn standalone_repo_rationale_surfaces_for_repo_key() {
+        let repo = brick_protocol::RepoContextId::new();
+        let event = standalone_rationale(None, Some(repo.clone()), "repo-wide convention");
+        let index = TraceIndex::build(&[event]).expect("index");
+        let key = format!("{}{repo}", crate::EFFECT_KEY_REPO_PREFIX);
+
+        let steps = standalone_rationales_to_steps(&index, &[key], 0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].what.as_deref(), Some("repo rationale"));
+        assert_eq!(steps[0].note.as_deref(), Some("repo-wide convention"));
+    }
+
+    #[test]
+    fn standalone_rationale_absent_for_unrelated_key() {
+        let event = standalone_rationale(Some("src/auth.rs"), None, "x");
+        let index = TraceIndex::build(&[event]).expect("index");
+        // A different file key must not surface this file's rationale.
+        let other = format!("{}src/other.rs", crate::EFFECT_KEY_FILE_PREFIX);
+        assert!(standalone_rationales_to_steps(&index, &[other], 0).is_empty());
+        // And a file:line anchor (which never passes file/repo keys) sees nothing.
+        assert!(standalone_rationales_to_steps(&index, &[], 0).is_empty());
     }
 }

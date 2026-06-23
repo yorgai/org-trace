@@ -299,15 +299,18 @@ impl TraceEvent {
     ///
     /// `confidence` distinguishes how the edge was produced: `Explicit` (an agent
     /// or human asserted it), `Observed` (a hook captured it from session
-    /// context), or `Inferred` (a fallback heuristic). The invariant — at least
-    /// one of `cause_events` or `note` must be non-empty — is enforced here so an
-    /// information-free edge can never enter the log.
+    /// context), or `Inferred` (a fallback heuristic). The invariant — the edge
+    /// must carry information: at least one of `effect_event`, `effect_path`,
+    /// `cause_events`, or `note` — is enforced here so an information-free edge
+    /// can never enter the log.
     pub fn causal_linked(
         actor: ActorRef,
         confidence: ConfidenceLevel,
         payload: CausalLinkedPayload,
     ) -> Result<Self, CausalLinkError> {
-        if payload.cause_events.is_empty()
+        if payload.effect_event.is_none()
+            && payload.effect_path.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && payload.cause_events.is_empty()
             && payload.note.as_deref().map(str::trim).unwrap_or("").is_empty()
         {
             return Err(CausalLinkError::Empty);
@@ -563,7 +566,8 @@ mod tests {
             actor(),
             ConfidenceLevel::Explicit,
             CausalLinkedPayload {
-                effect_event: effect,
+                effect_event: Some(effect),
+                effect_path: None,
                 cause_events: vec![cause],
                 relation: CausalRelation::DerivedFrom,
                 note: Some("covers the race fix".to_string()),
@@ -589,7 +593,8 @@ mod tests {
             actor(),
             ConfidenceLevel::Observed,
             CausalLinkedPayload {
-                effect_event: effect,
+                effect_event: Some(effect),
+                effect_path: None,
                 cause_events: vec![],
                 relation: CausalRelation::Rationale,
                 note: Some("token refresh has a concurrency race".to_string()),
@@ -610,7 +615,8 @@ mod tests {
             actor(),
             ConfidenceLevel::Inferred,
             CausalLinkedPayload {
-                effect_event: Uuid::new_v4(),
+                effect_event: Some(Uuid::new_v4()),
+                effect_path: None,
                 cause_events: vec![Uuid::new_v4(), Uuid::new_v4()],
                 relation: CausalRelation::TriggeredBy,
                 note: None,
@@ -630,7 +636,8 @@ mod tests {
             actor(),
             ConfidenceLevel::Explicit,
             CausalLinkedPayload {
-                effect_event: Uuid::new_v4(),
+                effect_event: None,
+                effect_path: None,
                 cause_events: vec![],
                 relation: CausalRelation::Rationale,
                 note: Some("   ".to_string()),
@@ -638,6 +645,30 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(CausalLinkError::Empty)));
+    }
+
+    #[test]
+    fn causal_linked_standalone_file_rationale_round_trips() {
+        let event = TraceEvent::causal_linked(
+            actor(),
+            ConfidenceLevel::Explicit,
+            CausalLinkedPayload {
+                effect_event: None,
+                effect_path: Some("src/auth.rs".to_string()),
+                cause_events: vec![],
+                relation: CausalRelation::Rationale,
+                note: Some("serialized the token refresh".to_string()),
+                repo_context_id: None,
+            },
+        )
+        .expect("build file-level standalone rationale");
+
+        let serialized = serde_json::to_string(&event).expect("serialize");
+        // effect_event is absent on the wire; effect_path carries the anchor.
+        assert!(event.payload.get("effect_event").is_none());
+        assert_eq!(event.payload["effect_path"], "src/auth.rs");
+        let decoded: TraceEvent = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(decoded, event);
     }
 
     #[test]

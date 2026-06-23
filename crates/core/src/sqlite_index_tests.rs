@@ -308,7 +308,8 @@ fn causal_edges_survive_sqlite_rebuild() {
             actor(),
             ConfidenceLevel::Observed,
             CausalLinkedPayload {
-                effect_event: e2,
+                effect_event: Some(e2),
+                effect_path: None,
                 cause_events: vec![],
                 relation: CausalRelation::Rationale,
                 note: Some("token refresh race".to_string()),
@@ -320,7 +321,8 @@ fn causal_edges_survive_sqlite_rebuild() {
             actor(),
             ConfidenceLevel::Explicit,
             CausalLinkedPayload {
-                effect_event: e4,
+                effect_event: Some(e4),
+                effect_path: None,
                 cause_events: vec![e2],
                 relation: CausalRelation::DerivedFrom,
                 note: Some("covers the race fix".to_string()),

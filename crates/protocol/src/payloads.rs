@@ -246,17 +246,28 @@ pub struct ExternalRefLinkedPayload {
 
 /// Payload for a directed causal edge in the provenance graph.
 ///
-/// `effect_event` is the event that happened (usually a `diff.captured`);
-/// `cause_events` are the zero-or-more upstream events that caused it (any
-/// `event_id` — a diff, an artifact, another session's event, a mission — not
-/// just a mission). `cause_events` may be empty for a standalone `Rationale`.
+/// The effect this edge is about is anchored at one of three precision levels,
+/// highest to lowest: a specific `effect_event` (usually a `diff.captured`), a
+/// repo-relative `effect_path` (a file the agent edited with its own tools, with
+/// no Brick event yet), or — when neither is known — the `repo_context_id` alone
+/// (a repo-level standalone rationale). `cause_events` are the zero-or-more
+/// upstream events that caused it (any `event_id` — a diff, an artifact, another
+/// session's event, a mission). `cause_events` may be empty for a standalone
+/// `Rationale`.
 ///
-/// Invariant (enforced by `TraceEvent::causal_linked`): at least one of
-/// `cause_events` (non-empty) or `note` (non-empty) must carry information — an
-/// edge with neither a cause nor a reason is pure noise and is rejected.
+/// Invariant (enforced by `TraceEvent::causal_linked`): the edge must carry
+/// information — at least one of `effect_event`, `effect_path`, a non-empty
+/// `cause_events`, or a non-empty `note`. An edge with none of these is pure
+/// noise and is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausalLinkedPayload {
-    pub effect_event: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_event: Option<Uuid>,
+    /// Repo-relative path of a file-level effect when no `effect_event` exists
+    /// (the agent edited the file with its own tools). The next-lower anchor
+    /// precision after `effect_event`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cause_events: Vec<Uuid>,
     pub relation: CausalRelation,

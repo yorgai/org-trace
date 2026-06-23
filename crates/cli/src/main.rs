@@ -412,6 +412,15 @@ fn handle_explain(
         is_file_line,
         depth,
     );
+    // Standalone `link` rationales (file/repo-level, no diff event) — same merge
+    // as the MCP surface so both entry points answer identically.
+    mcp::merge_standalone_rationales_into_chain(
+        &mut chain,
+        &index,
+        store.repo_root(),
+        anchored_path.as_deref(),
+        is_file_line,
+    );
     let value = mcp::finalize_explain_chain(
         chain,
         store,

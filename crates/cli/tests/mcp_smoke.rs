@@ -1194,6 +1194,112 @@ fn link_with_unresolvable_file_effect_falls_back_to_working_capture() {
     let _ = std::fs::remove_dir_all(&w.root);
 }
 
+/// The documented standalone-rationale shape (`note` only) on a CLEAN working
+/// tree must NOT hard-fail. With no diff to capture it records a repo-level
+/// rationale; `explain` on the repo surfaces it. This is the exact gap that made
+/// `link` reject a perfectly reasonable bare-note call.
+#[test]
+fn link_bare_note_on_clean_tree_records_repo_rationale() {
+    let w = world("link-bare-note", &[("src/auth.rs", "fn refresh() {}\n")]);
+    // world() commits the seed → the working tree is clean (nothing to capture).
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let linked = m.call(
+        "link",
+        json!({"note":"the whole module follows a serialize-then-commit invariant"}),
+    );
+    assert_eq!(
+        linked["linked"],
+        json!(true),
+        "bare note on a clean tree must succeed, not error: {linked}"
+    );
+    assert_eq!(
+        linked["anchored_to"],
+        json!("repo"),
+        "no file/diff → repo-level anchor: {linked}"
+    );
+    assert_eq!(
+        linked["captured_files"],
+        json!([]),
+        "clean tree captures no files: {linked}"
+    );
+
+    // Repo-level rationale surfaces on a whole-file explain in this repo.
+    let chain = m.call("explain", json!({"anchor":"src/auth.rs"}));
+    let has_why = chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("serialize-then-commit"))
+                .unwrap_or(false)
+        });
+    assert!(has_why, "repo rationale must be recoverable: {chain}");
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// A path `effect` on a CLEAN tree (file has no Brick event, nothing to capture)
+/// records a FILE-level rationale keyed by that path, and `explain <file>`
+/// recovers it. Previously this hard-errored ("no Brick event and no uncommitted
+/// changes to capture").
+#[test]
+fn link_file_effect_on_clean_tree_records_file_rationale() {
+    let w = world("link-file-note", &[("src/cache.rs", "fn get() {}\n")]);
+    // Clean tree (committed). No diff to capture; the path keys the rationale.
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let linked = m.call(
+        "link",
+        json!({"effect":"src/cache.rs","note":"get() is intentionally allocation-free"}),
+    );
+    assert_eq!(
+        linked["linked"],
+        json!(true),
+        "file effect on a clean tree must succeed, not error: {linked}"
+    );
+    assert_eq!(linked["anchored_to"], json!("file"), "{linked}");
+    assert_eq!(linked["effect_path"], json!("src/cache.rs"), "{linked}");
+
+    let chain = m.call("explain", json!({"anchor":"src/cache.rs"}));
+    let has_why = chain["causal_chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| {
+            step["note"]
+                .as_str()
+                .map(|note| note.contains("allocation-free"))
+                .unwrap_or(false)
+        });
+    assert!(has_why, "file rationale must be recoverable: {chain}");
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// A NON-path `effect` anchor that resolves to nothing (a stale/typo id) is still
+/// a genuine error — the one case the fallback ladder must not swallow.
+#[test]
+fn link_unresolvable_non_path_effect_still_errors() {
+    let w = world("link-stale-id", &[("src/auth.rs", "fn refresh() {}\n")]);
+    let mut m = Mcp::spawn(&w.home, &w.repo);
+    let result = m.call(
+        "link",
+        json!({"effect":"event_00000000-0000-0000-0000-000000000000","note":"x"}),
+    );
+    // A stale id surfaces an error rather than silently anchoring elsewhere.
+    let text = format!("{result}");
+    assert!(
+        text.contains("could not resolve effect anchor"),
+        "stale non-path effect must error: {result}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
 #[test]
 fn link_cross_event_edge_shows_as_forward_effect() {
     let w = world(

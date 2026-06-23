@@ -46,6 +46,13 @@ pub struct TraceIndex {
     pub effects: BTreeMap<String, Vec<String>>,
 }
 
+/// Synthetic `TraceIndex.causes` key prefixes for standalone rationales that
+/// have no concrete `effect_event`. They mirror the anchor-precision ladder so a
+/// rationale recorded against a file or repo can be looked up by rebuilding the
+/// same key. A real event keys on its raw uuid string (no prefix).
+pub const EFFECT_KEY_FILE_PREFIX: &str = "file:";
+pub const EFFECT_KEY_REPO_PREFIX: &str = "repo:";
+
 /// One causal edge from an effect event back to a single cause, carrying the
 /// relation, optional rationale note, and the confidence of the attribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
