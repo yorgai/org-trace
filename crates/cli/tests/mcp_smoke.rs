@@ -1126,7 +1126,7 @@ fn link_cause_mission_connects_planning_to_code() {
         .as_array()
         .map(|fs| {
             fs.iter().any(|f| {
-                f["what"]
+                f["title"]
                     .as_str()
                     .map(|w| w.contains("cache.rs"))
                     .unwrap_or(false)

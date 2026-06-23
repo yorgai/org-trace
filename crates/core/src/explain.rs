@@ -71,9 +71,9 @@ pub struct TranscriptPointer {
 pub struct CausalStep {
     pub event_id: String,
     pub event_type: String,
-    /// Short human description ("modified auth.rs", "added test_auth.rs", an
-    /// artifact title), best-effort from the event metadata.
-    pub what: Option<String>,
+    /// Short human title for this step ("modified auth.rs", a session/artifact
+    /// title), best-effort from the event metadata.
+    pub title: Option<String>,
     pub actor_type: Option<String>,
     pub actor_id: Option<String>,
     pub session_id: Option<String>,
@@ -99,7 +99,7 @@ pub struct CausalStep {
 pub struct ForwardEffect {
     pub event_id: String,
     pub event_type: String,
-    pub what: Option<String>,
+    pub title: Option<String>,
     pub relation_to_anchor: Option<String>,
     pub session_id: Option<String>,
 }
@@ -158,14 +158,14 @@ pub fn source_sessions_to_steps(
         // their tool's history. The anchor file is already known from the query,
         // so we don't append a redundant "— touched <file>" suffix. Fall back to a
         // minimal phrasing only when no title was indexed.
-        let what = match row.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let title = match row.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(title) => title.to_string(),
             None => format!("touched {file_name} in {source} session"),
         };
         steps.push(CausalStep {
             event_id,
             event_type: EVENT_TYPE_SOURCE_SESSION.to_string(),
-            what: Some(what),
+            title: Some(title),
             actor_type: row.actor_type.clone(),
             actor_id: row.actor_id.clone().or_else(|| Some(source.clone())),
             session_id: (!external.is_empty()).then(|| external.clone()),
@@ -560,7 +560,7 @@ fn build_step(
         Some(event) => CausalStep {
             event_id: event_id.to_string(),
             event_type: event_type_wire(event.event_type).to_string(),
-            what: describe_event(event),
+            title: describe_event(event),
             actor_type: Some(actor_type_wire(event).to_string()),
             actor_id: Some(event.actor.actor_id.clone()),
             session_id: event.session_id.as_ref().map(ToString::to_string),
@@ -578,7 +578,7 @@ fn build_step(
         None => CausalStep {
             event_id: event_id.to_string(),
             event_type: "unknown".to_string(),
-            what: None,
+            title: None,
             actor_type: None,
             actor_id: None,
             session_id: None,
@@ -657,7 +657,7 @@ fn inferred_same_session_steps(
         .map(|(offset, event)| CausalStep {
             event_id: event.event_id.to_string(),
             event_type: event_type_wire(event.event_type).to_string(),
-            what: describe_event(event),
+            title: describe_event(event),
             actor_type: Some(actor_type_wire(event).to_string()),
             actor_id: Some(event.actor.actor_id.clone()),
             session_id: event.session_id.as_ref().map(ToString::to_string),
@@ -700,7 +700,7 @@ fn forward_effects(
                 event_type: event
                     .map(|event| event_type_wire(event.event_type).to_string())
                     .unwrap_or_else(|| "unknown".to_string()),
-                what: event.and_then(describe_event),
+                title: event.and_then(describe_event),
                 relation_to_anchor: relation,
                 session_id: event.and_then(|event| event.session_id.as_ref().map(ToString::to_string)),
             });
@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(chain.steps[1].relation.as_deref(), Some("derived_from"));
         assert_eq!(chain.steps[1].note.as_deref(), Some("token refresh race"));
         assert_eq!(chain.steps[1].confidence, "observed");
-        assert_eq!(chain.steps[1].what.as_deref(), Some("changed auth.rs"));
+        assert_eq!(chain.steps[1].title.as_deref(), Some("changed auth.rs"));
         assert!(!chain.truncated);
     }
 
@@ -1139,7 +1139,7 @@ mod tests {
         let step = &steps[0];
         assert_eq!(step.event_type, EVENT_TYPE_SOURCE_SESSION);
         assert_eq!(step.confidence, "observed");
-        assert_eq!(step.what.as_deref(), Some("touched merge.rs in codex_app session"));
+        assert_eq!(step.title.as_deref(), Some("touched merge.rs in codex_app session"));
         assert_eq!(step.session_id.as_deref(), Some("sess-1"));
         assert_eq!(step.note, None, "WHY is filled later from the transcript");
         let transcript = step.transcript.as_ref().expect("transcript pointer");
@@ -1173,7 +1173,7 @@ mod tests {
         let steps = source_sessions_to_steps(&[row], 0);
         assert_eq!(steps.len(), 1);
         assert_eq!(
-            steps[0].what.as_deref(),
+            steps[0].title.as_deref(),
             Some("Cache git status lookups"),
             "a session with a title must get the title verbatim as its what"
         );
@@ -1186,7 +1186,7 @@ mod tests {
         let steps = source_sessions_to_steps(&[row], 0);
         assert_eq!(steps.len(), 1);
         assert_eq!(
-            steps[0].what.as_deref(),
+            steps[0].title.as_deref(),
             Some("touched types.ts in orgii session"),
             "no title → fall back to the generic phrasing"
         );
@@ -1197,7 +1197,7 @@ mod tests {
         CausalStep {
             event_id: event_id.to_string(),
             event_type: "test".to_string(),
-            what: None,
+            title: None,
             actor_type: None,
             actor_id: None,
             session_id: session_id.map(ToOwned::to_owned),

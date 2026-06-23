@@ -67,7 +67,7 @@ Output (abridged):
               "resolved_events": ["<event-id>"], "blame_confidence": "commit" },
   "causal_chain": [
     { "event_id": "…", "event_type": "diff.captured",
-      "what": "changed auth.rs", "actor_id": "claude",
+      "title": "changed auth.rs", "actor_id": "claude",
       "session_id": "session_…", "mission_id": "mission_…",
       "occurred_at": "…", "relation": null,
       "note": "token refresh had a concurrency race; serialized it",
@@ -75,7 +75,7 @@ Output (abridged):
       "transcript": { "source": null, "session_id": "session_…" } }
   ],
   "forward": [
-    { "event_id": "…", "what": "added test_auth.rs",
+    { "event_id": "…", "title": "added test_auth.rs",
       "relation_to_anchor": "derived_from" }
   ],
   "truncated": false,
