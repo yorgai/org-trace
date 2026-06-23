@@ -8,8 +8,6 @@ use serde_json::Value;
 
 use crate::NativeSessionMetadata;
 
-pub(super) const TITLE_LIMIT: usize = 200;
-
 #[derive(Debug, Clone)]
 pub(super) struct JsonlRecord {
     pub value: Value,
@@ -99,8 +97,12 @@ pub(super) fn text_from_value(value: &Value) -> Option<String> {
     })
 }
 
-pub(super) fn truncate_title(value: String) -> String {
-    value.chars().take(TITLE_LIMIT).collect()
+/// Normalizes a session title for the single-line `title` field: keeps the full
+/// text (titles are short in practice and callers want them whole) but folds any
+/// internal whitespace runs — including newlines from multi-line prompts — into
+/// single spaces so the title stays one clean line in `explain` output.
+pub(super) fn normalize_title(value: String) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(super) fn token_value(value: &Value, key: &str) -> u64 {

@@ -13,7 +13,7 @@ use crate::{
     FUNCTION_RUN_COMMAND_LINE,
 };
 
-use super::jsonl::truncate_title;
+use super::jsonl::normalize_title;
 
 const OPENCODE_SOURCE_ID: &str = "opencode";
 const OPENCODE_SQLITE_PARSER_VERSION: &str = "opencode-sqlite-v1";
@@ -276,7 +276,7 @@ fn session_from_row(
     part_tokens: &TokenTotals,
 ) -> rusqlite::Result<NativeSourceSession> {
     let external_session_id = string_cell(row, 0)?;
-    let title = optional_string_cell(row, 1)?.map(truncate_title);
+    let title = optional_string_cell(row, 1)?.map(normalize_title);
     let repo_path = optional_string_cell(row, 2)?.map(PathBuf::from);
     let model = optional_string_cell(row, 3)?.and_then(|raw| model_name(&raw));
     let session_created_at = system_time_cell(row, 4)?;

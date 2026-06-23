@@ -19,7 +19,6 @@ use super::{
 
 const COMPOSER_DATA_PREFIX: &str = "composerData:";
 const BUBBLE_PREFIX: &str = "bubbleId:";
-const TITLE_LIMIT: usize = 200;
 const BUBBLE_TYPE_USER: i64 = 1;
 const BUBBLE_TYPE_ASSISTANT: i64 = 2;
 
@@ -94,7 +93,7 @@ pub(in crate::sources) fn composer_header_session(
     let title = composer
         .get("name")
         .and_then(Value::as_str)
-        .map(truncate_title)
+        .map(normalize_title)
         .or_else(|| Some(composer_id.to_string()));
     let session_created_at = composer.get("createdAt").and_then(value_to_system_time_ms);
     let session_updated_at = composer
@@ -692,6 +691,6 @@ fn cursor_file_path(value: &str) -> String {
     value.strip_prefix("file://").unwrap_or(value).to_string()
 }
 
-fn truncate_title(value: &str) -> String {
-    value.chars().take(TITLE_LIMIT).collect()
+fn normalize_title(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }

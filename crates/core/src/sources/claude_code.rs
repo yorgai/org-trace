@@ -12,7 +12,7 @@ use crate::{
 
 use super::jsonl::{
     read_jsonl_records, read_jsonl_values, set_first_path, set_first_string,
-    set_first_string_value, text_from_value, token_value, truncate_title, update_session_times,
+    set_first_string_value, text_from_value, token_value, normalize_title, update_session_times,
 };
 
 const CLAUDE_CODE_SOURCE_ID: &str = "claude_code";
@@ -280,7 +280,7 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
             metadata.title = message
                 .and_then(|message_value| message_value.get("content"))
                 .and_then(text_from_value)
-                .map(truncate_title);
+                .map(normalize_title);
         }
 
         if let Some(model) = message

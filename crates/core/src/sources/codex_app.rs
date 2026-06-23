@@ -12,7 +12,7 @@ use crate::{
 
 use super::jsonl::{
     read_jsonl_records, read_jsonl_values, set_first_path, set_first_string, text_from_value,
-    token_value, truncate_title, update_session_times,
+    token_value, normalize_title, update_session_times,
 };
 
 const CODEX_APP_SOURCE_ID: &str = "codex_app";
@@ -245,7 +245,7 @@ fn extract_jsonl_metadata(path: &Path) -> Result<NativeSessionMetadata> {
             metadata.title = payload
                 .get("message")
                 .and_then(text_from_value)
-                .map(truncate_title);
+                .map(normalize_title);
         }
 
         if payload_type == Some("token_count") {

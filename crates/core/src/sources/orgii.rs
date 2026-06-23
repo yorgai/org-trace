@@ -23,7 +23,7 @@ use crate::{
     NativeSourceSession, SourceProfile,
 };
 
-use super::jsonl::truncate_title;
+use super::jsonl::normalize_title;
 use super::shell_edits::shell_edit_targets;
 
 const ORGII_SOURCE_ID: &str = "orgii";
@@ -144,7 +144,7 @@ fn session_from_row(
         .as_deref()
         .filter(|name| !name.is_empty())
         .or(row.user_input.as_deref())
-        .map(|value| truncate_title(value.to_string()));
+        .map(|value| normalize_title(value.to_string()));
     let touched_files: Vec<String> = impact.touched_files.into_iter().collect();
     let files_changed = (!touched_files.is_empty()).then_some(touched_files.len() as u64);
 

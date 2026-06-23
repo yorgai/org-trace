@@ -21,7 +21,7 @@ use crate::{
     SourceProfile,
 };
 
-use super::jsonl::truncate_title;
+use super::jsonl::normalize_title;
 use super::shell_edits::shell_edit_targets;
 
 const GEMINI_PARSER_VERSION: &str = "gemini-chat-json-v1";
@@ -193,7 +193,7 @@ fn extract_chat_metadata(path: &Path) -> Result<NativeSessionMetadata> {
                     .get("content")
                     .and_then(serde_json::Value::as_str)
                     .filter(|text| !text.is_empty())
-                    .map(|text| truncate_title(text.to_string()));
+                    .map(|text| normalize_title(text.to_string()));
             }
             if metadata.model.is_none() {
                 if let Some(model) = message.get("model").and_then(serde_json::Value::as_str) {
