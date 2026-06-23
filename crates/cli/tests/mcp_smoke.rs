@@ -222,8 +222,17 @@ fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         &home,
         &repo,
         &[
-            "source", "configure", "--name", "codex_app", "--app-id", "codex_app", "--actor-id",
-            "codex-agent", "--actor-type", "agent", "--session-log-path",
+            "source",
+            "configure",
+            "--name",
+            "codex_app",
+            "--app-id",
+            "codex_app",
+            "--actor-id",
+            "codex-agent",
+            "--actor-type",
+            "agent",
+            "--session-log-path",
             codex_dir.to_str().unwrap(),
         ],
     );
@@ -231,8 +240,17 @@ fn setup_world(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         &home,
         &repo,
         &[
-            "source", "configure", "--name", "claude_code", "--app-id", "claude_code",
-            "--actor-id", "claude-agent", "--actor-type", "agent", "--session-log-path",
+            "source",
+            "configure",
+            "--name",
+            "claude_code",
+            "--app-id",
+            "claude_code",
+            "--actor-id",
+            "claude-agent",
+            "--actor-type",
+            "agent",
+            "--session-log-path",
             claude_dir.to_str().unwrap(),
         ],
     );
@@ -354,7 +372,10 @@ fn planning_loop_mission_artifact_attach() {
         json!({"action":"create","project":project,"title":"Cache git status","status":"active","source":"codex_app"}),
     );
     assert_eq!(created["created"], json!(true), "{created}");
-    let mid = created["mission_id"].as_str().expect("mission_id").to_string();
+    let mid = created["mission_id"]
+        .as_str()
+        .expect("mission_id")
+        .to_string();
 
     let listed = m.call("mission_list", json!({"status":"active"}));
     assert!(
@@ -371,7 +392,10 @@ fn planning_loop_mission_artifact_attach() {
         json!({"title":"PR: cache","kind":"patch","mission":mid,"source":"codex_app"}),
     );
     assert_eq!(art["recorded"], json!(true), "{art}");
-    let aid = art["artifact_id"].as_str().expect("artifact_id").to_string();
+    let aid = art["artifact_id"]
+        .as_str()
+        .expect("artifact_id")
+        .to_string();
 
     let attached = m.call(
         "artifact_attach",
@@ -432,7 +456,10 @@ fn planning_survives_unrelated_cwd_via_brick_home_fallback() {
         json!(true),
         "mission create must not crash at unrelated cwd: {created}"
     );
-    let mid = created["mission_id"].as_str().expect("mission_id").to_string();
+    let mid = created["mission_id"]
+        .as_str()
+        .expect("mission_id")
+        .to_string();
 
     // Write/read land in the same fallback store — the mission lists back.
     let listed = m.call("mission_list", json!({"status":"active"}));
@@ -499,8 +526,17 @@ fn world(tag: &str, seed_files: &[(&str, &str)]) -> World {
             &home,
             &repo,
             &[
-                "--actor-type", "agent", "--actor-id", "codex-bot", "mission", "create",
-                "--project", &project, "m", "--status", "active",
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "mission",
+                "create",
+                "--project",
+                &project,
+                "m",
+                "--status",
+                "active",
             ],
         ),
         "mission_id",
@@ -511,8 +547,16 @@ fn world(tag: &str, seed_files: &[(&str, &str)]) -> World {
             &home,
             &repo,
             &[
-                "--actor-type", "agent", "--actor-id", "codex-bot", "session", "start",
-                "--mission", &mission, "--name", "s1",
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "session",
+                "start",
+                "--mission",
+                &mission,
+                "--name",
+                "s1",
             ],
         ),
         "session_id",
@@ -523,8 +567,17 @@ fn world(tag: &str, seed_files: &[(&str, &str)]) -> World {
             &home,
             &repo,
             &[
-                "--actor-type", "agent", "--actor-id", "codex-bot", "artifact", "create",
-                "--mission", &mission, "--kind", "patch", "p",
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "artifact",
+                "create",
+                "--mission",
+                &mission,
+                "--kind",
+                "patch",
+                "p",
             ],
         ),
         "artifact_id",
@@ -547,9 +600,20 @@ impl World {
             &self.home,
             &self.repo,
             &[
-                "--actor-type", "agent", "--actor-id", "codex-bot", "evidence", "diff",
-                "--artifact", &self.artifact, "--session", &self.session, "--mission",
-                &self.mission, "--target", "working",
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex-bot",
+                "evidence",
+                "diff",
+                "--artifact",
+                &self.artifact,
+                "--session",
+                &self.session,
+                "--mission",
+                &self.mission,
+                "--target",
+                "working",
             ],
         );
         assert!(
@@ -605,8 +669,16 @@ fn explain_file_line_resolves_who_via_blame() {
     );
     let step = step_for_actor(&chain, "codex-bot")
         .unwrap_or_else(|| panic!("no step for codex-bot: {chain}"));
-    assert_eq!(step["session_id"].as_str(), Some(w.session.as_str()), "{step}");
-    assert_eq!(step["mission_id"].as_str(), Some(w.mission.as_str()), "{step}");
+    assert_eq!(
+        step["session_id"].as_str(),
+        Some(w.session.as_str()),
+        "{step}"
+    );
+    assert_eq!(
+        step["mission_id"].as_str(),
+        Some(w.mission.as_str()),
+        "{step}"
+    );
 
     let _ = std::fs::remove_dir_all(&w.root);
 }
@@ -711,11 +783,17 @@ fn explain_resolves_store_from_absolute_anchor_when_cwd_is_unrelated() {
         "relative anchor with unrelated cwd must not hard-error: {rel}"
     );
     assert!(
-        rel["causal_chain"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        rel["causal_chain"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
         "relative anchor with no repo resolves to an empty chain: {rel}"
     );
     assert!(
-        rel["note"].as_str().unwrap_or_default().contains("No Brick repo resolved"),
+        rel["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("No Brick repo resolved"),
         "relative anchor with no repo must carry the actionable note: {rel}"
     );
 
@@ -797,8 +875,17 @@ fn explain_merges_linked_and_indexed_source_sessions() {
         &w.home,
         &w.repo,
         &[
-            "source", "configure", "--name", "codex_app", "--app-id", "codex_app", "--actor-id",
-            "codex-agent", "--actor-type", "agent", "--session-log-path",
+            "source",
+            "configure",
+            "--name",
+            "codex_app",
+            "--app-id",
+            "codex_app",
+            "--actor-id",
+            "codex-agent",
+            "--actor-type",
+            "agent",
+            "--session-log-path",
             codex_dir.to_str().unwrap(),
         ],
     );
@@ -806,7 +893,9 @@ fn explain_merges_linked_and_indexed_source_sessions() {
 
     // Whole-file anchor → merge. Both halves must be present.
     let chain = w.explain("src/main.rs");
-    let steps = chain["causal_chain"].as_array().expect("causal_chain array");
+    let steps = chain["causal_chain"]
+        .as_array()
+        .expect("causal_chain array");
     assert!(
         steps.len() >= 2,
         "interleaved history must surface both the linked and the indexed step, got {}: {chain}",
@@ -819,9 +908,10 @@ fn explain_merges_linked_and_indexed_source_sessions() {
     );
     // The indexed half (external Codex source session) — a `source.session` step.
     assert!(
-        steps
-            .iter()
-            .any(|s| s["event_id"].as_str().unwrap_or_default().starts_with("source-session:")),
+        steps.iter().any(|s| s["event_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("source-session:")),
         "merged chain must include the indexed source-session step: {chain}"
     );
 
@@ -851,7 +941,11 @@ fn explain_survives_commit_via_per_file_patch_id() {
     );
     let step = step_for_actor(&chain, "codex-bot")
         .unwrap_or_else(|| panic!("no codex-bot step after commit: {chain}"));
-    assert_eq!(step["session_id"].as_str(), Some(w.session.as_str()), "{step}");
+    assert_eq!(
+        step["session_id"].as_str(),
+        Some(w.session.as_str()),
+        "{step}"
+    );
 
     let _ = std::fs::remove_dir_all(&w.root);
 }
@@ -937,7 +1031,10 @@ fn link_rationale_then_explain_reads_the_why() {
                 .map(|note| note.contains("concurrency race"))
                 .unwrap_or(false)
         });
-    assert!(has_why, "explain must surface the linked rationale: {chain}");
+    assert!(
+        has_why,
+        "explain must surface the linked rationale: {chain}"
+    );
 
     drop(m);
     let _ = std::fs::remove_dir_all(&w.root);
@@ -1092,10 +1189,7 @@ fn link_auto_capture_includes_staged_changes() {
 /// graph disconnected — this pins that `cause=mission` actually wires up.
 #[test]
 fn link_cause_mission_connects_planning_to_code() {
-    let w = world(
-        "link-mission-cause",
-        &[("src/cache.rs", "fn get() {}\n")],
-    );
+    let w = world("link-mission-cause", &[("src/cache.rs", "fn get() {}\n")]);
     // Agent edits the file implementing the mission.
     std::fs::write(
         w.repo.join("src/cache.rs"),
@@ -1150,10 +1244,7 @@ fn link_cause_mission_connects_planning_to_code() {
 /// the strict "effect = existing event, or omit" contract.
 #[test]
 fn link_with_unresolvable_effect_errors_with_guidance() {
-    let w = world(
-        "link-effect-strict",
-        &[("src/cache.rs", "fn get() {}\n")],
-    );
+    let w = world("link-effect-strict", &[("src/cache.rs", "fn get() {}\n")]);
     // Agent edits cache.rs with its own tools; no Brick event exists for it.
     std::fs::write(
         w.repo.join("src/cache.rs"),
@@ -1181,7 +1272,11 @@ fn link_with_unresolvable_effect_errors_with_guidance() {
         "link",
         json!({"relation":"rationale","note":"get() now enforces TTL expiry","source":"codex_app"}),
     );
-    assert_eq!(retry["linked"], json!(true), "omit-effect must succeed: {retry}");
+    assert_eq!(
+        retry["linked"],
+        json!(true),
+        "omit-effect must succeed: {retry}"
+    );
     assert_eq!(
         retry["captured_files"],
         json!(["src/cache.rs"]),
@@ -1225,7 +1320,11 @@ fn link_cross_event_edge_shows_as_forward_effect() {
     assert!(git(&w.repo, &["commit", "-qm", "fix auth"]).success());
 
     // Second change: the test, captured.
-    std::fs::write(w.repo.join("src/test_auth.rs"), "fn t() {\n    refresh();\n}\n").unwrap();
+    std::fs::write(
+        w.repo.join("src/test_auth.rs"),
+        "fn t() {\n    refresh();\n}\n",
+    )
+    .unwrap();
     w.capture_working();
 
     let mut m = Mcp::spawn(&w.home, &w.repo);
@@ -1309,7 +1408,12 @@ fn explain_live_excludes_finished_session_but_keeps_active() {
     let (root, home, repo, codex_dir, claude_dir) = setup_world("explain-live-zombie");
 
     // Only a FINISHED Claude session has touched commands_memory.rs → no live.
-    write_claude(&claude_dir, "claude-done-001", &repo, "src/commands_memory.rs");
+    write_claude(
+        &claude_dir,
+        "claude-done-001",
+        &repo,
+        "src/commands_memory.rs",
+    );
 
     let mut m = Mcp::spawn(&home, &repo);
     let finished = m.call("explain", json!({"anchor":"src/commands_memory.rs:1"}));
@@ -1343,7 +1447,12 @@ fn explain_live_excludes_finished_session_but_keeps_active() {
 fn explain_live_fires_with_absolute_anchor_when_cwd_is_unrelated() {
     let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-live-cwd");
     // A live Codex session is editing commands_git.rs right now.
-    write_codex(&codex_dir, "codex-live-cwd-001", &repo, "src/commands_git.rs");
+    write_codex(
+        &codex_dir,
+        "codex-live-cwd-001",
+        &repo,
+        "src/commands_git.rs",
+    );
 
     // Spawn the server with a cwd OUTSIDE the repo — the cwd-derived profile
     // store would find nothing here.
@@ -1378,7 +1487,19 @@ fn explain_resolves_transcript_pointer_to_session_path() {
 
     // Commit the baseline so the subsequent edit is a real working diff.
     assert!(git(&repo, &["add", "-A"]).success());
-    assert!(git(&repo, &["-c", "user.email=t@t.io", "-c", "user.name=t", "commit", "-qm", "base"]).success());
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@t.io",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "base"
+        ]
+    )
+    .success());
 
     // The agent edits the file, then records WHY bound to that session id.
     std::fs::write(
@@ -1410,12 +1531,7 @@ fn explain_resolves_transcript_pointer_to_session_path() {
 
     let step = chain["causal_chain"]
         .as_array()
-        .and_then(|steps| {
-            steps
-                .iter()
-                .find(|s| s["transcript"].is_object())
-                .cloned()
-        })
+        .and_then(|steps| steps.iter().find(|s| s["transcript"].is_object()).cloned())
         .unwrap_or_else(|| panic!("expected a step with a transcript pointer: {chain}"));
     assert_eq!(
         step["transcript"]["session_id"].as_str(),
@@ -1463,18 +1579,41 @@ consumer OOM the process under backpressure.";
 
     // Commit a baseline so the edit is a real working diff the capture can see.
     assert!(git(&repo, &["add", "-A"]).success());
-    assert!(git(&repo, &["-c", "user.email=t@t.io", "-c", "user.name=t", "commit", "-qm", "base"]).success());
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@t.io",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "base"
+        ]
+    )
+    .success());
 
     // Capture a diff bound to the codex session id — the hook/ingest shape:
     // WHO/WHEN/what, but NO note (no `link`).
-    std::fs::write(repo.join("src/commands_git.rs"), "// real file\nfn q() {}\n").unwrap();
+    std::fs::write(
+        repo.join("src/commands_git.rs"),
+        "// real file\nfn q() {}\n",
+    )
+    .unwrap();
     let artifact = extract(
         &brick(
             &home,
             &repo,
             &[
-                "--actor-type", "agent", "--actor-id", "codex_app", "artifact", "create",
-                "--kind", "patch", "q",
+                "--actor-type",
+                "agent",
+                "--actor-id",
+                "codex_app",
+                "artifact",
+                "create",
+                "--kind",
+                "patch",
+                "q",
             ],
         ),
         "artifact_id",
@@ -1484,11 +1623,25 @@ consumer OOM the process under backpressure.";
         &home,
         &repo,
         &[
-            "--actor-type", "agent", "--actor-id", "codex_app", "evidence", "diff",
-            "--artifact", &artifact, "--session", sid, "--target", "working",
+            "--actor-type",
+            "agent",
+            "--actor-id",
+            "codex_app",
+            "evidence",
+            "diff",
+            "--artifact",
+            &artifact,
+            "--session",
+            sid,
+            "--target",
+            "working",
         ],
     );
-    assert!(out.status.success(), "diff capture failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "diff capture failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let elsewhere = root.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -1538,7 +1691,10 @@ fn explain_is_honest_when_no_record_exists() {
     );
     // It does NOT fabricate a chain.
     assert!(
-        chain["causal_chain"].as_array().map(|c| c.is_empty()).unwrap_or(true),
+        chain["causal_chain"]
+            .as_array()
+            .map(|c| c.is_empty())
+            .unwrap_or(true),
         "no record → empty chain, never guessed: {chain}"
     );
 
@@ -1557,7 +1713,11 @@ fn finished_claude(dir: &Path, sid: &str, repo: &Path, file: &str) {
 /// context `import native pick` indexes every discovered session, then prints
 /// guidance instead of prompting — exactly the index step we need.
 fn index_sources(home: &Path, repo: &Path, source: &str) {
-    let out = brick(home, repo, &["--source", source, "import", "native", "pick"]);
+    let out = brick(
+        home,
+        repo,
+        &["--source", source, "import", "native", "pick"],
+    );
     assert!(
         out.status.success(),
         "index ({source}) failed: {}",
@@ -1586,7 +1746,10 @@ consumer OOM the process under backpressure.";
     let mut m = Mcp::spawn(&home, &repo);
     let chain = m.call("explain", json!({ "anchor": file }));
 
-    let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
+    let steps = chain["causal_chain"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         !steps.is_empty(),
         "indexed session must synthesize a CTP step: {chain}"
@@ -1621,7 +1784,19 @@ fn explain_merges_real_events_with_indexed_sessions() {
 
     // Now create a REAL captured diff bound to a link rationale on the same file.
     assert!(git(&repo, &["add", "-A"]).success());
-    assert!(git(&repo, &["-c", "user.email=t@t.io", "-c", "user.name=t", "commit", "-qm", "base"]).success());
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@t.io",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "base"
+        ]
+    )
+    .success());
     std::fs::write(repo.join(file), "// real file\nfn changed() {}\n").unwrap();
     let mut m = Mcp::spawn(&home, &repo);
     // Strict contract: omit `effect`; Brick captures the uncommitted diff on this file.
@@ -1632,11 +1807,16 @@ fn explain_merges_real_events_with_indexed_sessions() {
     assert_eq!(linked["linked"], json!(true), "{linked}");
 
     let chain = m.call("explain", json!({ "anchor": file }));
-    let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
+    let steps = chain["causal_chain"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     // The explicit link note is present...
     assert!(
-        steps.iter().any(|s| s["note"].as_str() == Some("explicit asserted reason")
-            && s["confidence"].as_str() == Some("explicit")),
+        steps
+            .iter()
+            .any(|s| s["note"].as_str() == Some("explicit asserted reason")
+                && s["confidence"].as_str() == Some("explicit")),
         "explicit link note must appear: {chain}"
     );
     // ...AND the indexed source session is merged in, not suppressed.
@@ -1664,10 +1844,86 @@ fn explain_index_fallback_isolates_by_repo() {
 
     let mut m = Mcp::spawn(&home, &repo);
     let chain = m.call("explain", json!({ "anchor": file }));
-    let steps = chain["causal_chain"].as_array().cloned().unwrap_or_default();
+    let steps = chain["causal_chain"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         steps.iter().all(|s| s["event_type"] != "source.session"),
         "a different repo's indexed session must not bleed in: {chain}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `link` effect-anchor fallback: when an agent passes `effect=<file path>` but
+/// the JSONL ledger has NO event for that file (the universal case for agents
+/// that edit with their own tools and rely on Brick's passive index), `link`
+/// must resolve the effect to an indexed source-session that touched the file
+/// instead of hard-failing with "effect anchor has no Brick event". The session
+/// id is UUID-shaped so it can serve as the edge's effect event.
+#[test]
+fn link_effect_path_falls_back_to_indexed_source_session() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("link-effect-fallback");
+    // UUID-shaped external session id so the fallback can use it as effect_event.
+    let sid = "11111111-2222-4333-8444-555555555555";
+    let file = "src/commands_git.rs";
+    write_codex_with_final(&codex_dir, sid, &repo, file, "indexed session WHY");
+    // Index the session into metadata — NO capture, NO prior link. JSONL is empty.
+    index_sources(&home, &repo, "codex_app");
+
+    let abs = format!("{}/{}", repo.display(), file);
+    let mut m = Mcp::spawn(&home, &repo);
+    // effect names the file by absolute path; JSONL has no event for it, so this
+    // used to hard-fail. The fallback binds the edge to the indexed session.
+    let linked = m.call(
+        "link",
+        json!({ "effect": abs, "note": "cross-tool rationale", "relation": "rationale" }),
+    );
+    assert_eq!(
+        linked["linked"],
+        json!(true),
+        "link must succeed via source-session fallback instead of erroring: {linked}"
+    );
+    assert_eq!(
+        linked["effect_event"].as_str(),
+        Some(sid),
+        "effect event must be the indexed session's id: {linked}"
+    );
+
+    drop(m);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Deep-dive pointer: every explain step backed by a transcript must carry a
+/// ready-to-run `read_session` command so an agent can read the FULL trajectory
+/// instead of stopping at the turn-final `note`. For a file-backed source
+/// (Codex) it is a `read_file <path>`; the path must point at the real transcript.
+#[test]
+fn explain_step_carries_read_session_deep_dive_pointer() {
+    let (root, home, repo, codex_dir, _claude_dir) = setup_world("explain-read-session");
+    let sid = "codex-read-session-001";
+    let file = "src/commands_git.rs";
+    write_codex_with_final(&codex_dir, sid, &repo, file, "closing note, not the cause");
+    index_sources(&home, &repo, "codex_app");
+
+    let mut m = Mcp::spawn(&home, &repo);
+    let chain = m.call("explain", json!({ "anchor": file }));
+    let steps = chain["causal_chain"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let step = steps
+        .iter()
+        .find(|s| s["transcript"].is_object())
+        .unwrap_or_else(|| panic!("expected a step with a transcript: {chain}"));
+    let read_session = step["transcript"]["read_session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("step must carry a read_session pointer: {chain}"));
+    assert!(
+        read_session.starts_with("read_file ") && read_session.contains(sid),
+        "file-backed deep-dive pointer must read the real transcript file: {read_session}"
     );
 
     drop(m);

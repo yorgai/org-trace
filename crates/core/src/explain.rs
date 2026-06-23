@@ -63,6 +63,13 @@ pub struct TranscriptPointer {
     pub source: Option<String>,
     pub session_ref: Option<String>,
     pub session_id: Option<String>,
+    /// A ready-to-run command that dumps THIS session's full trajectory — the
+    /// deep-dive pointer. `note` is only the turn's closing narration (an
+    /// `observed` summary, often not the root cause); when an agent needs the
+    /// real WHY it should run this to read the original session end-to-end.
+    /// `None` until the CLI layer resolves the source's on-disk location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_session: Option<String>,
 }
 
 /// One step in a causal chain: an event, who/when produced it, why (the rationale
@@ -158,7 +165,12 @@ pub fn source_sessions_to_steps(
         // their tool's history. The anchor file is already known from the query,
         // so we don't append a redundant "— touched <file>" suffix. Fall back to a
         // minimal phrasing only when no title was indexed.
-        let title = match row.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let title = match row
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             Some(title) => title.to_string(),
             None => format!("touched {file_name} in {source} session"),
         };
@@ -179,6 +191,7 @@ pub fn source_sessions_to_steps(
                 source: (!source.is_empty()).then(|| source.clone()),
                 session_ref: source_path,
                 session_id: (!external.is_empty()).then(|| external.clone()),
+                read_session: None,
             }),
             depth: start_depth + steps.len(),
         });
@@ -478,11 +491,7 @@ pub fn explain_from_events(
             for edge in edges {
                 if let Some(cause) = &edge.cause_event {
                     if !visited.contains(cause) {
-                        queue.push_back((
-                            cause.clone(),
-                            Some(relation_name(edge)),
-                            step_depth + 1,
-                        ));
+                        queue.push_back((cause.clone(), Some(relation_name(edge)), step_depth + 1));
                     }
                 }
             }
@@ -501,7 +510,8 @@ pub fn explain_from_events(
             .first()
             .and_then(|id| by_id.get(id).copied())
         {
-            for inferred in inferred_same_session_steps(events, anchor_event, depth, &mission_titles)
+            for inferred in
+                inferred_same_session_steps(events, anchor_event, depth, &mission_titles)
             {
                 if visited.insert(inferred.event_id.clone()) {
                     steps.push(inferred);
@@ -702,7 +712,8 @@ fn forward_effects(
                     .unwrap_or_else(|| "unknown".to_string()),
                 title: event.and_then(describe_event),
                 relation_to_anchor: relation,
-                session_id: event.and_then(|event| event.session_id.as_ref().map(ToString::to_string)),
+                session_id: event
+                    .and_then(|event| event.session_id.as_ref().map(ToString::to_string)),
             });
         }
     }
@@ -716,6 +727,7 @@ fn transcript_pointer(event: &TraceEvent) -> Option<TranscriptPointer> {
         source: None,
         session_ref: None,
         session_id,
+        read_session: None,
     })
 }
 
@@ -731,7 +743,10 @@ fn describe_event(event: &TraceEvent) -> Option<String> {
                     changes
                         .iter()
                         .filter_map(|change| {
-                            change.get("path").and_then(|p| p.as_str()).map(str::to_string)
+                            change
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .map(str::to_string)
                         })
                         .collect()
                 })
@@ -936,7 +951,10 @@ mod tests {
         let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
         assert_eq!(chain.forward.len(), 1);
         assert_eq!(chain.forward[0].event_id, e4_id.to_string());
-        assert_eq!(chain.forward[0].relation_to_anchor.as_deref(), Some("derived_from"));
+        assert_eq!(
+            chain.forward[0].relation_to_anchor.as_deref(),
+            Some("derived_from")
+        );
     }
 
     #[test]
@@ -947,8 +965,20 @@ mod tests {
         let a_id = a.event_id;
         let b_id = b.event_id;
         // a caused by b, and b caused by a (degenerate cycle).
-        let ab = causal(a_id, vec![b_id], CausalRelation::TriggeredBy, "x", ConfidenceLevel::Explicit);
-        let ba = causal(b_id, vec![a_id], CausalRelation::TriggeredBy, "y", ConfidenceLevel::Explicit);
+        let ab = causal(
+            a_id,
+            vec![b_id],
+            CausalRelation::TriggeredBy,
+            "x",
+            ConfidenceLevel::Explicit,
+        );
+        let ba = causal(
+            b_id,
+            vec![a_id],
+            CausalRelation::TriggeredBy,
+            "y",
+            ConfidenceLevel::Explicit,
+        );
         let events = vec![a, b, ab, ba];
         let index = TraceIndex::build(&events).expect("index");
 
@@ -965,8 +995,20 @@ mod tests {
         let b = diff_event(&session, "b.rs");
         let c = diff_event(&session, "c.rs");
         let (a_id, b_id, c_id) = (a.event_id, b.event_id, c.event_id);
-        let ab = causal(a_id, vec![b_id], CausalRelation::DerivedFrom, "x", ConfidenceLevel::Explicit);
-        let bc = causal(b_id, vec![c_id], CausalRelation::DerivedFrom, "y", ConfidenceLevel::Explicit);
+        let ab = causal(
+            a_id,
+            vec![b_id],
+            CausalRelation::DerivedFrom,
+            "x",
+            ConfidenceLevel::Explicit,
+        );
+        let bc = causal(
+            b_id,
+            vec![c_id],
+            CausalRelation::DerivedFrom,
+            "y",
+            ConfidenceLevel::Explicit,
+        );
         let events = vec![a, b, c, ab, bc];
         let index = TraceIndex::build(&events).expect("index");
 
@@ -992,10 +1034,7 @@ mod tests {
         let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
         // anchor + one inferred prior step, clearly labelled.
         assert!(chain.steps.len() >= 2);
-        assert!(chain
-            .steps
-            .iter()
-            .any(|step| step.confidence == "inferred"));
+        assert!(chain.steps.iter().any(|step| step.confidence == "inferred"));
     }
 
     #[test]
@@ -1139,12 +1178,18 @@ mod tests {
         let step = &steps[0];
         assert_eq!(step.event_type, EVENT_TYPE_SOURCE_SESSION);
         assert_eq!(step.confidence, "observed");
-        assert_eq!(step.title.as_deref(), Some("touched merge.rs in codex_app session"));
+        assert_eq!(
+            step.title.as_deref(),
+            Some("touched merge.rs in codex_app session")
+        );
         assert_eq!(step.session_id.as_deref(), Some("sess-1"));
         assert_eq!(step.note, None, "WHY is filled later from the transcript");
         let transcript = step.transcript.as_ref().expect("transcript pointer");
         assert_eq!(transcript.source.as_deref(), Some("codex_app"));
-        assert_eq!(transcript.session_ref.as_deref(), Some("/sessions/sess-1.jsonl"));
+        assert_eq!(
+            transcript.session_ref.as_deref(),
+            Some("/sessions/sess-1.jsonl")
+        );
         assert_eq!(transcript.session_id.as_deref(), Some("sess-1"));
     }
 
@@ -1193,7 +1238,12 @@ mod tests {
     }
 
     /// Builds a minimal CausalStep for merge tests.
-    fn step(event_id: &str, session_id: Option<&str>, occurred_at: &str, confidence: &str) -> CausalStep {
+    fn step(
+        event_id: &str,
+        session_id: Option<&str>,
+        occurred_at: &str,
+        confidence: &str,
+    ) -> CausalStep {
         CausalStep {
             event_id: event_id.to_string(),
             event_type: "test".to_string(),
@@ -1217,28 +1267,60 @@ mod tests {
         // The exact bug the merge fixes: change 1 (source only) → change 2
         // (linked) → change 3 (source only). The old fill-if-empty fallback
         // dropped 1 and 3 because the chain already had the linked step 2.
-        let mut chain = vec![step("link-2", Some("s2"), "2026-06-22T10:02:00Z", "explicit")];
+        let mut chain = vec![step(
+            "link-2",
+            Some("s2"),
+            "2026-06-22T10:02:00Z",
+            "explicit",
+        )];
         let source = vec![
-            step("source-session:codex:s1", Some("s1"), "2026-06-22T10:01:00Z", "observed"),
-            step("source-session:codex:s3", Some("s3"), "2026-06-22T10:03:00Z", "observed"),
+            step(
+                "source-session:codex:s1",
+                Some("s1"),
+                "2026-06-22T10:01:00Z",
+                "observed",
+            ),
+            step(
+                "source-session:codex:s3",
+                Some("s3"),
+                "2026-06-22T10:03:00Z",
+                "observed",
+            ),
         ];
         merge_source_steps_into(&mut chain, source);
         let order: Vec<&str> = chain.iter().map(|s| s.event_id.as_str()).collect();
         assert_eq!(
             order,
-            vec!["source-session:codex:s1", "link-2", "source-session:codex:s3"],
+            vec![
+                "source-session:codex:s1",
+                "link-2",
+                "source-session:codex:s3"
+            ],
             "all three changes must appear, time-ordered"
         );
         // depth renumbered contiguously 0..N.
-        assert_eq!(chain.iter().map(|s| s.depth).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            chain.iter().map(|s| s.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
     fn merge_dedups_source_step_already_linked_by_session_id() {
         // The same session was BOTH linked and indexed — keep the richer linked
         // version, drop the source duplicate.
-        let mut chain = vec![step("link-a", Some("sA"), "2026-06-22T10:00:00Z", "explicit")];
-        let source = vec![step("source-session:codex:sA", Some("sA"), "2026-06-22T10:00:00Z", "observed")];
+        let mut chain = vec![step(
+            "link-a",
+            Some("sA"),
+            "2026-06-22T10:00:00Z",
+            "explicit",
+        )];
+        let source = vec![step(
+            "source-session:codex:sA",
+            Some("sA"),
+            "2026-06-22T10:00:00Z",
+            "observed",
+        )];
         merge_source_steps_into(&mut chain, source);
         assert_eq!(chain.len(), 1, "duplicate session must be deduped");
         assert_eq!(chain[0].event_id, "link-a");
@@ -1249,7 +1331,12 @@ mod tests {
         // link without a `session` arg → no session_id → no fuzzy dedup; keep
         // both rather than risk dropping a real change.
         let mut chain = vec![step("link-x", None, "2026-06-22T10:00:00Z", "explicit")];
-        let source = vec![step("source-session:codex:sX", Some("sX"), "2026-06-22T10:00:30Z", "observed")];
+        let source = vec![step(
+            "source-session:codex:sX",
+            Some("sX"),
+            "2026-06-22T10:00:30Z",
+            "observed",
+        )];
         merge_source_steps_into(&mut chain, source);
         assert_eq!(chain.len(), 2, "no session_id means no dedup — keep both");
     }

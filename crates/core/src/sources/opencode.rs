@@ -797,7 +797,8 @@ mod tests {
             .expect("create OpenCode session fixture");
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10), None).expect("list OpenCode sessions");
+        let sessions =
+            list_sessions(&profile(path), Some(10), None).expect("list OpenCode sessions");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].external_session_id, "session-1");
@@ -849,7 +850,8 @@ mod tests {
             .expect("create OpenCode token fixture");
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10), None).expect("list OpenCode sessions");
+        let sessions =
+            list_sessions(&profile(path), Some(10), None).expect("list OpenCode sessions");
 
         assert_eq!(sessions[0].input_tokens, Some(18));
         assert_eq!(sessions[0].output_tokens, Some(11));

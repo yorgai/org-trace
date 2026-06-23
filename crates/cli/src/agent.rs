@@ -23,10 +23,12 @@ use crate::args::{
 };
 use crate::claude_hook;
 use crate::mcp_config;
+use crate::native_hook;
+use crate::skill;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 7;
+const TEMPLATE_VERSION: u32 = 9;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -46,18 +48,23 @@ const BLOCK_BODY: &str = "\
 Brick answers WHY code looks the way it does, across every AI tool that has
 touched this repo. It is the causal layer git does not have.
 
-### When you investigate existing code
+### When you investigate WHY — a bug, an issue, any \"how did this happen\"
 
-When you locate a file or code you are about to change or reason about, your
-FIRST step — before drawing conclusions from the code alone — is `explain`:
+The moment a task is about CAUSE or HISTORY — investigating what caused a bug or
+issue, explaining why some behavior exists, tracing what introduced a change, or
+reviewing code before you touch it — your FIRST move is `explain`, BEFORE grep,
+`git log`, reading files top-to-bottom, or fetching the issue tracker:
 
 `brick explain <path>:<line>`
 
-It returns a `causal_chain`: who changed that code, WHEN, the `mission_title`
-they did it under, what was derived from or triggered by it, and whether another
-session is editing the file right now. To understand a whole block at once, pass
-a line range: `brick explain <path>:<start>-<end>` (e.g. `src/auth.rs:10-20`).
-The anchor can also be a whole file, an artifact, mission, or event id.
+Do NOT spend your opening moves on code_search / read_file / web search and only
+reach for `explain` if reminded — for a \"why\"/\"how was this caused\" question,
+`explain` is the first tool, not the last. It returns a `causal_chain`: who
+changed that code, WHEN, the `mission_title` they did it under, what was derived
+from or triggered by it, and whether another session is editing the file right
+now. To understand a whole block at once, pass a line range:
+`brick explain <path>:<start>-<end>` (e.g. `src/auth.rs:10-20`). The anchor can
+also be a whole file, an artifact, mission, or event id.
 
 **What counts as a real Brick record.** A chain step carrying an `actor_id`, a
 `mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY
@@ -67,17 +74,27 @@ git/grep when `explain` returns an empty `causal_chain` or an explicit
 \"No Brick record\" note. Do NOT dismiss a populated chain as \"no record\"
 just because `note` is null.
 
+**Go deeper than the `note` — read the full session.** A step's `note` is only
+that turn's CLOSING narration (an `observed` summary), which is often NOT the
+root cause. When the note doesn't answer your question, do NOT stop: run the
+step's `transcript.read_session` command (a ready-to-run `sqlite3`/`read_file`
+that dumps that session's full trajectory) and read the original tool calls,
+errors, and reasoning end-to-end. The real cause lives in that deep read, not in
+the one-line note.
+
 **Prefer `explain` over `grep` and `git log` for understanding existing code.**
 git log / git blame / grep are a FALLBACK, used only when `explain` truly has no
 record for that code.
 
 ### After you change code
 
-When you finish a non-trivial change, record WHY so the next agent (or you, in
-three months) can recover your reasoning. If your tool exposes Brick over MCP,
-call the `link` tool with a one-line `note` (and a `cause` anchor + `relation`
-when the change was prompted by other code). The `explain` and `link` MCP tools
-are the primary write/read surface.";
+You usually do NOT need to record anything: `explain` recovers the WHY of
+ordinary edits from the session transcript automatically. Only call the `link`
+MCP tool for a causal edge Brick cannot infer on its own — a cross-repo /
+cross-session cause (`relation=derived_from`/`triggered_by`), a change that
+supersedes an earlier one (`relation=supersedes`), or a high-stakes rationale you
+want recorded at `explicit` confidence. `explain` (read) and `link` (the rare
+explicit write) are the MCP surface.";
 
 /// One memory file to act on, resolved from a target + scope.
 #[derive(Debug, Clone)]
@@ -115,11 +132,15 @@ fn install(args: AgentInstallArgs) -> Result<()> {
         let action = file.install(args.force)?;
         outcomes.push(file.outcome(action));
     }
-    if let Some(outcome) = claude_hook_outcome(&args.target, HookOp::Install { force: args.force })
-    {
-        outcomes.push(outcome);
-    }
+    outcomes.extend(hook_outcomes(
+        &args.target,
+        &HookOp::Install { force: args.force },
+    ));
     outcomes.extend(mcp_config_outcomes(
+        &args.target,
+        &HookOp::Install { force: args.force },
+    ));
+    outcomes.extend(skill_outcomes(
         &args.target,
         &HookOp::Install { force: args.force },
     ));
@@ -135,10 +156,9 @@ fn uninstall(args: AgentTargetArgs) -> Result<()> {
         let action = file.uninstall()?;
         outcomes.push(file.outcome(action));
     }
-    if let Some(outcome) = claude_hook_outcome(&args, HookOp::Uninstall) {
-        outcomes.push(outcome);
-    }
+    outcomes.extend(hook_outcomes(&args, &HookOp::Uninstall));
     outcomes.extend(mcp_config_outcomes(&args, &HookOp::Uninstall));
+    outcomes.extend(skill_outcomes(&args, &HookOp::Uninstall));
     report(&outcomes, format);
     Ok(())
 }
@@ -151,10 +171,9 @@ fn status(args: AgentTargetArgs) -> Result<()> {
         let action = file.status()?;
         outcomes.push(file.outcome(action));
     }
-    if let Some(outcome) = claude_hook_outcome(&args, HookOp::Status) {
-        outcomes.push(outcome);
-    }
+    outcomes.extend(hook_outcomes(&args, &HookOp::Status));
     outcomes.extend(mcp_config_outcomes(&args, &HookOp::Status));
+    outcomes.extend(skill_outcomes(&args, &HookOp::Status));
     report(&outcomes, format);
     Ok(())
 }
@@ -166,28 +185,92 @@ enum HookOp {
     Status,
 }
 
-/// Runs the requested Claude `PreToolUse` hook operation when the claude target
-/// (or `all`) is selected, returning a reportable outcome. The hook is a
-/// Claude-only mechanism, so other targets are skipped silently. A failure to
-/// resolve the settings path or the `brick` binary is reported, not fatal.
-fn claude_hook_outcome(args: &AgentTargetArgs, op: HookOp) -> Option<AgentOutcome> {
-    if !matches!(args.target, AgentTargetArg::Claude | AgentTargetArg::All) {
-        return None;
+/// Runs native hook registration for selected targets. Claude uses its
+/// `settings.json` schema; Codex and Windsurf use their own native hook files.
+fn hook_outcomes(args: &AgentTargetArgs, op: &HookOp) -> Vec<AgentOutcome> {
+    let is_all = matches!(args.target, AgentTargetArg::All);
+    let mut outcomes = Vec::new();
+
+    if is_all || matches!(args.target, AgentTargetArg::Claude) {
+        outcomes.push(claude_hook_outcome(args, op));
     }
+
+    let Some(home) = home_dir() else {
+        if is_all
+            || matches!(
+                args.target,
+                AgentTargetArg::Codex | AgentTargetArg::Windsurf
+            )
+        {
+            outcomes.push(AgentOutcome {
+                target: "native_hook".to_string(),
+                path: String::new(),
+                action: "skipped no_home_dir".to_string(),
+            });
+        }
+        return outcomes;
+    };
+
+    let mut native = Vec::new();
+    if is_all || matches!(args.target, AgentTargetArg::Codex) {
+        native.push((
+            native_hook::HookClient::Codex,
+            home.join(".codex").join("config.toml"),
+        ));
+    }
+    if is_all || matches!(args.target, AgentTargetArg::Windsurf) {
+        native.push((
+            native_hook::HookClient::Windsurf,
+            home.join(".codeium").join("windsurf").join("hooks.json"),
+        ));
+    }
+
+    let brick_bin = brick_binary();
+    outcomes.extend(native.into_iter().map(|(client, path)| {
+        let path_label = path.display().to_string();
+        let action = match (&brick_bin, op) {
+            (Ok(bin), HookOp::Install { force }) => {
+                native_hook::install(client, &path, bin, *force).map(|a| a.as_str().to_string())
+            }
+            (Ok(bin), HookOp::Status) => {
+                native_hook::status(client, &path, bin).map(|a| a.as_str().to_string())
+            }
+            (_, HookOp::Uninstall) => {
+                native_hook::uninstall(client, &path).map(|a| a.as_str().to_string())
+            }
+            (Err(error), _) => Err(anyhow::anyhow!("{error}")),
+        };
+        AgentOutcome {
+            target: client.label().to_string(),
+            path: path_label,
+            action: action.unwrap_or_else(|error| format!("error {error}")),
+        }
+    }));
+
+    outcomes
+}
+
+/// Runs the requested Claude `PreToolUse` hook operation when the claude target
+/// is selected, returning a reportable outcome. A failure to resolve the settings
+/// path or the `brick` binary is reported, not fatal.
+fn claude_hook_outcome(args: &AgentTargetArgs, op: &HookOp) -> AgentOutcome {
     let home = home_dir();
     let Some(settings) =
         claude_hook::settings_path(args.global, args.dir.as_deref(), home.as_deref())
     else {
-        return Some(hook_outcome(
+        return hook_outcome(
+            "claude_hook",
             String::new(),
             "skipped no_known_global_path".to_string(),
-        ));
+        );
     };
     let path_label = settings.display().to_string();
     let result = match op {
         HookOp::Install { force } => match brick_binary() {
-            Ok(bin) => claude_hook::install(&settings, &bin, force),
-            Err(error) => return Some(hook_outcome(path_label, format!("error {error}"))),
+            Ok(bin) => claude_hook::install(&settings, &bin, *force),
+            Err(error) => {
+                return hook_outcome("claude_hook", path_label, format!("error {error}"));
+            }
         },
         HookOp::Uninstall => claude_hook::uninstall(&settings),
         HookOp::Status => claude_hook::status(&settings),
@@ -196,13 +279,13 @@ fn claude_hook_outcome(args: &AgentTargetArgs, op: HookOp) -> Option<AgentOutcom
         Ok(action) => action.as_str().to_string(),
         Err(error) => format!("error {error}"),
     };
-    Some(hook_outcome(path_label, action))
+    hook_outcome("claude_hook", path_label, action)
 }
 
-/// Builds an outcome row for the Claude hook (a distinct pseudo-target).
-fn hook_outcome(path: String, action: String) -> AgentOutcome {
+/// Builds an outcome row for a hook pseudo-target.
+fn hook_outcome(target: &str, path: String, action: String) -> AgentOutcome {
     AgentOutcome {
-        target: "claude_hook".to_string(),
+        target: target.to_string(),
         path,
         action,
     }
@@ -398,6 +481,61 @@ fn mcp_config_outcomes(args: &AgentTargetArgs, op: &HookOp) -> Vec<AgentOutcome>
         .collect()
 }
 
+/// Installs/uninstalls/reports the Brick Agent Skill for every skill-capable
+/// client selected by the target. Skills are ALWAYS installed at the per-user
+/// (global) location so one install is visible across every project, regardless
+/// of the `--global` flag used for the markdown block.
+fn skill_outcomes(args: &AgentTargetArgs, op: &HookOp) -> Vec<AgentOutcome> {
+    let is_all = matches!(args.target, AgentTargetArg::All);
+    let mut clients = Vec::new();
+    if is_all || matches!(args.target, AgentTargetArg::Claude) {
+        clients.push(skill::SkillClient::Claude);
+    }
+    if is_all || matches!(args.target, AgentTargetArg::Codex) {
+        clients.push(skill::SkillClient::Codex);
+    }
+    if is_all || matches!(args.target, AgentTargetArg::Cursor) {
+        clients.push(skill::SkillClient::Cursor);
+    }
+    if is_all || matches!(args.target, AgentTargetArg::Gemini) {
+        clients.push(skill::SkillClient::Gemini);
+    }
+    if is_all || matches!(args.target, AgentTargetArg::Orgii) {
+        clients.push(skill::SkillClient::Orgii);
+    }
+    if is_all || matches!(args.target, AgentTargetArg::Windsurf) {
+        clients.push(skill::SkillClient::Windsurf);
+    }
+    if clients.is_empty() {
+        return Vec::new();
+    }
+    let Some(home) = home_dir() else {
+        return vec![AgentOutcome {
+            target: "skill".to_string(),
+            path: String::new(),
+            action: "skipped no_home_dir".to_string(),
+        }];
+    };
+    clients
+        .into_iter()
+        .map(|client| {
+            let path = skill::skill_path(client, &home).display().to_string();
+            let action = match op {
+                HookOp::Install { force } => skill::install(client, &home, *force),
+                HookOp::Uninstall => skill::uninstall(client, &home),
+                HookOp::Status => skill::status(client, &home),
+            };
+            AgentOutcome {
+                target: client.label().to_string(),
+                path,
+                action: action
+                    .map(|a| a.as_str().to_string())
+                    .unwrap_or_else(|error| format!("error {error}")),
+            }
+        })
+        .collect()
+}
+
 /// Resolves the absolute path to the running `brick` binary so the hook command
 /// works regardless of the user's `PATH`.
 fn brick_binary() -> Result<String> {
@@ -410,18 +548,26 @@ fn brick_binary() -> Result<String> {
 /// they still appear in the report.
 fn resolve_targets(args: &AgentTargetArgs) -> Result<(Vec<MemoryFile>, Vec<AgentOutcome>)> {
     let targets = match args.target {
-        AgentTargetArg::All => vec![
-            AgentTargetArg::Claude,
-            AgentTargetArg::Codex,
-            AgentTargetArg::Gemini,
-        ],
+        AgentTargetArg::All => {
+            let mut all = vec![
+                AgentTargetArg::Claude,
+                AgentTargetArg::Codex,
+                AgentTargetArg::Gemini,
+            ];
+            // ORGII has a per-workspace conventions file (`.orgii/agent-rules.md`),
+            // but only in local scope — include it in `all` so a repo-local install
+            // teaches the ORGII agent too, not just Claude/Codex/Gemini.
+            if !args.global {
+                all.push(AgentTargetArg::Orgii);
+            }
+            all
+        }
         // MCP-only targets have no markdown memory file, so they never
         // contribute a `MemoryFile`; their registration is handled separately
-        // by `mcp_config_outcomes`.
-        AgentTargetArg::Cursor
-        | AgentTargetArg::Orgii
-        | AgentTargetArg::Windsurf
-        | AgentTargetArg::Vscode => vec![],
+        // by `mcp_config_outcomes`. ORGII is the exception in LOCAL scope: it
+        // writes `<repo>/.orgii/agent-rules.md` (resolved in `resolve_path`).
+        AgentTargetArg::Cursor | AgentTargetArg::Windsurf | AgentTargetArg::Vscode => vec![],
+        AgentTargetArg::Orgii if args.global => vec![],
         single => vec![single],
     };
 
@@ -449,6 +595,21 @@ fn resolve_path(
     global: bool,
     dir: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
+    // ORGII reads its standing instructions from `<workspace>/.orgii/agent-rules.md`
+    // (the `project_conventions` prompt section), NOT a top-level CLAUDE.md/AGENTS.md.
+    // It is per-workspace only, so there is no global conventions file to write —
+    // global scope leaves ORGII to MCP registration alone.
+    if matches!(target, AgentTargetArg::Orgii) {
+        if global {
+            return Ok(None);
+        }
+        let base = match dir {
+            Some(dir) => dir.to_path_buf(),
+            None => std::env::current_dir().context("failed to read current directory")?,
+        };
+        return Ok(Some(base.join(".orgii").join("agent-rules.md")));
+    }
+
     let filename = target_filename(target);
     if !global {
         let base = match dir {
@@ -468,7 +629,7 @@ fn resolve_path(
         AgentTargetArg::Cursor
         | AgentTargetArg::Orgii
         | AgentTargetArg::Windsurf
-        | AgentTargetArg::Vscode => unreachable!("MCP-only target has no memory file"),
+        | AgentTargetArg::Vscode => unreachable!("MCP-only target has no global memory file"),
         AgentTargetArg::All => unreachable!("`all` is expanded before path resolution"),
     };
     Ok(Some(path))
@@ -768,7 +929,39 @@ mod tests {
             .iter()
             .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]);
+        // Local `all` also teaches the ORGII agent via its per-workspace
+        // conventions file `<dir>/.orgii/agent-rules.md`.
+        assert_eq!(
+            names,
+            ["CLAUDE.md", "AGENTS.md", "GEMINI.md", "agent-rules.md"]
+        );
         assert!(files.iter().all(|f| f.path.starts_with(&dir)));
+        let orgii = files
+            .iter()
+            .find(|f| matches!(f.target, AgentTargetArg::Orgii))
+            .expect("orgii memory file present in local `all`");
+        assert!(
+            orgii.path.ends_with(".orgii/agent-rules.md"),
+            "ORGII memory file must be <dir>/.orgii/agent-rules.md, got {}",
+            orgii.path.display()
+        );
+    }
+
+    #[test]
+    fn orgii_global_has_no_memory_file_only_mcp() {
+        // ORGII's conventions file is per-workspace; in global scope it must NOT
+        // resolve to a memory file (MCP registration handles it separately).
+        let (files, skipped) = resolve_targets(&AgentTargetArgs {
+            global: true,
+            target: AgentTargetArg::Orgii,
+            dir: None,
+            format: AgentFormatArg::Text,
+        })
+        .expect("resolve");
+        assert!(
+            files.is_empty(),
+            "global ORGII has no memory file: {files:?}"
+        );
+        assert!(skipped.is_empty(), "and nothing to skip: {skipped:?}");
     }
 }

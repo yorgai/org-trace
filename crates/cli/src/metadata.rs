@@ -117,12 +117,8 @@ fn build_explain_hook_context(store: &LocalStore, file_path: &str) -> Result<Opt
     let anchor_event = matches[0].event_id.to_string();
 
     let anchor = brick_core::resolve_direct_anchor(&events, &anchor_event);
-    let chain = brick_core::explain_from_events(
-        &index,
-        &events,
-        anchor,
-        brick_core::DEFAULT_EXPLAIN_DEPTH,
-    );
+    let chain =
+        brick_core::explain_from_events(&index, &events, anchor, brick_core::DEFAULT_EXPLAIN_DEPTH);
 
     // Only inject if there is real WHY to share (a rationale/relation note), not
     // just a bare diff event — otherwise it is noise.

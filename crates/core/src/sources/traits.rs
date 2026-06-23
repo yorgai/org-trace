@@ -8,9 +8,7 @@ use crate::{
 };
 
 use super::liveness::probe_liveness;
-use super::{
-    claude_code, codex_app, cursor_agent, cursor_ide, gemini, opencode, orgii, windsurf,
-};
+use super::{claude_code, codex_app, cursor_agent, cursor_ide, gemini, opencode, orgii, windsurf};
 
 const SOURCE_CLAUDE_CODE: &str = "claude_code";
 const SOURCE_CODEX_APP: &str = "codex_app";
@@ -166,6 +164,19 @@ pub fn turn_final_assistant_message(
     Ok(select_turn_final_message(&chunks, occurred_at))
 }
 
+/// I/O wrapper over [`infer_turn_rationale`]: loads the session transcript and
+/// infers the turn-final note plus any cause references. Mirrors
+/// [`turn_final_assistant_message`] but returns the richer [`InferredRationale`].
+pub fn infer_session_rationale(
+    source_id: &str,
+    external_session_id: &str,
+    source_path: Option<&Path>,
+    occurred_at: &str,
+) -> Result<InferredRationale> {
+    let chunks = format_source_session_chunks(source_id, external_session_id, source_path)?;
+    Ok(infer_turn_rationale(&chunks, occurred_at))
+}
+
 /// Pure turn-selection over ordered chunks, split out for unit testing without
 /// touching the filesystem. See [`turn_final_assistant_message`] for semantics.
 pub fn select_turn_final_message(chunks: &[ActivityChunk], occurred_at: &str) -> Option<String> {
@@ -218,6 +229,151 @@ pub fn select_turn_final_message(chunks: &[ActivityChunk], occurred_at: &str) ->
         .filter_map(assistant_text)
         .next_back()
         .or_else(|| chunks.iter().filter_map(assistant_text).next_back())
+}
+
+/// A weak (read-side, `observed`-confidence) rationale inferred from a session
+/// transcript: the turn-final note plus any cause references the assistant
+/// mentioned. Unlike an explicit `link` edge, every field here is best-effort
+/// and may be empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InferredRationale {
+    /// The turn-final assistant message — the WHY the diff alone can't express.
+    pub note: Option<String>,
+    /// Entity/cause references parsed out of that turn's assistant text:
+    /// `mission_…` / `artifact_…` ids, and the kind of relation the phrasing
+    /// implies (e.g. "supersedes" / "because"). Best-effort, never fabricated.
+    pub cause_refs: Vec<CauseRef>,
+}
+
+/// One cause reference scraped from transcript text. `target` is the raw id
+/// (`mission_…`, `artifact_…`) the assistant named; `relation` is the causal
+/// relation the surrounding phrasing implies. The caller is responsible for
+/// resolving `target` to a real event (and dropping it if it can't) — this
+/// function only surfaces candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CauseRef {
+    pub target: String,
+    pub relation: InferredRelation,
+}
+
+/// The causal relation a transcript phrase implies. Mirrors the subset of
+/// `brick_protocol::CausalRelation` that is safely inferable from prose; the
+/// `cli` layer maps these onto the protocol enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferredRelation {
+    DerivedFrom,
+    Supersedes,
+    TriggeredBy,
+}
+
+/// Infers a weak rationale for the turn containing `occurred_at`: the turn-final
+/// assistant message (same selection as [`select_turn_final_message`]) plus any
+/// `mission_…` / `artifact_…` references found in that turn's assistant text,
+/// each tagged with the relation its phrasing implies.
+///
+/// Pure (no I/O) so it unit-tests without a filesystem. Honesty rule: this only
+/// ever produces `observed`-confidence signals — it surfaces id candidates and
+/// implied relations, but never invents a target that isn't named verbatim.
+pub fn infer_turn_rationale(chunks: &[ActivityChunk], occurred_at: &str) -> InferredRationale {
+    let note = select_turn_final_message(chunks, occurred_at);
+    let cause_refs = note.as_deref().map(extract_cause_refs).unwrap_or_default();
+    InferredRationale { note, cause_refs }
+}
+
+/// Scrapes `mission_…` / `artifact_…` ids out of free text and tags each with
+/// the relation implied by nearby wording. Deduplicates by target id (first
+/// relation wins). Conservative by design: an id with no relation cue defaults
+/// to `DerivedFrom` (the weakest "this came from that"), and prose with a
+/// relation cue but no id is ignored (nothing to bind to).
+fn extract_cause_refs(text: &str) -> Vec<CauseRef> {
+    let mut refs: Vec<CauseRef> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Split into whitespace/punctuation-delimited words; an entity id is a single
+    // such token (`mission_<id>` / `artifact_<id>`). Track a char offset so we can
+    // sample a relation cue from the surrounding text on a char boundary.
+    let lower = text.to_lowercase();
+    let mut offset = 0usize;
+    for word in
+        text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '`' | '"'))
+    {
+        let word_start = match text[offset..].find(word) {
+            Some(rel) if !word.is_empty() => offset + rel,
+            _ => offset,
+        };
+        offset = word_start + word.len();
+        let trimmed =
+            word.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        let Some(target) = parse_entity_id(trimmed) else {
+            continue;
+        };
+        if !seen.insert(target.clone()) {
+            continue;
+        }
+        // Sample a window of lowercased prose around the id for a relation cue,
+        // snapping bounds to char boundaries.
+        let win_lo = floor_char_boundary(&lower, word_start.saturating_sub(60));
+        let win_hi = ceil_char_boundary(&lower, (offset + 60).min(lower.len()));
+        let relation = relation_from_cue(&lower[win_lo..win_hi]);
+        refs.push(CauseRef { target, relation });
+    }
+    refs
+}
+
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Parses a leading `mission_<id>` / `artifact_<id>` token from `text`. The id
+/// body is `[A-Za-z0-9_-]+`. Returns the matched token (prefix included), or
+/// `None` if `text` doesn't start with a recognized entity prefix.
+fn parse_entity_id(text: &str) -> Option<String> {
+    const PREFIXES: [&str; 2] = ["mission_", "artifact_"];
+    let lower = text.to_lowercase();
+    let prefix = PREFIXES.into_iter().find(|p| lower.starts_with(p))?;
+    let body: String = text[prefix.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{body}"))
+}
+
+/// Maps a window of lowercased prose to the relation it implies. Order matters:
+/// the more specific / directional cues are checked first.
+fn relation_from_cue(window: &str) -> InferredRelation {
+    if window.contains("supersede")
+        || window.contains("replaces")
+        || window.contains("replaced")
+        || window.contains("instead of")
+    {
+        InferredRelation::Supersedes
+    } else if window.contains("triggered by")
+        || window.contains("in response to")
+        || window.contains("responds to")
+    {
+        InferredRelation::TriggeredBy
+    } else {
+        InferredRelation::DerivedFrom
+    }
 }
 
 #[cfg(test)]
@@ -334,7 +490,63 @@ mod tests {
     fn turn_final_message_none_when_turn_has_no_assistant_text() {
         // A turn with only a user message and tool noise yields nothing rather
         // than fabricating a rationale.
-        let chunks = vec![user_message_chunk("s", "p", 0, "2026-06-20T10:00:00Z", "go")];
-        assert_eq!(select_turn_final_message(&chunks, "2026-06-20T10:05:00Z"), None);
+        let chunks = vec![user_message_chunk(
+            "s",
+            "p",
+            0,
+            "2026-06-20T10:00:00Z",
+            "go",
+        )];
+        assert_eq!(
+            select_turn_final_message(&chunks, "2026-06-20T10:05:00Z"),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_rationale_extracts_note_and_mission_cause() {
+        let chunks = vec![
+            user_message_chunk("s", "p", 0, "2026-06-20T10:00:00Z", "do it"),
+            assistant_message_chunk(
+                "s",
+                "p",
+                1,
+                "2026-06-20T10:01:00Z",
+                "Hardened the token refresh, derived from mission_abc123 which set the goal.",
+            ),
+        ];
+        let got = infer_turn_rationale(&chunks, "2026-06-20T10:02:00Z");
+        assert!(got.note.as_deref().unwrap().contains("Hardened"));
+        assert_eq!(got.cause_refs.len(), 1);
+        assert_eq!(got.cause_refs[0].target, "mission_abc123");
+        assert_eq!(got.cause_refs[0].relation, InferredRelation::DerivedFrom);
+    }
+
+    #[test]
+    fn infer_rationale_detects_supersedes_cue() {
+        let chunks = vec![
+            user_message_chunk("s", "p", 0, "2026-06-20T10:00:00Z", "go"),
+            assistant_message_chunk(
+                "s",
+                "p",
+                1,
+                "2026-06-20T10:01:00Z",
+                "This replaces artifact_old99, the earlier approach was wrong.",
+            ),
+        ];
+        let got = infer_turn_rationale(&chunks, "2026-06-20T10:02:00Z");
+        assert_eq!(got.cause_refs.len(), 1);
+        assert_eq!(got.cause_refs[0].target, "artifact_old99");
+        assert_eq!(got.cause_refs[0].relation, InferredRelation::Supersedes);
+    }
+
+    #[test]
+    fn extract_cause_refs_ignores_prose_without_ids_and_dedupes() {
+        // A relation cue with no entity id binds to nothing.
+        assert!(extract_cause_refs("this supersedes the old behavior entirely").is_empty());
+        // Repeated id is surfaced once.
+        let refs = extract_cause_refs("mission_x drove this; see mission_x again");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].target, "mission_x");
     }
 }

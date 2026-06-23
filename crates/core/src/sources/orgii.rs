@@ -362,10 +362,7 @@ pub(super) fn format_chunks(
 /// ORGII assistant `content` rows are stored with a literal `assistant ` prefix;
 /// strip it so the recovered rationale reads naturally.
 fn strip_assistant_prefix(content: &str) -> &str {
-    content
-        .strip_prefix("assistant ")
-        .unwrap_or(content)
-        .trim()
+    content.strip_prefix("assistant ").unwrap_or(content).trim()
 }
 
 fn parse_time(value: Option<&str>) -> Option<SystemTime> {
@@ -492,8 +489,7 @@ mod tests {
         let path = temp_db("list");
         seed_db(&path);
 
-        let sessions =
-            list_sessions(&profile(path), Some(10), None).expect("list orgii sessions");
+        let sessions = list_sessions(&profile(path), Some(10), None).expect("list orgii sessions");
 
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];

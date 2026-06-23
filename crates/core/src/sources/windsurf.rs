@@ -135,7 +135,8 @@ mod tests {
         }
         drop(connection);
 
-        let sessions = list_sessions(&profile(path), Some(10), None).expect("list windsurf sessions");
+        let sessions =
+            list_sessions(&profile(path), Some(10), None).expect("list windsurf sessions");
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].external_session_id, "windsurf-composer-1");

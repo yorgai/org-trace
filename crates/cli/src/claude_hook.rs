@@ -174,7 +174,10 @@ fn upsert_entry(
     desired: Value,
     force: bool,
 ) -> EntryChange {
-    match entries.iter().position(|entry| entry_has_marker(entry, marker)) {
+    match entries
+        .iter()
+        .position(|entry| entry_has_marker(entry, marker))
+    {
         Some(index) => {
             if !force && entries[index] == desired {
                 EntryChange::Unchanged

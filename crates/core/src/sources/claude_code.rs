@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::jsonl::{
-    read_jsonl_records, read_jsonl_values, set_first_path, set_first_string,
-    set_first_string_value, text_from_value, token_value, normalize_title, update_session_times,
+    normalize_title, read_jsonl_records, read_jsonl_values, set_first_path, set_first_string,
+    set_first_string_value, text_from_value, token_value, update_session_times,
 };
 
 const CLAUDE_CODE_SOURCE_ID: &str = "claude_code";

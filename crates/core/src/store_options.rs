@@ -89,8 +89,8 @@ pub fn resolve_storage_root(
     // (`~/.brick/repos/<repo_id>/provenance`), NOT under the user's working tree.
     // A user has exactly one `~/.brick`; nothing is written into the repo. Falls
     // back to a repo-local path only if the global home cannot be resolved.
-    let path = crate::repo_provenance_root(repo_root)
-        .unwrap_or_else(|_| repo_root.join(PROVENANCE_DIR));
+    let path =
+        crate::repo_provenance_root(repo_root).unwrap_or_else(|_| repo_root.join(PROVENANCE_DIR));
     Ok(ResolvedStorageRoot {
         path,
         source: StorageRootSource::RepoDefault,

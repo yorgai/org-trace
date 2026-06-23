@@ -14,11 +14,11 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    capture_diff, discover_repo_root, explain_from_events, merge_source_steps_into,
-    resolve_direct_anchor, resolve_file_anchor, resolve_file_line_anchor,
+    capture_diff, discover_repo_root, explain_from_events, infer_session_rationale,
+    merge_source_steps_into, resolve_direct_anchor, resolve_file_anchor, resolve_file_line_anchor,
     resolve_file_range_anchor, source_sessions_to_steps, CausalChain, DiffCaptureRequest,
-    LocalStore, MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH,
-    MAX_EXPLAIN_DEPTH,
+    InferredRelation, LocalStore, MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore,
+    DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -133,29 +133,41 @@ fn explain_tool() -> Value {
     json!({
         "name": "explain",
         "description": "Explain WHY a piece of code looks the way it does, across \
-every AI tool that touched this repo. Your FIRST step when you locate existing \
-code and before you draw conclusions from the code alone — prefer it over grep \
-and `git log`, which are only a fallback when Brick has no record. Returns a \
-causal chain: who changed the anchor, WHEN, WHY (the rationale note that cannot \
-be read from the code), what was derived from / triggered by it, each step's \
-confidence (explicit > observed > inferred), a transcript pointer per step, and \
-a `live` field warning if another session is editing the same file right now. \
-This subsumes line-level blame (WHO) into the WHY answer. Anchor can be a \
-`path:line` (e.g. `/abs/workspace/src/auth.rs:42`), a `path:start-end` line \
-range to explain a whole block at once (e.g. `/abs/workspace/src/auth.rs:10-20`), \
-a whole-file `path`, an `artifact_*` id, a `mission_*` id, or an event id. Prefer \
-an ABSOLUTE path — the server may run from a different working directory than \
-your workspace, and an absolute anchor always resolves the right repo.",
+    every AI tool that touched this repo. This is your DEFAULT first move for ANY \
+    \"why\" or \"how did this happen\" question — investigating what caused a bug or \
+    an issue, explaining why some behavior exists, tracing the history of a change, \
+    or reviewing code before you touch it. The moment a task is about CAUSE or \
+    HISTORY (e.g. \"how did this issue happen\", \"why is this broken\", \"what \
+    introduced this\"), reach for `explain` BEFORE grep, `git log`, reading files \
+    top-to-bottom, or fetching the issue tracker — those are fallbacks for when \
+    Brick genuinely has no record. Returns a \
+    causal chain: who changed the anchor, WHEN, WHY (the rationale note that cannot \
+    be read from the code), what was derived from / triggered by it, each step's \
+    confidence (explicit > observed > inferred), a transcript pointer per step, and \
+    a `live` field warning if another session is editing the same file right now. \
+    This subsumes line-level blame (WHO) into the WHY answer. \
+    IMPORTANT — go deeper than the `note`: each step's `note` is only that turn's \
+    CLOSING narration (an `observed` summary), which is frequently NOT the root \
+    cause. When the note doesn't answer your question, do NOT stop and fall back to \
+    git/grep — run the step's `transcript.read_session` command to read that \
+    session's FULL trajectory (the original tool calls, errors, and reasoning) from \
+    the source db/file. That deep read is where the real cause lives. \
+    Anchor can be a \
+    `path:line` (e.g. `/abs/workspace/src/auth.rs:42`), a `path:start-end` line \
+    range to explain a whole block at once (e.g. `/abs/workspace/src/auth.rs:10-20`), \
+    a whole-file `path`, an `artifact_*` id, a `mission_*` id, or an event id. Prefer \
+    an ABSOLUTE path — the server may run from a different working directory than \
+    your workspace, and an absolute anchor always resolves the right repo.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "anchor": {
                     "type": "string",
                     "description": "What to explain: a `path:line`, a `path:start-end` \
-line range (e.g. `/abs/ws/src/auth.rs:10-20`, to get every change that touched \
-that block), a whole-file `path` (use an ABSOLUTE path, e.g. \
-`/abs/workspace/src/auth.rs:42`, so it resolves regardless of the server's \
-working directory), an artifact id, a mission id, or an event id."
+    line range (e.g. `/abs/ws/src/auth.rs:10-20`, to get every change that touched \
+    that block), a whole-file `path` (use an ABSOLUTE path, e.g. \
+    `/abs/workspace/src/auth.rs:42`, so it resolves regardless of the server's \
+    working directory), an artifact id, a mission id, or an event id."
                 },
                 "depth": {
                     "type": "integer",
@@ -171,45 +183,46 @@ working directory), an artifact id, a mission id, or an event id."
 fn link_tool() -> Value {
     json!({
         "name": "link",
-        "description": "Record WHY you just made a change, so the next agent can \
-recover your reasoning with `explain`. Call this RIGHT AFTER a non-trivial edit \
-and BEFORE you commit — `link` binds your reason to a real change event, which it \
-gets by capturing your still-uncommitted work, so committing first leaves nothing \
-to bind to. Every `link` has an effect (the change) and a WHY (`note`), plus an \
-optional `cause`. Common shapes: (1) a rationale — omit `effect` and give a \
-`note`; Brick captures your uncommitted diff and binds the note to exactly those \
-files; (2) a causal edge — also set `cause` to the anchor that prompted the \
-change (an artifact, mission, or event id) and pick a `relation`; (3) \
-implementing a planned work item — set `cause` to its `mission_…` id with \
-relation='derived_from' so the planning record connects to the real code. If you \
-made several unrelated edits, `link` after each one so each reason binds to the \
-right files.",
+        "description": "Record an EXPLICIT causal edge that Brick cannot infer on \
+    its own. You usually do NOT need this: `explain` already recovers the WHY of \
+    ordinary single-session edits from the transcript automatically (as `observed` \
+    rationale), so day-to-day work needs no `link` call. Reach for `link` only for \
+    the few things inference can't reconstruct: (1) a CROSS-REPO or CROSS-SESSION \
+    cause — this change was driven by a decision/change made elsewhere (set `cause` \
+    to that artifact/mission/event id with relation='derived_from' or \
+    'triggered_by'); (2) a SUPERSEDES edge — this change replaces/corrects an earlier \
+    one (set `cause` to the superseded event id, relation='supersedes'); (3) a \
+    high-stakes rationale you want recorded at `explicit` confidence rather than left \
+    to transcript inference. When you do call it: `link` binds to a real change \
+    event, so call it BEFORE committing (it captures your still-uncommitted work) or \
+    pass an `effect` naming an existing event/file. Every `link` has an effect (the \
+    change) and a WHY (`note` and/or a `cause` + `relation`).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "effect": {
                     "type": "string",
                     "description": "The change you are explaining. USUALLY OMIT \
-THIS — when omitted, Brick captures your current uncommitted edits and binds the \
-reason to exactly those files (so call `link` before committing). Only pass \
-`effect` to point at a change Brick has ALREADY recorded: an event id, or a \
-`path`/`path:line` (prefer an ABSOLUTE path) that resolves through blame to an \
-existing change event. An `effect` that resolves to nothing is an error — it does \
-NOT create a free-floating note; omit it and let Brick capture the diff instead."
+    THIS — when omitted, Brick captures your current uncommitted edits and binds the \
+    reason to exactly those files (so call `link` before committing). Only pass \
+    `effect` to point at a change Brick has ALREADY recorded: an event id, or a \
+    `path`/`path:line` (prefer an ABSOLUTE path) that resolves through blame to an \
+    existing change event. An `effect` that resolves to nothing is an error — it does \
+    NOT create a free-floating note; omit it and let Brick capture the diff instead."
                 },
                 "cause": {
                     "type": "string",
                     "description": "Optional anchor that caused/motivated this \
-change: a `path`, `path:line` (prefer an ABSOLUTE path), artifact, mission, or \
-event id. If you are implementing a planned work item, pass that `mission_…` id \
-here (with relation='derived_from') so the planning record links to the actual \
-code — do NOT just mention the mission in `note`, that leaves the graph \
-disconnected. Omit for a standalone rationale."
+    change: a `path`, `path:line` (prefer an ABSOLUTE path), artifact, mission, or \
+    event id. If you are implementing a planned work item, pass that `mission_…` id \
+    here (with relation='derived_from') so the planning record links to the actual \
+    code — do NOT just mention the mission in `note`, that leaves the graph \
+    disconnected. Omit for a standalone rationale."
                 },
                 "relation": {
                     "type": "string",
                     "description": "How the effect relates to the cause. Use 'rationale' \
-for a standalone reason (no cause).",
+    for a standalone reason (no cause).",
                     "enum": ["triggered_by", "derived_from", "supersedes", "responds_to", "rationale"]
                 },
                 "note": {
@@ -219,10 +232,10 @@ for a standalone reason (no cause).",
                 "session": {
                     "type": "string",
                     "description": "Optional: the id of the coding session you are \
-working in (your tool's session/conversation id). Brick records it on the \
-change so a later `explain` can hand the next agent a transcript pointer back \
-to this session — the original context behind the change. Omit if you don't \
-have one."
+    working in (your tool's session/conversation id). Brick records it on the \
+    change so a later `explain` can hand the next agent a transcript pointer back \
+    to this session — the original context behind the change. Omit if you don't \
+    have one."
                 }
             },
             "required": []
@@ -244,8 +257,8 @@ fn planning_tools() -> Vec<Value> {
         json!({
             "name": "mission_list",
             "description": "List missions (work items / goals) Brick is tracking, \
-newest first. Use to see what's in flight before starting work or to pick up an \
-unfinished task. Optionally filter by status or project.",
+        newest first. Use to see what's in flight before starting work or to pick up an \
+        unfinished task. Optionally filter by status or project.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -261,7 +274,7 @@ unfinished task. Optionally filter by status or project.",
         json!({
             "name": "show_mission",
             "description": "Show one mission in detail: status, description, and the \
-sessions and artifacts linked to it.",
+        sessions and artifacts linked to it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -273,8 +286,8 @@ sessions and artifacts linked to it.",
         json!({
             "name": "mission",
             "description": "Create or update a mission (work item / goal). \
-action='create' opens a new work item under a project; action='update' changes \
-its title/description/status as work progresses.",
+        action='create' opens a new work item under a project; action='update' changes \
+        its title/description/status as work progresses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -304,7 +317,7 @@ its title/description/status as work progresses.",
         json!({
             "name": "artifact_add",
             "description": "Record a deliverable (a PR, design doc, decision, test \
-result) and link it to a mission. Call after finishing a meaningful piece of work.",
+        result) and link it to a mission. Call after finishing a meaningful piece of work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -325,7 +338,7 @@ result) and link it to a mission. Call after finishing a meaningful piece of wor
         json!({
             "name": "artifact_attach",
             "description": "Attach a file-path piece of evidence to an artifact — the \
-concrete file(s) backing a deliverable. Call after artifact_add.",
+        concrete file(s) backing a deliverable. Call after artifact_add.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -519,9 +532,9 @@ fn explain_tool_call(
             "forward": [],
             "truncated": false,
             "note": "No Brick repo resolved for this anchor (the MCP server was \
-likely started outside a git repo, e.g. cwd=/). Pass an absolute path anchor, \
-or set the server's working directory to the workspace. Falling back to git/grep \
-is fine here."
+        likely started outside a git repo, e.g. cwd=/). Pass an absolute path anchor, \
+        or set the server's working directory to the workspace. Falling back to git/grep \
+        is fine here."
         }));
     };
     let store = &store;
@@ -536,27 +549,30 @@ is fine here."
 
     // file:line and file:start-end anchors need git + the working tree; direct
     // ids do not.
-    let (anchor, anchored_path, is_file_line) = if let Some((path, start, end)) =
-        parse_file_range(&anchor_input)
-    {
-        let repo_root = store.repo_root().to_path_buf();
-        let rel_path = normalize_repo_relative(&repo_root, &path);
-        let anchor = resolve_file_range_anchor(store, &repo_root, &rel_path, start, end)?;
-        (anchor, Some(rel_path), true)
-    } else if let Some((path, line)) = parse_file_line(&anchor_input) {
-        let repo_root = store.repo_root().to_path_buf();
-        let rel_path = normalize_repo_relative(&repo_root, &path);
-        let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
-        (anchor, Some(rel_path), true)
-    } else if looks_like_path(&anchor_input) {
-        // A whole-file anchor (no `:line`) — agents very often ask about a file,
-        // not a line. Match the file's change events directly instead of treating
-        // the path as an opaque id (which wrongly reported "no record").
-        let rel_path = normalize_repo_relative(store.repo_root(), &anchor_input);
-        (resolve_file_anchor(&events, &rel_path), Some(rel_path), false)
-    } else {
-        (resolve_direct_anchor(&events, &anchor_input), None, false)
-    };
+    let (anchor, anchored_path, is_file_line) =
+        if let Some((path, start, end)) = parse_file_range(&anchor_input) {
+            let repo_root = store.repo_root().to_path_buf();
+            let rel_path = normalize_repo_relative(&repo_root, &path);
+            let anchor = resolve_file_range_anchor(store, &repo_root, &rel_path, start, end)?;
+            (anchor, Some(rel_path), true)
+        } else if let Some((path, line)) = parse_file_line(&anchor_input) {
+            let repo_root = store.repo_root().to_path_buf();
+            let rel_path = normalize_repo_relative(&repo_root, &path);
+            let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
+            (anchor, Some(rel_path), true)
+        } else if looks_like_path(&anchor_input) {
+            // A whole-file anchor (no `:line`) — agents very often ask about a file,
+            // not a line. Match the file's change events directly instead of treating
+            // the path as an opaque id (which wrongly reported "no record").
+            let rel_path = normalize_repo_relative(store.repo_root(), &anchor_input);
+            (
+                resolve_file_anchor(&events, &rel_path),
+                Some(rel_path),
+                false,
+            )
+        } else {
+            (resolve_direct_anchor(&events, &anchor_input), None, false)
+        };
 
     let mut chain = explain_from_events(&index, &events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
     // One db, one explain: when a WHOLE-FILE anchor has no recorded trace events,
@@ -603,8 +619,10 @@ pub(crate) fn finalize_explain_chain(
     // For steps that have a resolved transcript but no asserted (`explicit`) note,
     // recover the turn's final assistant message as an `observed` rationale, so
     // ingested history isn't left with WHO/WHEN but zero WHY. Never overrides an
-    // explicit `link` note.
-    enrich_observed_rationale(&mut chain);
+    // explicit `link` note. `events` lets it resolve transcript-named entity ids
+    // (mission/artifact) into an `observed` relation when they really exist.
+    let events = store.read_all_events().unwrap_or_default();
+    enrich_observed_rationale(&mut chain, &events);
 
     let mut value = serde_json::to_value(&chain)?;
     // `live` field: if another running session is touching the anchored file
@@ -799,7 +817,12 @@ fn capture_working_diff_event(
     if payload.file_changes.is_empty() {
         return Ok(None);
     }
-    captured_files.extend(payload.file_changes.iter().map(|change| change.path.clone()));
+    captured_files.extend(
+        payload
+            .file_changes
+            .iter()
+            .map(|change| change.path.clone()),
+    );
     let event = TraceEvent::diff_captured(
         mcp_actor(args),
         ArtifactId::new(),
@@ -956,7 +979,7 @@ fn dispatch_mission(store: &LocalStore, args: &Value) -> Result<Value> {
                 "created": true,
                 "mission_id": mission_id.to_string(),
                 "note": "Mission opened. Record deliverables with artifact_add, and \
-update its status with mission action='update'."
+            update its status with mission action='update'."
             }))
         }
         "update" => {
@@ -976,7 +999,8 @@ update its status with mission action='update'."
                 Some(raw) if !raw.is_empty() => Some(parse_mission_status(raw)?),
                 _ => None,
             };
-            if project_id.is_none() && title.is_none() && description.is_none() && status.is_none() {
+            if project_id.is_none() && title.is_none() && description.is_none() && status.is_none()
+            {
                 return Err(anyhow::anyhow!(
                     "mission update needs at least one of project, title, description, or status"
                 ));
@@ -1112,9 +1136,7 @@ fn planning_store_fallback(default: &LocalStore) -> Option<LocalStore> {
     if discover_repo_root(default.repo_root()).is_ok() {
         return None;
     }
-    brick_core::resolve_brick_home()
-        .ok()
-        .map(LocalStore::new)
+    brick_core::resolve_brick_home().ok().map(LocalStore::new)
 }
 
 /// Resolves any anchor (file:line, artifact/mission/event id) to a single event
@@ -1135,22 +1157,77 @@ fn resolve_anchor_to_event(
             .and_then(|id| uuid::Uuid::parse_str(id).ok()));
     }
     if looks_like_path(anchor) {
-        let rel_path = std::env::current_dir()
+        let repo_root = std::env::current_dir()
             .ok()
-            .and_then(|cwd| discover_repo_root(&cwd).ok())
-            .map(|repo_root| normalize_repo_relative(&repo_root, anchor))
+            .and_then(|cwd| discover_repo_root(&cwd).ok());
+        let rel_path = repo_root
+            .as_ref()
+            .map(|root| normalize_repo_relative(root, anchor))
             .unwrap_or_else(|| anchor.to_string());
         let resolved = resolve_file_anchor(events, &rel_path);
-        return Ok(resolved
+        if let Some(id) = resolved
             .resolved_events
             .first()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok()));
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        {
+            return Ok(Some(id));
+        }
+        // Fallback: the JSONL ledger has no event for this file (the common case
+        // for agents that edit with their own tools and rely on Brick's passive
+        // index). Resolve the anchor to a metadata source-session instead, and
+        // bind the edge to that session's id. This is what turns the "effect file
+        // has no Brick event" hard-failure into a real link for cross-repo /
+        // passively-indexed work.
+        if let Some(root) = repo_root.as_ref() {
+            return Ok(resolve_path_to_source_session(root, anchor));
+        }
+        return Ok(None);
     }
     let resolved = resolve_direct_anchor(events, anchor);
     Ok(resolved
         .resolved_events
         .first()
         .and_then(|id| uuid::Uuid::parse_str(id).ok()))
+}
+
+/// Resolves a file path anchor to the id of a metadata source-session that
+/// touched it, for `link`'s effect fallback. Picks the most-recent same-repo
+/// session whose `external_session_id` is a parseable UUID, and returns that
+/// UUID as the effect event. Returns `None` when nothing matches or the matched
+/// session's id isn't UUID-shaped (we never fabricate an id).
+fn resolve_path_to_source_session(repo_root: &std::path::Path, anchor: &str) -> Option<uuid::Uuid> {
+    let abs_path = if std::path::Path::new(anchor).is_absolute() {
+        anchor.to_string()
+    } else {
+        repo_root.join(anchor).display().to_string()
+    };
+    let db = MetadataDb::open_global().ok()?;
+    let query = SourceFileSessionBlameQuery {
+        file_path: abs_path,
+        source_id: None,
+        repo_path: Some(repo_root.to_path_buf()),
+        limit: MAX_EXPLAIN_DEPTH,
+    };
+    let rows = db.query_source_file_session_blame(&query).ok()?;
+    let want = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    rows.into_iter()
+        .filter(|row| {
+            row.source_pointer
+                .as_ref()
+                .and_then(|p| p.get("repo_path"))
+                .and_then(|v| v.as_str())
+                .map(|rp| {
+                    let have =
+                        std::fs::canonicalize(rp).unwrap_or_else(|_| std::path::PathBuf::from(rp));
+                    have == want
+                })
+                .unwrap_or(false)
+        })
+        .find_map(|row| {
+            row.external_session_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        })
 }
 
 /// Parses the `relation` arg, defaulting to `derived_from` when a cause is given
@@ -1204,29 +1281,81 @@ fn enrich_transcripts(
 ) {
     // Cheap exit: if no step or forward effect carries a session id, there is
     // nothing to resolve and we skip the (potentially slow) source scan.
-    let needs_resolution = chain
-        .steps
-        .iter()
-        .any(|step| step.transcript.as_ref().and_then(|t| t.session_id.as_ref()).is_some())
-        || chain.forward.iter().any(|f| f.session_id.is_some());
+    let needs_resolution = chain.steps.iter().any(|step| {
+        step.transcript
+            .as_ref()
+            .and_then(|t| t.session_id.as_ref())
+            .is_some()
+    }) || chain.forward.iter().any(|f| f.session_id.is_some());
     if !needs_resolution {
         return;
     }
 
-    let index = build_transcript_index(anchor_profiles, cwd_profiles);
-    if index.is_empty() {
-        return;
-    }
+    // Only the (expensive) source scan is needed when some step lacks a resolved
+    // ref; steps the core already resolved (db-backed sources) just need the
+    // deep-dive command derived from their existing ref.
+    let needs_index = chain.steps.iter().any(|step| {
+        step.transcript
+            .as_ref()
+            .map(|t| t.session_id.is_some() && t.session_ref.is_none())
+            .unwrap_or(false)
+    });
+    let index = if needs_index {
+        build_transcript_index(anchor_profiles, cwd_profiles)
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     for step in &mut chain.steps {
         if let Some(pointer) = step.transcript.as_mut() {
             if let Some(session_id) = pointer.session_id.clone() {
-                if let Some((source, session_ref)) = index.get(&session_id) {
-                    pointer.source = Some(source.clone());
-                    pointer.session_ref = Some(session_ref.clone());
+                // Fill source/session_ref from the index when the core didn't
+                // already resolve them (file-backed steps), then always derive the
+                // deep-dive command from whatever ref we have.
+                if pointer.session_ref.is_none() {
+                    if let Some((source, session_ref)) = index.get(&session_id) {
+                        pointer.source = Some(source.clone());
+                        pointer.session_ref = Some(session_ref.clone());
+                    }
+                }
+                if let (Some(source), Some(session_ref)) =
+                    (pointer.source.clone(), pointer.session_ref.clone())
+                {
+                    pointer.read_session =
+                        Some(read_session_command(&source, &session_ref, &session_id));
                 }
             }
         }
+    }
+}
+
+/// Builds a ready-to-run command that dumps one session's FULL trajectory, so an
+/// agent can deep-dive past the turn-final `note` (a closing summary, often not
+/// the root cause) into the original session end-to-end.
+///
+/// SQLite-backed sources (ORGII, Cursor) keep many sessions in one `.db`, so the
+/// command is a `sqlite3` query scoped to this `session_id`. File-backed sources
+/// (Claude/Codex/Gemini) keep one transcript per file, so it's a plain file read.
+fn read_session_command(source: &str, session_ref: &str, session_id: &str) -> String {
+    let is_sqlite = session_ref.ends_with(".db")
+        || session_ref.ends_with(".vscdb")
+        || session_ref.ends_with(".sqlite");
+    if !is_sqlite {
+        // File-backed: the ref IS the transcript; read it directly.
+        return format!("read_file {session_ref}");
+    }
+    match source {
+        // ORGII: one row per message/tool-call in `events`, keyed by session_id.
+        "orgii" => format!(
+            "sqlite3 \"{session_ref}\" \"SELECT created_at, function_name, \
+substr(content,1,4000) FROM events WHERE session_id='{session_id}' ORDER BY \
+created_at;\""
+        ),
+        // Cursor and other db sources: surface the db + id so the agent can probe
+        // the source's own schema (Cursor's layout differs by version).
+        _ => format!(
+            "# inspect session {session_id} in the source db:\nsqlite3 \"{session_ref}\" \".tables\""
+        ),
     }
 }
 
@@ -1274,7 +1403,7 @@ fn build_transcript_index(
 /// - never touches a step that already has a note (an `explicit` `link` always wins);
 /// - sets `confidence = "observed"` so the agent can weigh it accordingly;
 /// - is best-effort: a missing/unreadable transcript leaves the step unchanged.
-fn enrich_observed_rationale(chain: &mut CausalChain) {
+fn enrich_observed_rationale(chain: &mut CausalChain, events: &[TraceEvent]) {
     for step in &mut chain.steps {
         if step.note.is_some() {
             continue;
@@ -1289,17 +1418,51 @@ fn enrich_observed_rationale(chain: &mut CausalChain) {
         ) else {
             continue;
         };
-        let recovered = brick_core::turn_final_assistant_message(
+        let inferred = infer_session_rationale(
             source,
             session_id,
             Some(std::path::Path::new(session_ref)),
             &step.occurred_at,
         );
-        if let Ok(Some(message)) = recovered {
+        let Ok(inferred) = inferred else {
+            continue;
+        };
+        if let Some(message) = inferred.note {
             step.note = Some(message);
             step.confidence = "observed".to_string();
+            // Only set a relation when the assistant named an entity that
+            // actually exists in the ledger AND this step has no asserted
+            // relation. An unresolvable id is dropped (never a fabricated edge).
+            if step.relation.is_none() {
+                if let Some(relation) = inferred
+                    .cause_refs
+                    .iter()
+                    .find(|cref| entity_exists(events, &cref.target))
+                    .map(|cref| inferred_relation_wire(cref.relation))
+                {
+                    step.relation = Some(relation.to_string());
+                }
+            }
         }
     }
+}
+
+/// Wire string for a transcript-inferred relation, matching `relation_wire`'s
+/// names for the protocol enum so observed and explicit edges read identically.
+fn inferred_relation_wire(relation: InferredRelation) -> &'static str {
+    match relation {
+        InferredRelation::DerivedFrom => "derived_from",
+        InferredRelation::Supersedes => "supersedes",
+        InferredRelation::TriggeredBy => "triggered_by",
+    }
+}
+
+/// Whether `target` (a `mission_…` / `artifact_…` id scraped from a transcript)
+/// names a real mission/artifact event in the ledger. Guards against binding a
+/// relation to an id the assistant mentioned but that Brick never recorded.
+fn entity_exists(events: &[TraceEvent], target: &str) -> bool {
+    let resolved = resolve_direct_anchor(events, target);
+    !resolved.resolved_events.is_empty()
 }
 
 /// Whether `explain` found genuinely nothing to say. A chain is empty ONLY when

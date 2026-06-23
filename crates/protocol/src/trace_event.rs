@@ -308,7 +308,12 @@ impl TraceEvent {
         payload: CausalLinkedPayload,
     ) -> Result<Self, CausalLinkError> {
         if payload.cause_events.is_empty()
-            && payload.note.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && payload
+                .note
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
         {
             return Err(CausalLinkError::Empty);
         }
@@ -362,10 +367,11 @@ pub enum CausalLinkError {
 impl std::fmt::Display for CausalLinkError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CausalLinkError::Empty => formatter.write_str(
-                "causal edge requires at least one cause_event or a non-empty note",
-            ),
-            CausalLinkError::Serialize(err) => write!(formatter, "failed to serialize payload: {err}"),
+            CausalLinkError::Empty => formatter
+                .write_str("causal edge requires at least one cause_event or a non-empty note"),
+            CausalLinkError::Serialize(err) => {
+                write!(formatter, "failed to serialize payload: {err}")
+            }
         }
     }
 }

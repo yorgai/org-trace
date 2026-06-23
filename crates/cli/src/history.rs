@@ -1694,17 +1694,20 @@ fn refresh_repo_sources(repo_root: &Path) -> Result<()> {
     let now = Utc::now();
     let due: Vec<SourceProfile> = profiles
         .into_iter()
-        .filter(|profile| match metadata_db.get_source_watermark(&profile.name) {
-            Ok(Some((_, last_refreshed_at))) => {
-                DateTime::parse_from_rfc3339(&last_refreshed_at)
-                    .map(|last| {
-                        now.signed_duration_since(last.with_timezone(&Utc)).num_seconds()
-                            >= AUTO_REFRESH_THROTTLE_SECS
-                    })
-                    .unwrap_or(true)
-            }
-            _ => true,
-        })
+        .filter(
+            |profile| match metadata_db.get_source_watermark(&profile.name) {
+                Ok(Some((_, last_refreshed_at))) => {
+                    DateTime::parse_from_rfc3339(&last_refreshed_at)
+                        .map(|last| {
+                            now.signed_duration_since(last.with_timezone(&Utc))
+                                .num_seconds()
+                                >= AUTO_REFRESH_THROTTLE_SECS
+                        })
+                        .unwrap_or(true)
+                }
+                _ => true,
+            },
+        )
         .collect();
     if due.is_empty() {
         return Ok(());

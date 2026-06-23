@@ -54,8 +54,12 @@ pub fn handle_push(
         .context("upload requires a Brick account. Run `brick login` first")?;
 
     let request = PushEventsRequest { events };
-    let response =
-        push_events_to_remote(&remote, repo_id.as_deref(), &request, Some(&identity.access_token))?;
+    let response = push_events_to_remote(
+        &remote,
+        repo_id.as_deref(),
+        &request,
+        Some(&identity.access_token),
+    )?;
     print_push_result(&response, request.events.len());
     Ok(())
 }
@@ -305,7 +309,15 @@ mod tests {
         let repo_root = temp_repo_root("dry-run-push");
         let store = LocalStore::new(&repo_root);
         store.append_event(&event("queued")).expect("append");
-        let result = handle_push(&store, true, Some("http://127.0.0.1:7821".to_string()), None);
-        assert!(result.is_ok(), "dry-run push must not require login: {result:?}");
+        let result = handle_push(
+            &store,
+            true,
+            Some("http://127.0.0.1:7821".to_string()),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "dry-run push must not require login: {result:?}"
+        );
     }
 }

@@ -751,17 +751,17 @@ pub enum HistoryExportFormatArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 pub enum AgentTargetArg {
-    /// `CLAUDE.md` (Claude Code).
+    /// `CLAUDE.md` plus Claude Code skill/MCP registration.
     Claude,
-    /// `AGENTS.md` (Codex, Cursor, Copilot, OpenCode, etc.).
+    /// `AGENTS.md` plus Codex skill/MCP registration.
     Codex,
-    /// `GEMINI.md` (Gemini).
+    /// `GEMINI.md` plus Gemini skill registration.
     Gemini,
-    /// Cursor — MCP-server registration only (no separate memory file).
+    /// Cursor skill/MCP registration.
     Cursor,
-    /// ORGII — MCP-server registration only.
+    /// ORGII rules plus skill/MCP registration.
     Orgii,
-    /// Windsurf — MCP-server registration only.
+    /// Windsurf skill/MCP registration.
     Windsurf,
     /// VS Code (Copilot) — MCP-server registration only.
     Vscode,

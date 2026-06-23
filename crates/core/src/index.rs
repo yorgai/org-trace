@@ -561,26 +561,35 @@ impl TraceIndex {
         let source_event_id = event.event_id.to_string();
 
         if payload.cause_events.is_empty() {
-            self.causes.entry(effect.clone()).or_default().push(CausalEdge {
-                cause_event: None,
-                relation: payload.relation,
-                note: payload.note.clone(),
-                source_event_id: source_event_id.clone(),
-                confidence: confidence.clone(),
-                recorded_at: event.recorded_at,
-            });
-        } else {
-            for cause in &payload.cause_events {
-                let cause_id = cause.to_string();
-                self.causes.entry(effect.clone()).or_default().push(CausalEdge {
-                    cause_event: Some(cause_id.clone()),
+            self.causes
+                .entry(effect.clone())
+                .or_default()
+                .push(CausalEdge {
+                    cause_event: None,
                     relation: payload.relation,
                     note: payload.note.clone(),
                     source_event_id: source_event_id.clone(),
                     confidence: confidence.clone(),
                     recorded_at: event.recorded_at,
                 });
-                self.effects.entry(cause_id).or_default().push(effect.clone());
+        } else {
+            for cause in &payload.cause_events {
+                let cause_id = cause.to_string();
+                self.causes
+                    .entry(effect.clone())
+                    .or_default()
+                    .push(CausalEdge {
+                        cause_event: Some(cause_id.clone()),
+                        relation: payload.relation,
+                        note: payload.note.clone(),
+                        source_event_id: source_event_id.clone(),
+                        confidence: confidence.clone(),
+                        recorded_at: event.recorded_at,
+                    });
+                self.effects
+                    .entry(cause_id)
+                    .or_default()
+                    .push(effect.clone());
             }
         }
         Ok(())

@@ -126,22 +126,16 @@ pub(super) fn format_chunks(
             "assistant" => {
                 // One assistant blob can carry reasoning, text, and tool calls;
                 // emit each as its own chunk in declaration order.
-                for chunk in assistant_chunks(
-                    external_session_id,
-                    &message,
-                    &created_at,
-                    &mut sequence,
-                ) {
+                for chunk in
+                    assistant_chunks(external_session_id, &message, &created_at, &mut sequence)
+                {
                     chunks.push(chunk);
                 }
             }
             "tool" => {
-                for chunk in tool_result_chunks(
-                    external_session_id,
-                    &message,
-                    &created_at,
-                    &mut sequence,
-                ) {
+                for chunk in
+                    tool_result_chunks(external_session_id, &message, &created_at, &mut sequence)
+                {
                     chunks.push(chunk);
                 }
             }
@@ -162,7 +156,9 @@ struct StoreMeta {
 
 fn read_meta(connection: &Connection) -> Result<StoreMeta> {
     let raw: Option<String> = connection
-        .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| row.get(0))
+        .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
+            row.get(0)
+        })
         .ok();
     let Some(raw) = raw else {
         return Ok(StoreMeta {
@@ -176,8 +172,8 @@ fn read_meta(connection: &Connection) -> Result<StoreMeta> {
     let json_text = hex_decode(&raw)
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or(raw);
-    let value: Value = serde_json::from_str(&json_text)
-        .context("failed to parse cursor-agent meta JSON")?;
+    let value: Value =
+        serde_json::from_str(&json_text).context("failed to parse cursor-agent meta JSON")?;
     Ok(StoreMeta {
         agent_id: value
             .get("agentId")
@@ -241,7 +237,10 @@ fn session_from_store(path: &Path, app_id: &str) -> Result<Option<NativeSourceSe
     }
 
     let file_metadata = std::fs::metadata(path).with_context(|| {
-        format!("failed to read cursor-agent store metadata for {}", path.display())
+        format!(
+            "failed to read cursor-agent store metadata for {}",
+            path.display()
+        )
     })?;
     let created_at = meta
         .created_at_ms
@@ -777,10 +776,7 @@ mod tests {
         });
         let meta_hex = hex_encode(meta.to_string().as_bytes());
         connection
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('0', ?1)",
-                [meta_hex],
-            )
+            .execute("INSERT INTO meta (key, value) VALUES ('0', ?1)", [meta_hex])
             .expect("insert meta");
     }
 
@@ -808,7 +804,10 @@ mod tests {
             "New Agent",
             1_770_000_000_000,
             &[
-                (sha_id(1), json!({"role": "system", "content": "You are an AI"})),
+                (
+                    sha_id(1),
+                    json!({"role": "system", "content": "You are an AI"}),
+                ),
                 (
                     sha_id(2),
                     json!({"role": "user", "content": "<user_query>\nfix the bug\n</user_query>"}),
@@ -886,8 +885,14 @@ mod tests {
         let session = &sessions[0];
         assert_eq!(session.external_session_id, "agent-123");
         assert_eq!(session.title.as_deref(), Some("help me"));
-        assert_eq!(session.repo_path.as_deref(), Some(Path::new("/repo/project")));
-        assert_eq!(session.touched_files, vec!["/repo/project/src/lib.rs".to_string()]);
+        assert_eq!(
+            session.repo_path.as_deref(),
+            Some(Path::new("/repo/project"))
+        );
+        assert_eq!(
+            session.touched_files,
+            vec!["/repo/project/src/lib.rs".to_string()]
+        );
         assert_eq!(session.files_changed, Some(1));
         assert_eq!(session.parser_version, CURSOR_AGENT_PARSER_VERSION);
     }

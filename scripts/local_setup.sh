@@ -97,11 +97,70 @@ if [[ "$REGISTER_AGENTS" == 1 ]]; then
   say "Registering Brick MCP server with detected AI tools (global)"
   # Re-point every tool's MCP config at this binary. The default --target is
   # `all`, so this registers every detected tool. Idempotent; --force rewrites
-  # the managed block so a moved/renamed binary path is corrected.
+  # the managed block so a moved/renamed binary path is corrected. This step also
+  # installs the Brick Agent Skill (SKILL.md) into skill-capable clients
+  # (Claude Code, Codex, Cursor, Gemini, ORGII, and Windsurf) so the skill
+  # description routes "why/how did this happen" investigations to `brick
+  # explain` more reliably than the markdown block alone.
   if brick agent install --global --force; then
     ok "MCP registration refreshed"
   else
     printf '\033[1;33m  agent install reported an issue (often: a tool not installed) — safe to ignore\033[0m\n'
+  fi
+
+  # `--global` only touches per-user MCP configs; it does NOT write the
+  # per-project memory block that tells the agent WHEN to reach for `explain`.
+  # Without that block an agent never learns the workflow and silently falls back
+  # to grep/read_file. Each client reads a DIFFERENT file: Claude→CLAUDE.md,
+  # Codex→AGENTS.md, ORGII→<repo>/.orgii/agent-rules.md.
+  #
+  # BRICK_AGENT_REPOS is a space-separated list of repos. Each entry is either:
+  #   /path/to/repo            → install ALL detected clients' blocks (mixed repo)
+  #   /path/to/repo@orgii      → install ONLY that client (e.g. an ORGII workspace,
+  #                              so we don't pollute it with CLAUDE.md/AGENTS.md it
+  #                              never reads). @target is any `brick agent` target.
+  # We verify the EXACT target we installed reports `present` (not a blanket
+  # `--target all | grep present`, which goes green if any one client landed and
+  # would hide the very "ORGII file missing" failure this is meant to catch).
+  if [[ -n "${BRICK_AGENT_REPOS:-}" ]]; then
+    say "Installing the agent memory block into target repos"
+    # Space-separated only, so absolute paths containing ':' stay intact.
+    read -r -a _repos <<< "$BRICK_AGENT_REPOS"
+    for entry in "${_repos[@]}"; do
+      [[ -z "$entry" ]] && continue
+      _target="all"
+      repo="$entry"
+      if [[ "$entry" == *"@"* ]]; then
+        repo="${entry%@*}"
+        _target="${entry##*@}"
+      fi
+      if [[ ! -d "$repo" ]]; then
+        printf '\033[1;33m  skip (not a dir): %s\033[0m\n' "$repo"
+        continue
+      fi
+      # --force rolls a stale block forward to the current TEMPLATE_VERSION.
+      if (cd "$repo" && brick agent install --target "$_target" --force >/dev/null); then
+        # Verify the SAME target we just installed is actually present on disk —
+        # a silent "installed" with no readable file is exactly the failure that
+        # makes an agent never learn the workflow (it then falls back to grep).
+        if (cd "$repo" && brick agent status --target "$_target" 2>/dev/null | grep -q "present"); then
+          ok "memory block ($_target) installed + verified in $repo"
+        else
+          printf '\033[1;31m  installed but NOT verified present for target=%s in %s — agent will not see Brick\033[0m\n' "$_target" "$repo"
+        fi
+      else
+        printf '\033[1;33m  agent install failed for target=%s in %s — install it manually there\033[0m\n' "$_target" "$repo"
+      fi
+    done
+  else
+    printf '  \033[1;33mnote:\033[0m --global updated MCP configs only. To teach an agent the\n'
+    printf '        explain workflow, the per-project memory block must be installed IN that\n'
+    printf '        repo (each client reads a different file — ORGII uses .orgii/agent-rules.md).\n'
+    printf '        Run there:\n'
+    printf '          cd /path/to/your/repo && brick agent install --target orgii   # ORGII workspace\n'
+    printf '          cd /path/to/your/repo && brick agent install --target all     # mixed repo\n'
+    printf '        or re-run this script with BRICK_AGENT_REPOS set, e.g.:\n'
+    printf '          BRICK_AGENT_REPOS="%s@orgii" scripts/local_setup.sh\n' "$HOME/Projects/ORGII"
   fi
 else
   ok "skipped MCP registration (--no-agents)"
