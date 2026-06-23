@@ -154,12 +154,12 @@ pub fn source_sessions_to_steps(
             .rsplit('/')
             .next()
             .unwrap_or(row.file_path.as_str());
-        // A session-specific `what`: prefer the session's human title so two
-        // sessions that touched the same file read differently ("Cache git status
-        // — touched lib.rs" vs "Fix auth race — touched lib.rs"). Fall back to the
-        // old generic phrasing only when no title was indexed.
+        // `what` is the session's human title — the same string the user sees in
+        // their tool's history. The anchor file is already known from the query,
+        // so we don't append a redundant "— touched <file>" suffix. Fall back to a
+        // minimal phrasing only when no title was indexed.
         let what = match row.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            Some(title) => format!("{title} — touched {file_name}"),
+            Some(title) => title.to_string(),
             None => format!("touched {file_name} in {source} session"),
         };
         steps.push(CausalStep {
@@ -1174,8 +1174,8 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(
             steps[0].what.as_deref(),
-            Some("Cache git status lookups — touched types.ts"),
-            "a session with a title must get a title-based what"
+            Some("Cache git status lookups"),
+            "a session with a title must get the title verbatim as its what"
         );
     }
 
