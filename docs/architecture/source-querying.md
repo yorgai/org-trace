@@ -12,7 +12,7 @@ Terminology:
 - Native source storage remains the raw source of truth for external transcripts and app history.
 - Full transcript bytes are not copied into Brick unless the user explicitly requests evidence copy/upload.
 - Source-specific chunk providers should lazy-read native storage and return normalized history DTOs.
-- ORGII currently has mature source readers in `orgtrack-core`; Brick should absorb those provider implementations over time.
+- Brick now has its own native source providers for all supported platforms, with real metadata extraction, real lazy chunk loading (`format_chunks`), and incremental refresh shipped. ORGII's `orgtrack-core` readers remain a reference, but Brick is no longer waiting to absorb them.
 
 ## Shared export contract
 
@@ -113,7 +113,7 @@ Future formats should be added as formatting adapters over the same source metad
 | ORGII implementation | `orgtrack-core/src/sources/cursor_ide/db.rs`, `history.rs`, `io.rs`, `helpers.rs`, `models.rs`, `summaries.rs`. Tauri bridge: `src-tauri/src/orgtrack/history_commands.rs`. Frontend wrapper: `src/api/tauri/cursorIde/index.ts`. |
 | Current ORGII metadata store | `imported_history_session_cache` for session metadata and `cursor_ide_turn_summaries` for derived turn summaries. |
 | Brick target | Cursor source provider with metadata rows in `<BRICK_HOME>/metadata.sqlite`; lazy chunk provider reads Cursor DB on demand; turn summaries become a derived index keyed by source fingerprint. |
-| JSON export | `history sessions` returns session rows; `history chunks` supports first-pass full-session raw formatting from `composerData:{composerId}` and `bubbleId:{composerId}:{bubbleId}`. Cursor-specific chunk modes `initial-window`, `full-refresh`, and `turn-window` remain pending. |
+| JSON export | `history sessions` returns session rows; `history chunks` supports real full-session raw formatting from `composerData:{composerId}` and `bubbleId:{composerId}:{bubbleId}`. Cursor-specific chunk modes `initial-window`, `full-refresh`, and `turn-window` remain pending. |
 
 ### Cursor session metadata fields observed
 
@@ -298,7 +298,7 @@ First slice implemented in Brick:
 | ORGII implementation | `orgtrack-core/src/sources/opencode/history.rs`. |
 | Current ORGII metadata store | `imported_history_session_cache`. |
 | Brick target | DB-backed OpenCode provider with per-session metadata rows and lazy DB chunk loading. |
-| JSON export | Sessions, recent paths, and first-pass full chunks. Chunk source pointers include DB path plus message and part IDs when exposed by the schema. |
+| JSON export | Sessions, recent paths, and real full chunks. Chunk source pointers include DB path plus message and part IDs when exposed by the schema. |
 
 ### OpenCode metadata fields
 
@@ -388,6 +388,19 @@ First slice implemented in Brick:
 | Brick treatment | Do not make Brick scrape ORGII runtime state by default. ORGII should explicitly emit Brick provenance events or export evidence when needed. |
 | JSON export | Brick can ingest ORGII-origin events, but ORGII remains runtime owner. |
 
+## Incremental refresh model (shipped)
+
+Brick auto-refreshes the anchor repo's sources on every `explain`/`link` call, but the refresh is both throttled and incremental, so it stays near-real-time without a manual CLI refresh.
+
+- **Watermark table.** `source_index_watermark(source_id, last_indexed_updated_at, last_refreshed_at)` lives in `metadata.sqlite` (schema version 6) and tracks each source's high-water mark.
+- **Incremental entry point.** `list_source_sessions_since(profile, limit, since)` is the incremental scan path; `since` is the source's last indexed updated-at.
+- **Three filter strategies:**
+  - File-mtime gate (JSONL/JSON file providers — `claude_code`, `codex_app`, `gemini`): the native file walker (`native_source.rs`) skips parsing any session file whose mtime is at or below the watermark. This is what eliminates the big-history full re-scan cost (codex went from 1413 parsed session files to ~1 on incremental runs).
+  - SQL / column push-down (ORGII and OpenCode): `updated_at >= since` filters at the query / parsed-column level (`time_updated` for OpenCode).
+  - KV-blob post-filter (cursor-family — `cursor_ide`, `windsurf`): `filter_sessions_since` shrinks the downstream upsert set after parsing, because the session's updated time lives inside a SQLite KV JSON blob that must be parsed anyway.
+- **Persistent cross-process throttle.** Auto-refresh is keyed on `source_index_watermark.last_refreshed_at` with a 10s window, so back-to-back `explain`/`link` calls across separate CLI processes stay cheap. (The earlier in-process `OnceLock` throttle never fired for the CLI, where each invocation is a fresh process.)
+- **Measured effect.** A throttle-expired `explain` over a multi-GB ORGII plus ~1400-file codex history dropped from ~30s (full re-scan of every source) to ~0.5s once the watermark is populated.
+
 ## Provider fixture validation
 
 Provider parity tests use sanitized fixture scenarios under `crates/core/tests/fixtures/external_sources`. The fixture tree is intentionally text-first so Brick can validate real-ish source schemas without committing private native history or large binary databases.
@@ -419,12 +432,14 @@ The current committed example is `claude_code/basic_session`, a tiny JSONL trans
 
 | Source | Brick today | ORGII today | Target |
 | --- | --- | --- | --- |
-| Cursor IDE | Metadata provider reads `composer.composerHeaders.allComposers`; raw chunk formatter reads composer/bubble KV rows and dereferences `composer.content.{hash}`-style blobs; plan registry refresh persists `source_plans` and typed plan-session edges. Windowing remains pending. | Mature metadata scan, DB parsing, lazy chunks, window APIs, turn summaries. | Add window modes and richer plan/task export next. |
-| Claude Code | Generic file listing and metadata index upsert. | Mature JSONL metadata scan, impact stats, lazy chunks. | Port first. |
-| Codex App | Generic file listing and metadata index upsert. | Mature JSONL metadata scan, impact stats, lazy chunks. | Port first. |
-| OpenCode | DB metadata provider registered as `opencode`; reads `session` metadata, aggregates token columns from `session` or `part`, filters archived sessions, and provides first-pass lazy chunks from `message` + `part`. | DB metadata scan and lazy chunks. | Add source pointer metadata and validate against more real-world schema variants. |
-| Windsurf | First provider reads `composerData:%` rows from `cursorDiskKV`, extracts core metadata/context tokens/impact fields, and shares Cursor-family full-session raw chunk formatting for composer/bubble rows, including shared content-blob resolution. | Cursor-family DB metadata scan and lazy chunks. | Validate content ID/blob patterns against real Windsurf fixtures and add native path discovery defaults next. |
-| ORGII runtime | Not a native external source. | ORGII owns runtime. | ORGII emits/exports to Brick explicitly. |
+| Cursor IDE | Metadata provider reads `composer.composerHeaders.allComposers`; real chunk formatter reads composer/bubble KV rows and dereferences `composer.content.{hash}`-style blobs; plan registry refresh persists `source_plans` and typed plan-session edges; incremental refresh wired via KV-blob post-filter (`filter_sessions_since`). Cursor windowing modes (initial-window/full-refresh/turn-window) remain pending. | Mature metadata scan, DB parsing, lazy chunks, window APIs, turn summaries. | Add Cursor window modes and richer plan/task export next. |
+| Claude Code | Full JSONL metadata extraction, impact stats (`touched_files`), real lazy chunk loading (`format_chunks`), and incremental refresh via a file-mtime watermark gate. | Mature JSONL metadata scan, impact stats, lazy chunks. | At parity; harden fixtures and edge cases. |
+| Codex App | Full JSONL parsing, impact stats, real lazy chunks (`format_chunks`), and mtime-gated incremental refresh. This was the big-history case: incremental runs dropped from ~1413 parsed session files to ~1 once the watermark is populated. | Mature JSONL metadata scan, impact stats, lazy chunks. | At parity; harden fixtures and edge cases. |
+| OpenCode | DB metadata provider registered as `opencode`; reads `session` metadata, aggregates token columns from `session` or `part`, filters archived sessions, provides real lazy chunks from `message` + `part`, and supports incremental refresh via a parsed `time_updated` column filter. | DB metadata scan and lazy chunks. | Add source pointer metadata and validate against more real-world schema variants. |
+| Windsurf | Reads `composerData:%` rows from `cursorDiskKV`, extracts core metadata/context tokens/impact fields, shares Cursor-family real chunk formatting for composer/bubble rows (including shared content-blob resolution), and supports incremental refresh via the KV-blob post-filter (`filter_sessions_since`). | Cursor-family DB metadata scan and lazy chunks. | Validate content ID/blob patterns against real Windsurf fixtures and add native path discovery defaults next. |
+| Gemini | `format_chunks` implemented: renders user/gemini messages plus `toolCalls` from the chat JSON; mtime-gated incremental refresh shared with the other native file walkers. | n/a | Document full field reference alongside the other providers. |
+| ORGII source | Full ORGII provider reads `agent_sessions` + `events`; real chunks strip the literal `assistant ` prefix from assistant content; incremental refresh uses SQL `updated_at >= since` push-down. | ORGII owns runtime. | Keep in sync with ORGII session/event schema. |
+| ORGII runtime | Not a native external scrape target. | ORGII owns runtime. | ORGII emits/exports to Brick explicitly. |
 
 ## Brick treatment rules
 
@@ -434,4 +449,4 @@ The current committed example is `claude_code/basic_session`, a tiny JSONL trans
 - Source providers should never silently swallow parser errors for an explicitly requested source/session.
 - Full transcript bytes should remain in native storage by default.
 - Optional evidence copy should go through content-addressed blobs and provenance events, not through the source metadata index.
-- Source profile and scan state should move into `metadata.sqlite` over time, but repo-local TOML profiles can remain as bootstrap/config during migration.
+- Source profile and scan state should move into `metadata.sqlite` over time, but repo-local TOML profiles can remain as bootstrap/config during migration. Incremental-refresh watermark/scan state already lives in `metadata.sqlite` via the `source_index_watermark` table (see "Incremental refresh model").

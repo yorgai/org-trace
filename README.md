@@ -36,6 +36,15 @@ timeline up as causality.
   Brick is installed; for code with no record, `explain` says so honestly and you
   fall back to git. The more changes flow through Brick, the denser the graph.
 
+Even before any explicit `link` edge exists, `explain` is not empty: it
+synthesizes a causal chain from the **indexed source sessions** — the real
+Cursor / Claude Code / Codex / Gemini / OpenCode / ORGII history Brick already
+reads. For a whole-file anchor it merges those indexed sessions with any runtime
+causal edges (deduped by session, ordered by time); each step recovers the
+session's *reason* from its turn-final assistant message and a session-specific
+`what` ("&lt;session title&gt; — touched &lt;file&gt;"). Explicit `link` edges then
+sharpen this from a time-ordered `inferred` guess into real cause→effect.
+
 **Commercial boundary:** local `explain` is fully free and open — WHO, WHY, the
 causal walk, and live awareness all run locally with no login. Setting a wall on
 a local open feature is unenforceable anyway (it can be recompiled). The
@@ -260,7 +269,7 @@ Source-specific paths can be configured per repo under `<BRICK_HOME>/repos/<repo
 
 `index.json`, `brick.sqlite`, and `views/` are derived indexes under the effective store. Rebuilding them never mutates the source event log. `views/` contains agent-readable Markdown files for orgs, projects, missions, sessions, and artifacts. Pull writes remote events to separate inbound logs and deduplicates them by event ID when rebuilding indexes.
 
-Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `explain` and `link` refresh the index for the anchor's repo on every call (throttled), so an agent always reads a near-real-time view without ever running a CLI command.
+Global source-history metadata lives under `<BRICK_HOME>/metadata.sqlite` (`~/.brick/metadata.sqlite` by default). This file is the source metadata index, not a second cache layer or transcript copy. `explain` and `link` refresh the index for the anchor's repo on every call, so an agent always reads a near-real-time view without ever running a CLI command. That refresh is **incremental and throttled** so it stays cheap even on multi-gigabyte histories: a per-source watermark (`source_index_watermark`) records the high-water update time already indexed and the last refresh moment. Only sessions newer than the watermark are re-scanned — file-backed sources (Claude Code, Codex, Gemini) skip unchanged transcripts by mtime before parsing, SQLite sources (ORGII, OpenCode) push the bound into the query, and the Cursor family post-filters. The last-refresh timestamp also persists across processes, so back-to-back agent calls do not re-scan within the throttle window.
 
 ## Documentation
 

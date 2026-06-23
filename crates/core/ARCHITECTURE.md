@@ -29,7 +29,10 @@ Rules (enforced by convention, stated in each module header):
   query cache projected from the index.
 - Two *additional* SQLite DBs have different truth semantics:
   - `metadata.sqlite` — a **rebuildable cache** of external-tool ("source")
-    sessions. A schema bump triggers a full reset.
+    sessions. A schema bump triggers a full reset (currently schema v6). It also
+    holds `source_index_watermark`, the per-source incremental-refresh high-water
+    mark (`last_indexed_updated_at`) plus the persistent, cross-process
+    auto-refresh throttle timestamp (`last_refreshed_at`).
 
 ### Index loading
 

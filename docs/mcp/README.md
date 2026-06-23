@@ -101,6 +101,20 @@ Output (abridged):
      record with `stop_reason` set). Only an open turn counts as live.
 - When the anchor has no causal record, `resolved_events` is empty, `causal_chain`
   is empty (never guessed), and a `note` says so — fall back to git there.
+- The `causal_chain` is **not limited to explicit `link` edges**. For a whole-file
+  anchor, `explain` merges any runtime causal edges with the **indexed source
+  sessions** — the real Cursor / Claude Code / Codex / Gemini / OpenCode / ORGII
+  history Brick already reads — deduped by session and ordered by time. Each
+  source-session step recovers its `note` (WHY) from the session's turn-final
+  assistant message and a session-specific `what` ("&lt;session title&gt; — touched
+  &lt;file&gt;"). So `explain` is useful immediately, before any `link` has been
+  recorded; explicit edges then upgrade steps from `inferred`/`observed` toward
+  `explicit`. (File:line anchors resolve through blame to the specific change
+  events and do not fold in file-level source sessions.)
+- This indexed view is refreshed automatically per call — incrementally (only
+  sessions newer than a per-source watermark are re-scanned) and throttled across
+  processes — so it stays near-real-time on large histories without a manual
+  `brick history refresh`.
 
 `explain` subsumes line-level **blame** (WHO) into the WHY answer.
 
@@ -126,6 +140,13 @@ reasoning with `explain`. Two forms:
   `responds_to`, `rationale` (defaults to `derived_from` with a cause, else
   `rationale`).
 - **Invariant:** at least one of `cause` or `note` must be present.
+- **Effect resolution:** when `effect` is a file path the agent just edited with
+  its own tools (no Brick event yet), `link` binds the rationale to the current
+  uncommitted changes in that file's repo. If the file has no Brick event **and**
+  there are no uncommitted changes to capture, `link` fails with that message —
+  it has nowhere to anchor. Fixes: omit `effect` for a standalone `note`, run
+  `link` while the change is still uncommitted, or point `effect` at an anchor
+  Brick already has an event for.
 
 Edges recorded via `link` carry `confidence: explicit`.
 
