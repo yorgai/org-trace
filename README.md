@@ -1,4 +1,4 @@
-# Brick
+# Brick (WIP - do not fork / install)
 
 Brick is the **causal memory of a codebase**: a self-host-first provenance layer
 that answers *why* code looks the way it does, across every AI tool that touched
