@@ -7,13 +7,15 @@
 # AI tool so your editor/agent picks up the new binary.
 #
 # Usage:
-#   scripts/local_setup.sh              # build + install + register MCP (default)
+#   scripts/local_setup.sh              # build + install + register MCP + optional share login
 #   scripts/local_setup.sh --no-agents  # build + install only, skip MCP registration
+#   scripts/local_setup.sh --no-login   # skip the optional Supabase sharing prompt
 #   scripts/local_setup.sh --debug      # faster debug build via symlink (no cargo install)
 #   scripts/local_setup.sh --check      # just report installed vs source, do nothing
 #
 # Env:
 #   BRICK_INSTALL_BIN   override the install dir (default: cargo's bin dir)
+#   BRICK_NO_LOGIN=1    skip the optional Supabase sharing prompt
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,14 +24,16 @@ cd "$ROOT_DIR"
 REGISTER_AGENTS=1
 MODE="release"
 CHECK_ONLY=0
+PROMPT_LOGIN=1
 
 for arg in "$@"; do
   case "$arg" in
     --no-agents) REGISTER_AGENTS=0 ;;
+    --no-login)  PROMPT_LOGIN=0 ;;
     --debug)     MODE="debug" ;;
     --check)     CHECK_ONLY=1 ;;
     -h|--help)
-      sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -67,7 +71,7 @@ fi
 if [[ "$MODE" == "debug" ]]; then
   # Fast path for iterating: debug build + symlink, no full release `cargo install`.
   say "Building brick (debug)"
-  cargo build -p brick
+  cargo build -p brick --features sync
   BIN_SRC="$ROOT_DIR/target/debug/brick"
   DEST_DIR="${BRICK_INSTALL_BIN:-$HOME/.cargo/bin}"
   mkdir -p "$DEST_DIR"
@@ -76,9 +80,9 @@ if [[ "$MODE" == "debug" ]]; then
 else
   say "Building + installing brick (release)"
   if [[ -n "${BRICK_INSTALL_BIN:-}" ]]; then
-    cargo install --path crates/cli --force --root "$(dirname "$BRICK_INSTALL_BIN")"
+    cargo install --path crates/cli --features sync --force --root "$(dirname "$BRICK_INSTALL_BIN")"
   else
-    cargo install --path crates/cli --force
+    cargo install --path crates/cli --features sync --force
   fi
   ok "installed to cargo bin dir"
 fi
@@ -108,23 +112,12 @@ if [[ "$REGISTER_AGENTS" == 1 ]]; then
     printf '\033[1;33m  agent install reported an issue (often: a tool not installed) — safe to ignore\033[0m\n'
   fi
 
-  # `--global` only touches per-user MCP configs; it does NOT write the
-  # per-project memory block that tells the agent WHEN to reach for `explain`.
-  # Without that block an agent never learns the workflow and silently falls back
-  # to grep/read_file. Each client reads a DIFFERENT file: Claude→CLAUDE.md,
-  # Codex→AGENTS.md, ORGII→<repo>/.orgii/agent-rules.md.
-  #
-  # BRICK_AGENT_REPOS is a space-separated list of repos. Each entry is either:
-  #   /path/to/repo            → install ALL detected clients' blocks (mixed repo)
-  #   /path/to/repo@orgii      → install ONLY that client (e.g. an ORGII workspace,
-  #                              so we don't pollute it with CLAUDE.md/AGENTS.md it
-  #                              never reads). @target is any `brick agent` target.
-  # We verify the EXACT target we installed reports `present` (not a blanket
-  # `--target all | grep present`, which goes green if any one client landed and
-  # would hide the very "ORGII file missing" failure this is meant to catch).
+  # The global MCP + Skill install is the normal path: one install makes Brick
+  # available across repos for skill-capable clients. Per-repo memory blocks are
+  # optional overrides for clients/workspaces that explicitly read a project file.
+  # BRICK_AGENT_REPOS is kept for that advanced case only.
   if [[ -n "${BRICK_AGENT_REPOS:-}" ]]; then
-    say "Installing the agent memory block into target repos"
-    # Space-separated only, so absolute paths containing ':' stay intact.
+    say "Installing optional per-repo agent memory blocks"
     read -r -a _repos <<< "$BRICK_AGENT_REPOS"
     for entry in "${_repos[@]}"; do
       [[ -z "$entry" ]] && continue
@@ -138,32 +131,57 @@ if [[ "$REGISTER_AGENTS" == 1 ]]; then
         printf '\033[1;33m  skip (not a dir): %s\033[0m\n' "$repo"
         continue
       fi
-      # --force rolls a stale block forward to the current TEMPLATE_VERSION.
       if (cd "$repo" && brick agent install --target "$_target" --force >/dev/null); then
-        # Verify the SAME target we just installed is actually present on disk —
-        # a silent "installed" with no readable file is exactly the failure that
-        # makes an agent never learn the workflow (it then falls back to grep).
         if (cd "$repo" && brick agent status --target "$_target" 2>/dev/null | grep -q "present"); then
-          ok "memory block ($_target) installed + verified in $repo"
+          ok "optional memory block ($_target) installed + verified in $repo"
         else
-          printf '\033[1;31m  installed but NOT verified present for target=%s in %s — agent will not see Brick\033[0m\n' "$_target" "$repo"
+          printf '\033[1;31m  installed but NOT verified present for target=%s in %s\033[0m\n' "$_target" "$repo"
         fi
       else
-        printf '\033[1;33m  agent install failed for target=%s in %s — install it manually there\033[0m\n' "$_target" "$repo"
+        printf '\033[1;33m  optional agent install failed for target=%s in %s\033[0m\n' "$_target" "$repo"
       fi
     done
   else
-    printf '  \033[1;33mnote:\033[0m --global updated MCP configs only. To teach an agent the\n'
-    printf '        explain workflow, the per-project memory block must be installed IN that\n'
-    printf '        repo (each client reads a different file — ORGII uses .orgii/agent-rules.md).\n'
-    printf '        Run there:\n'
-    printf '          cd /path/to/your/repo && brick agent install --target orgii   # ORGII workspace\n'
-    printf '          cd /path/to/your/repo && brick agent install --target all     # mixed repo\n'
-    printf '        or re-run this script with BRICK_AGENT_REPOS set, e.g.:\n'
-    printf '          BRICK_AGENT_REPOS="%s@orgii" scripts/local_setup.sh\n' "$HOME/Projects/ORGII"
+    ok "global MCP + Skill install is ready across repos"
+    printf '  Optional: set BRICK_AGENT_REPOS if you also want project-local memory blocks.\n'
   fi
 else
   ok "skipped MCP registration (--no-agents)"
+fi
+
+if [[ "$PROMPT_LOGIN" == 1 && "${BRICK_NO_LOGIN:-0}" != "1" ]]; then
+  say "Optional Supabase sharing login"
+  if brick sync whoami 2>/dev/null | grep -q '^logged_in=true'; then
+    ok "already logged in; sharing sync is enabled"
+  elif [[ -t 0 ]]; then
+    printf '  Brick works local-only without an account. Log in now to enable sharing sync? [y/N] '
+    read -r answer
+    case "$answer" in
+      y|Y|yes|YES)
+        printf '  Email: '
+        read -r email
+        if [[ -n "$email" ]]; then
+          brick setup --agents false --email "$email"
+          printf '  Code: '
+          read -r code
+          if [[ -n "$code" ]]; then
+            brick setup --agents false --email "$email" --code "$code"
+            ok "sharing sync enabled"
+          else
+            printf '  \033[1;33msharing login pending; finish later with:\033[0m\n'
+            printf '    brick setup --email %s --code <code>\n' "$email"
+          fi
+        fi
+        ;;
+      *)
+        ok "staying local-only; run 'brick setup --email <you@example.com>' later to enable sharing"
+        ;;
+    esac
+  else
+    ok "non-interactive shell; run 'brick setup --email <you@example.com>' later to enable sharing"
+  fi
+else
+  ok "skipped optional Supabase sharing login"
 fi
 
 say "Done"
