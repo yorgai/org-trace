@@ -66,6 +66,7 @@ fn auto_push(store: &LocalStore) -> Result<()> {
     if events.is_empty() {
         return Ok(());
     }
+    let events = hydrate_source_session_chunks(events)?;
     let identity = identity::refresh_if_needed()?;
     let remote = auto_sync_remote();
     let repo_id = repo_id_for_root(store.repo_root());
@@ -133,6 +134,7 @@ pub fn handle_push(
     let identity = identity::refresh_if_needed()
         .context("upload requires a Brick account. Run `brick login` first")?;
 
+    let events = hydrate_source_session_chunks(events)?;
     let request = PushEventsRequest {
         events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
     };
@@ -333,6 +335,65 @@ fn ingest_pulled_source_sessions(mut events: Vec<TraceEvent>) -> Result<Vec<Trac
     let mut metadata_db = MetadataDb::open_global()?;
     ingest_source_sessions_into_metadata(&mut metadata_db, &mut events)?;
     Ok(events)
+}
+
+/// Refills `normalized_chunks` on outbound `source.session_observed` events from
+/// the local metadata index before upload.
+///
+/// Canonical events in the JSONL queue deliberately carry no chunks — the
+/// session-content snapshot is a derivative of the provider's own log, indexed
+/// into `metadata.sqlite`, not part of the append-only causal record. Push is
+/// the one place that needs the chunks inline (so the remote can split them into
+/// `brick_event_chunks`), so we hydrate them here keyed by
+/// `(source_id, external_session_id)`. Best-effort: a session whose chunks are no
+/// longer indexed simply uploads without them.
+fn hydrate_source_session_chunks(events: Vec<TraceEvent>) -> Result<Vec<TraceEvent>> {
+    if !events
+        .iter()
+        .any(|event| event.event_type == brick_protocol::EventType::SourceSessionObserved)
+    {
+        return Ok(events);
+    }
+    let metadata_db = MetadataDb::open_global()?;
+    hydrate_source_session_chunks_with(&metadata_db, events)
+}
+
+fn hydrate_source_session_chunks_with(
+    metadata_db: &MetadataDb,
+    events: Vec<TraceEvent>,
+) -> Result<Vec<TraceEvent>> {
+    events
+        .into_iter()
+        .map(|mut event| {
+            if event.event_type != brick_protocol::EventType::SourceSessionObserved {
+                return Ok(event);
+            }
+            let source_id = event
+                .payload
+                .get("source_id")
+                .and_then(serde_json::Value::as_str);
+            let external_session_id = event
+                .payload
+                .get("external_session_id")
+                .and_then(serde_json::Value::as_str);
+            let (Some(source_id), Some(external_session_id)) = (source_id, external_session_id)
+            else {
+                return Ok(event);
+            };
+            let chunks: Vec<serde_json::Value> = metadata_db
+                .list_source_session_chunks(source_id, external_session_id)?
+                .into_iter()
+                .map(|row| row.raw_json)
+                .collect();
+            if let Some(payload) = event.payload.as_object_mut() {
+                payload.insert(
+                    "normalized_chunks".to_string(),
+                    serde_json::Value::Array(chunks),
+                );
+            }
+            Ok(event)
+        })
+        .collect()
 }
 
 fn ingest_source_sessions_into_metadata(
@@ -591,6 +652,52 @@ mod tests {
             chunks[0].result_json,
             serde_json::json!({"content": "done"})
         );
+    }
+
+    #[test]
+    fn push_hydrates_normalized_chunks_from_metadata() {
+        let path = temp_repo_root("push-hydrate").join("metadata.sqlite");
+        let mut metadata_db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let payload = source_session_payload();
+        metadata_db
+            .upsert_source_session(&source_session_upsert_from_payload(&payload).expect("upsert"))
+            .expect("upsert session");
+        let chunks: Vec<ActivityChunk> = payload
+            .normalized_chunks
+            .iter()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<serde_json::Result<Vec<_>>>()
+            .expect("decode chunks");
+        metadata_db
+            .upsert_source_session_chunks(&SourceSessionChunksUpsert {
+                source_id: payload.source_id.clone(),
+                external_session_id: payload.external_session_id.clone(),
+                chunks,
+            })
+            .expect("upsert chunks");
+
+        // Canonical event as stored in the local JSONL queue: no chunks inline.
+        let mut stripped = payload.clone();
+        stripped.normalized_chunks = Vec::new();
+        let event = TraceEvent::source_session_observed(
+            ActorRef {
+                actor_type: ActorType::Agent,
+                actor_id: "codex".to_string(),
+                display_name: None,
+            },
+            stripped,
+        )
+        .expect("build event");
+
+        let hydrated =
+            hydrate_source_session_chunks_with(&metadata_db, vec![event]).expect("hydrate chunks");
+
+        let normalized = hydrated[0].payload["normalized_chunks"]
+            .as_array()
+            .expect("normalized chunks present after hydrate");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0]["result"]["content"], "done");
     }
 
     fn source_session_payload() -> SourceSessionObservedPayload {
