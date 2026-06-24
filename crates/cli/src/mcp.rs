@@ -1352,30 +1352,17 @@ fn enrich_transcripts(
 
 /// Builds a ready-to-run command that dumps one session's FULL trajectory, so an
 /// agent can deep-dive past the turn-final `note` (a closing summary, often not
-/// the root cause) into the original session end-to-end.
-///
-/// SQLite-backed sources (ORGII, Cursor) keep many sessions in one `.db`, so the
-/// command is a `sqlite3` query scoped to this `session_id`. File-backed sources
-/// (Claude/Codex/Gemini) keep one transcript per file, so it's a plain file read.
-fn read_session_command(source: &str, session_ref: &str, session_id: &str) -> String {
-    let is_sqlite = session_ref.ends_with(".db")
-        || session_ref.ends_with(".vscdb")
-        || session_ref.ends_with(".sqlite");
-    if !is_sqlite {
-        // File-backed: the ref IS the transcript; read it directly.
-        return format!("read_file {session_ref}");
-    }
-    match source {
-        // ORGII: one row per message/tool-call in `events`, keyed by session_id.
-        "orgii" => format!(
-            "sqlite3 \"{session_ref}\" \"SELECT created_at, function_name, \
-substr(content,1,4000) FROM events WHERE session_id='{session_id}' ORDER BY \
-created_at;\""
+/// the root cause) into the normalized fused transcript stored in Brick's metadata DB.
+fn read_session_command(source: &str, _session_ref: &str, session_id: &str) -> String {
+    match brick_core::metadata_db_path() {
+        Ok(path) => format!(
+            "sqlite3 -json \"{}\" \"SELECT c.chunk_index, c.created_at, c.action_type, c.function, c.raw_json FROM source_session_chunks c JOIN source_sessions s ON s.source_session_id=c.source_session_id WHERE s.source_id='{}' AND s.external_session_id='{}' ORDER BY c.chunk_index;\"",
+            path.display(),
+            source.replace('\'', "''"),
+            session_id.replace('\'', "''")
         ),
-        // Cursor and other db sources: surface the db + id so the agent can probe
-        // the source's own schema (Cursor's layout differs by version).
-        _ => format!(
-            "# inspect session {session_id} in the source db:\nsqlite3 \"{session_ref}\" \".tables\""
+        Err(_) => format!(
+            "# fused metadata DB unavailable; session source={source} external_session_id={session_id}"
         ),
     }
 }

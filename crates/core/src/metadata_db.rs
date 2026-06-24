@@ -94,6 +94,36 @@ pub struct SourceSessionRecord {
     pub metadata_json: Option<Value>,
 }
 
+/// One normalized activity chunk stored in the fused provenance DB.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSessionChunkRecord {
+    pub source_id: String,
+    pub external_session_id: String,
+    pub chunk_id: String,
+    pub chunk_index: i64,
+    pub action_type: String,
+    pub function: String,
+    pub args_json: Value,
+    pub result_json: Value,
+    pub created_at: String,
+    pub thread_id: Option<String>,
+    pub process_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_record_key: Option<String>,
+    pub source_line_number: Option<u64>,
+    pub source_message_id: Option<String>,
+    pub source_part_id: Option<String>,
+    pub raw_json: Value,
+}
+
+/// Input for replacing the fused chunks for one source session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSessionChunksUpsert {
+    pub source_id: String,
+    pub external_session_id: String,
+    pub chunks: Vec<crate::ActivityChunk>,
+}
+
 /// Optional filters for listing source-session rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceSessionListQuery {
@@ -297,6 +327,105 @@ impl MetadataDb {
             .commit()
             .context("failed to commit metadata source-session upsert")?;
         record.context("metadata source-session row missing after upsert")
+    }
+
+    pub fn upsert_source_session_chunks(
+        &mut self,
+        upsert: &SourceSessionChunksUpsert,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .context("failed to start metadata source-session chunks upsert")?;
+        let source_session_id =
+            read_source_session_id(&transaction, &upsert.source_id, &upsert.external_session_id)?
+                .context("metadata source-session row missing for chunks upsert")?;
+        transaction.execute(
+            "DELETE FROM source_session_chunks WHERE source_session_id = ?1",
+            params![source_session_id],
+        )?;
+        for (index, chunk) in upsert.chunks.iter().enumerate() {
+            let raw_json =
+                serde_json::to_value(chunk).context("failed to encode activity chunk")?;
+            let args_json = serialize_metadata_json(Some(&chunk.args))?;
+            let result_json = serialize_metadata_json(Some(&chunk.result))?;
+            let raw_json = serialize_metadata_json(Some(&raw_json))?;
+            transaction.execute(
+                "INSERT INTO source_session_chunks (
+                    source_session_id, chunk_id, chunk_index, action_type, function,
+                    args_json, result_json, created_at, thread_id, process_id, source_path,
+                    source_record_key, source_line_number, source_message_id, source_part_id, raw_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    source_session_id,
+                    chunk.chunk_id,
+                    i64::try_from(index).context("source session chunk index exceeds i64")?,
+                    chunk.action_type,
+                    chunk.function,
+                    args_json,
+                    result_json,
+                    chunk.created_at,
+                    chunk.thread_id,
+                    chunk.process_id,
+                    chunk.source_path,
+                    chunk.source_record_key,
+                    optional_u64_to_i64(chunk.source_line_number)?,
+                    chunk.source_message_id,
+                    chunk.source_part_id,
+                    raw_json,
+                ],
+            )?;
+        }
+        transaction
+            .commit()
+            .context("failed to commit metadata source-session chunks upsert")?;
+        Ok(())
+    }
+
+    pub fn list_source_session_chunks(
+        &self,
+        source_id: &str,
+        external_session_id: &str,
+    ) -> Result<Vec<SourceSessionChunkRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.source_id, s.external_session_id, c.chunk_id, c.chunk_index,
+                    c.action_type, c.function, c.args_json, c.result_json, c.created_at,
+                    c.thread_id, c.process_id, c.source_path, c.source_record_key,
+                    c.source_line_number, c.source_message_id, c.source_part_id, c.raw_json
+             FROM source_session_chunks c
+             JOIN source_sessions s ON s.source_session_id = c.source_session_id
+             WHERE s.source_id = ?1 AND s.external_session_id = ?2
+             ORDER BY c.chunk_index ASC, c.created_at ASC, c.chunk_id ASC",
+        )?;
+        let rows = statement.query_map(params![source_id, external_session_id], |row| {
+            Ok(SourceSessionChunkRecord {
+                source_id: row.get(0)?,
+                external_session_id: row.get(1)?,
+                chunk_id: row.get(2)?,
+                chunk_index: row.get(3)?,
+                action_type: row.get(4)?,
+                function: row.get(5)?,
+                args_json: parse_metadata_json(row.get::<_, Option<String>>(6)?)?
+                    .unwrap_or(json!({})),
+                result_json: parse_metadata_json(row.get::<_, Option<String>>(7)?)?
+                    .unwrap_or(json!({})),
+                created_at: row.get(8)?,
+                thread_id: row.get(9)?,
+                process_id: row.get(10)?,
+                source_path: row.get(11)?,
+                source_record_key: row.get(12)?,
+                source_line_number: optional_i64_to_u64(row.get(13)?)?,
+                source_message_id: row.get(14)?,
+                source_part_id: row.get(15)?,
+                raw_json: parse_metadata_json(row.get::<_, Option<String>>(16)?)?
+                    .unwrap_or(json!({})),
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.context("failed to read metadata source-session chunk row")?);
+        }
+        Ok(records)
     }
 
     /// Lists source-session rows in deterministic most-recent-first order.
@@ -1180,7 +1309,28 @@ fn create_schema(connection: &Connection) -> Result<()> {
              metadata_json TEXT,
              UNIQUE(source_id, external_session_id)
          );
-         CREATE TABLE IF NOT EXISTS source_plans (
+         CREATE TABLE IF NOT EXISTS source_session_chunks (
+            source_session_chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_session_id INTEGER NOT NULL,
+            chunk_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            function TEXT NOT NULL,
+            args_json TEXT,
+            result_json TEXT,
+            created_at TEXT NOT NULL,
+            thread_id TEXT,
+            process_id TEXT,
+            source_path TEXT,
+            source_record_key TEXT,
+            source_line_number INTEGER,
+            source_message_id TEXT,
+            source_part_id TEXT,
+            raw_json TEXT NOT NULL,
+            UNIQUE(source_session_id, chunk_id),
+            FOREIGN KEY(source_session_id) REFERENCES source_sessions(source_session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS source_plans (
              source_plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
              source_id TEXT NOT NULL,
              external_plan_id TEXT NOT NULL,
@@ -1262,11 +1412,14 @@ fn create_schema(connection: &Connection) -> Result<()> {
              last_indexed_updated_at TEXT,
              last_refreshed_at TEXT NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_source_sessions_source ON source_sessions(source_id, last_seen_at);
-         CREATE INDEX IF NOT EXISTS idx_source_sessions_path ON source_sessions(source_path);
-         CREATE INDEX IF NOT EXISTS idx_source_sessions_repo_path ON source_sessions(source_id, repo_path);
-         CREATE INDEX IF NOT EXISTS idx_source_sessions_fingerprint ON source_sessions(source_fingerprint);
-         CREATE INDEX IF NOT EXISTS idx_source_plans_source ON source_plans(source_id, last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_source_sessions_source ON source_sessions(source_id, last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_source_sessions_path ON source_sessions(source_path);
+        CREATE INDEX IF NOT EXISTS idx_source_sessions_repo_path ON source_sessions(source_id, repo_path);
+        CREATE INDEX IF NOT EXISTS idx_source_sessions_fingerprint ON source_sessions(source_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_source_session_chunks_session ON source_session_chunks(source_session_id, chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_source_session_chunks_text ON source_session_chunks(action_type, function, created_at);
+        CREATE INDEX IF NOT EXISTS idx_source_plans_source ON source_plans(source_id, last_seen_at);
+
          CREATE INDEX IF NOT EXISTS idx_source_plans_path ON source_plans(source_path);
          CREATE INDEX IF NOT EXISTS idx_source_plan_edges_session ON source_plan_session_edges(external_session_id, role);", 
     )?;
@@ -1498,6 +1651,21 @@ fn read_source_session(
         )
         .optional()
         .context("failed to read metadata source-session row")
+}
+
+fn read_source_session_id(
+    connection: &Connection,
+    source_id: &str,
+    external_session_id: &str,
+) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT source_session_id FROM source_sessions WHERE source_id = ?1 AND external_session_id = ?2",
+            params![source_id, external_session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read metadata source-session id")
 }
 
 fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> FileSessionBlameRow {
@@ -1945,6 +2113,39 @@ mod tests {
                 .expect("count source sessions"),
             1
         );
+    }
+
+    #[test]
+    fn upserts_and_lists_source_session_chunks() {
+        let path = temp_home("chunks").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Chunked", 0))
+            .expect("insert source session");
+        let mut chunk = crate::ActivityChunk::new(
+            TEST_EXTERNAL_SESSION_ID,
+            crate::ACTION_TYPE_ASSISTANT,
+            crate::FUNCTION_ASSISTANT,
+        );
+        chunk.chunk_id = "chunk-1".to_string();
+        chunk.created_at = "2026-06-18T01:02:03Z".to_string();
+        chunk.result = json!({"content": "normalized hello"});
+
+        db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+            source_id: TEST_SOURCE_ID.to_string(),
+            external_session_id: TEST_EXTERNAL_SESSION_ID.to_string(),
+            chunks: vec![chunk.clone()],
+        })
+        .expect("upsert chunks");
+
+        let rows = db
+            .list_source_session_chunks(TEST_SOURCE_ID, TEST_EXTERNAL_SESSION_ID)
+            .expect("list chunks");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chunk_id, "chunk-1");
+        assert_eq!(rows[0].result_json, json!({"content": "normalized hello"}));
+        let decoded: crate::ActivityChunk =
+            serde_json::from_value(rows[0].raw_json.clone()).expect("decode raw chunk");
+        assert_eq!(decoded, chunk);
     }
 
     fn upsert_with(

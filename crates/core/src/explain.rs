@@ -964,6 +964,7 @@ mod tests {
                 lines_removed: Some(0),
                 touched_files: vec![path.to_string()],
                 metadata_json: None,
+                normalized_chunks: Vec::new(),
             },
         )
         .expect("source session event")

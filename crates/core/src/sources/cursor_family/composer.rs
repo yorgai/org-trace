@@ -70,7 +70,9 @@ pub(in crate::sources) fn list_sessions_from_composer_data(
             .or(right.modified_at)
             .cmp(&left.session_updated_at.or(left.modified_at))
     });
-    sessions.truncate(limit.unwrap_or(50));
+    if let Some(limit) = limit {
+        sessions.truncate(limit);
+    }
     Ok(sessions)
 }
 

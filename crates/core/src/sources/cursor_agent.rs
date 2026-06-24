@@ -41,7 +41,6 @@ const CURSOR_AGENT_SOURCE_ID: &str = "cursor_agent";
 const CURSOR_AGENT_PARSER_VERSION: &str = "cursor-agent-store-v1";
 const CURSOR_AGENT_PROVIDER_SLUG: &str = "cursor-agent";
 const STORE_DB_FILE: &str = "store.db";
-const DEFAULT_LIMIT: usize = 50;
 
 pub(super) fn list_sessions(
     profile: &SourceProfile,
@@ -80,7 +79,9 @@ pub(super) fn list_sessions(
     }
 
     sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_at));
-    sessions.truncate(limit.unwrap_or(DEFAULT_LIMIT));
+    if let Some(limit) = limit {
+        sessions.truncate(limit);
+    }
     Ok(sessions)
 }
 

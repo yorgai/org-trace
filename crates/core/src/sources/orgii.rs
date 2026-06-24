@@ -30,7 +30,6 @@ const ORGII_SOURCE_ID: &str = "orgii";
 const ORGII_SQLITE_PARSER_VERSION: &str = "orgii-sqlite-v2";
 const ORGII_PROVIDER_SLUG: &str = "orgii";
 const ORGII_DB_FILE: &str = "sessions.db";
-const DEFAULT_LIMIT: usize = 50;
 
 /// Lists ORGII sessions, newest first. When `since` is set (an RFC3339 string),
 /// only sessions whose `updated_at >= since` are returned — the incremental path
@@ -44,7 +43,6 @@ pub(super) fn list_sessions(
 ) -> Result<Vec<NativeSourceSession>> {
     let db_path = orgii_db_path(profile)?;
     let connection = open_orgii_db(&db_path)?;
-    let scan_limit = limit.unwrap_or(DEFAULT_LIMIT);
     let app_id = profile
         .app_id
         .clone()
@@ -57,15 +55,13 @@ pub(super) fn list_sessions(
         "SELECT session_id, name, model, project_path, code_repo_path, workspace_path,
                 worktree_branch, user_input, created_at, updated_at
          FROM agent_sessions
-         WHERE updated_at >= ?2
-         ORDER BY updated_at DESC
-         LIMIT ?1"
+         WHERE updated_at >= ?1
+         ORDER BY updated_at DESC"
     } else {
         "SELECT session_id, name, model, project_path, code_repo_path, workspace_path,
                 worktree_branch, user_input, created_at, updated_at
          FROM agent_sessions
-         ORDER BY updated_at DESC
-         LIMIT ?1"
+         ORDER BY updated_at DESC"
     };
     let mut statement = connection
         .prepare(sql)
@@ -84,17 +80,20 @@ pub(super) fn list_sessions(
             updated_at: row.get::<_, Option<String>>(9)?,
         })
     };
-    let session_rows: Vec<OrgiiSessionRow> = if let Some(since) = since {
+    let mut session_rows: Vec<OrgiiSessionRow> = if let Some(since) = since {
         statement
-            .query_map(rusqlite::params![scan_limit as i64, since], map_row)
+            .query_map(rusqlite::params![since], map_row)
             .context("failed to query ORGII agent_sessions")?
             .collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         statement
-            .query_map(rusqlite::params![scan_limit as i64], map_row)
+            .query_map([], map_row)
             .context("failed to query ORGII agent_sessions")?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    if let Some(limit) = limit {
+        session_rows.truncate(limit);
+    }
 
     let session_ids: Vec<&str> = session_rows.iter().map(|r| r.session_id.as_str()).collect();
     let mut impacts = batch_edit_impact(&connection, &session_ids)?;

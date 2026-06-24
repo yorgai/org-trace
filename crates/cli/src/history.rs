@@ -2,15 +2,17 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::SystemTime;
 
 use anyhow::Result;
 use brick_core::{
-    list_source_plans, list_source_sessions, DiscoveredPathKind, DiscoveredSource, LocalStore,
-    MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore, SourceScanStatus,
+    list_source_plans, list_source_sessions, ActivityChunk, DiscoveredPathKind, DiscoveredSource,
+    LocalStore, MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore,
+    SourceScanStatus, SourceSessionChunksUpsert, SourceSessionListQuery, SourceSessionRecord,
     SourceSessionUpsert,
 };
-use brick_protocol::{ActorRef, ActorType, SourceSessionObservedPayload, TraceEvent};
+use brick_protocol::{ActorRef, ActorType, SessionId, SourceSessionObservedPayload, TraceEvent};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -21,8 +23,8 @@ use crate::args::HistoryFormatArg;
 #[cfg(feature = "sync")]
 use brick_sync::auto_push_best_effort;
 
-const SOURCE_INDEX_REFRESH_LIMIT: usize = crate::defaults::SOURCE_REFRESH_LIMIT;
 const AUTO_REFRESH_THROTTLE_SECS: i64 = 10;
+const SOURCE_INDEX_REFRESH_LIMIT: usize = 100;
 
 pub fn print_version(format: HistoryFormatArg) -> Result<()> {
     ensure_json(format);
@@ -188,12 +190,11 @@ fn refresh_profiles_to_metadata(
         let since = watermark
             .as_ref()
             .and_then(|(high_water, _)| high_water.as_deref());
-        let scan_limit = if since.is_some() { limit } else { None };
         let profile_stats = match refresh_single_profile(
             store,
             metadata_db,
             profile,
-            scan_limit,
+            limit,
             since,
             &mut known_event_ids,
         ) {
@@ -268,6 +269,7 @@ fn refresh_repo_sources(store: &LocalStore) -> Result<()> {
         )
         .collect();
     if due.is_empty() {
+        backfill_source_session_events_from_metadata(store, &metadata_db)?;
         return Ok(());
     }
     refresh_profiles_to_metadata(
@@ -276,6 +278,7 @@ fn refresh_repo_sources(store: &LocalStore) -> Result<()> {
         &due,
         Some(SOURCE_INDEX_REFRESH_LIMIT),
     )?;
+    backfill_source_session_events_from_metadata(store, &metadata_db)?;
     Ok(())
 }
 
@@ -313,19 +316,50 @@ fn refresh_single_profile(
             (Some(record), Some(fingerprint))
                 if record.source_fingerprint.as_deref() == Some(fingerprint.as_str())
         );
-        if unchanged {
+        let chunks = if unchanged {
             metadata_db.touch_source_session_last_seen(
                 &upsert.source_id,
                 &upsert.external_session_id,
                 upsert.last_seen_at,
             )?;
             stats.skipped += 1;
+            let chunks = metadata_db
+                .list_source_session_chunks(&upsert.source_id, &upsert.external_session_id)?
+                .into_iter()
+                .filter_map(|row| serde_json::from_value(row.raw_json).ok())
+                .collect::<Vec<ActivityChunk>>();
+            if chunks.is_empty() {
+                let chunks = brick_core::format_source_session_chunks(
+                    &upsert.source_id,
+                    &upsert.external_session_id,
+                    upsert.source_path.as_deref(),
+                )?;
+                metadata_db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+                    source_id: upsert.source_id.clone(),
+                    external_session_id: upsert.external_session_id.clone(),
+                    chunks: chunks.clone(),
+                })?;
+                chunks
+            } else {
+                chunks
+            }
         } else {
             metadata_db.upsert_source_session(&upsert)?;
+            let chunks = brick_core::format_source_session_chunks(
+                &upsert.source_id,
+                &upsert.external_session_id,
+                upsert.source_path.as_deref(),
+            )?;
+            metadata_db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+                source_id: upsert.source_id.clone(),
+                external_session_id: upsert.external_session_id.clone(),
+                chunks: chunks.clone(),
+            })?;
             stats.reindexed += 1;
-        }
+            chunks
+        };
         if source_session_belongs_to_repo(&upsert, store.repo_root()) {
-            append_source_session_event(store, profile, &upsert, known_event_ids)?;
+            append_source_session_event(store, Some(profile), &upsert, &chunks, known_event_ids)?;
         }
         link_session_repo(
             metadata_db,
@@ -349,29 +383,93 @@ fn source_session_belongs_to_repo(session: &SourceSessionUpsert, repo_root: &Pat
     have == want
 }
 
+fn backfill_source_session_events_from_metadata(
+    store: &LocalStore,
+    metadata_db: &MetadataDb,
+) -> Result<()> {
+    let mut known_event_ids = store.known_event_ids()?;
+    let mut offset = 0;
+    loop {
+        let records = metadata_db.list_source_sessions(&SourceSessionListQuery {
+            source_id: None,
+            limit: 500,
+            offset,
+        })?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        for record in &records {
+            let session = source_session_record_to_upsert(record);
+            if source_session_belongs_to_repo(&session, store.repo_root()) {
+                let chunks = metadata_db
+                    .list_source_session_chunks(&session.source_id, &session.external_session_id)?
+                    .into_iter()
+                    .filter_map(|row| serde_json::from_value(row.raw_json).ok())
+                    .collect::<Vec<ActivityChunk>>();
+                append_source_session_event(store, None, &session, &chunks, &mut known_event_ids)?;
+            }
+        }
+        offset += records.len();
+    }
+}
+
+fn source_session_record_to_upsert(record: &SourceSessionRecord) -> SourceSessionUpsert {
+    SourceSessionUpsert {
+        source_id: record.source_id.clone(),
+        external_session_id: record.external_session_id.clone(),
+        title: record.title.clone(),
+        name: record.name.clone(),
+        source_path: record.source_path.clone(),
+        source_uri: record.source_uri.clone(),
+        source_mtime: record.source_mtime,
+        source_size: record.source_size,
+        source_fingerprint: record.source_fingerprint.clone(),
+        parser_version: record.parser_version.clone(),
+        session_created_at: record.session_created_at,
+        session_updated_at: record.session_updated_at,
+        model: record.model.clone(),
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        repo_path: record.repo_path.clone(),
+        branch: record.branch.clone(),
+        files_changed: record.files_changed,
+        lines_added: record.lines_added,
+        lines_removed: record.lines_removed,
+        touched_files_json: record.touched_files_json.clone(),
+        listable: record.listable,
+        discovered_at: record.discovered_at,
+        last_seen_at: record.last_seen_at,
+        metadata_json: record.metadata_json.clone(),
+    }
+}
+
 fn append_source_session_event(
     store: &LocalStore,
-    profile: &SourceProfile,
+    profile: Option<&SourceProfile>,
     session: &SourceSessionUpsert,
+    chunks: &[ActivityChunk],
     known_event_ids: &mut BTreeSet<Uuid>,
 ) -> Result<()> {
     let actor = ActorRef {
-        actor_type: profile.actor_type.unwrap_or(ActorType::Agent),
+        actor_type: profile
+            .and_then(|profile| profile.actor_type)
+            .unwrap_or(ActorType::Agent),
         actor_id: profile
-            .actor_id
-            .clone()
+            .and_then(|profile| profile.actor_id.clone())
             .unwrap_or_else(|| session.source_id.clone()),
         display_name: None,
     };
+    let source_path = session
+        .source_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let source_uri = session.source_uri.clone();
     let payload = SourceSessionObservedPayload {
         source_id: session.source_id.clone(),
         external_session_id: session.external_session_id.clone(),
         title: session.title.clone(),
-        source_path: session
-            .source_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        source_uri: session.source_uri.clone(),
+        source_path,
+        source_uri,
         source_mtime: session.source_mtime.map(|time| time.to_rfc3339()),
         source_size: session.source_size,
         source_fingerprint: session.source_fingerprint.clone(),
@@ -401,21 +499,37 @@ fn append_source_session_event(
             })
             .unwrap_or_default(),
         metadata_json: session.metadata_json.clone(),
+        normalized_chunks: chunks
+            .iter()
+            .filter_map(|chunk| serde_json::to_value(chunk).ok())
+            .collect(),
     };
+    let event_id = source_session_event_id(session, &payload.normalized_chunks);
     let mut event = TraceEvent::source_session_observed(actor, payload)?;
-    event.event_id = source_session_event_id(session);
+    event.event_id = event_id;
+    event.session_id = Some(session_id_for_source_session(session));
+    event.repo_id = Some(brick_core::repo_id_for_root(store.repo_root()));
     if known_event_ids.insert(event.event_id) {
         store.append_event(&event)?;
     }
     Ok(())
 }
 
-fn source_session_event_id(session: &SourceSessionUpsert) -> Uuid {
+fn session_id_for_source_session(session: &SourceSessionUpsert) -> SessionId {
+    SessionId::from_str(&session.external_session_id).unwrap_or_else(|_| SessionId::new())
+}
+
+fn source_session_event_id(session: &SourceSessionUpsert, normalized_chunks: &[Value]) -> Uuid {
+    let chunk_fingerprint = serde_json::to_string(normalized_chunks).unwrap_or_default();
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!(
-            "brick:source-session-observed:{}:{}",
-            session.source_id, session.external_session_id
+            "brick:source-session-observed-v2:{}:{}:{}:{}:{}",
+            session.source_id,
+            session.external_session_id,
+            session.source_fingerprint.as_deref().unwrap_or_default(),
+            session.parser_version.as_deref().unwrap_or_default(),
+            chunk_fingerprint
         )
         .as_bytes(),
     )
@@ -607,15 +721,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_session_event_id_is_stable() {
+    fn source_session_event_id_is_stable_for_same_payload_and_versions_chunks() {
         let session = test_source_session("session-1");
+        let empty = Vec::new();
+        let chunked = vec![json!({"chunk_id": "chunk-1"})];
         assert_eq!(
-            source_session_event_id(&session),
-            source_session_event_id(&session)
+            source_session_event_id(&session, &empty),
+            source_session_event_id(&session, &empty)
         );
         assert_ne!(
-            source_session_event_id(&session),
-            source_session_event_id(&test_source_session("session-2"))
+            source_session_event_id(&session, &empty),
+            source_session_event_id(&test_source_session("session-2"), &empty)
+        );
+        assert_ne!(
+            source_session_event_id(&session, &empty),
+            source_session_event_id(&session, &chunked)
         );
     }
 
@@ -635,16 +755,90 @@ mod tests {
         session.repo_path = Some(repo);
         let mut known = store.known_event_ids().expect("known ids");
 
-        append_source_session_event(&store, &profile, &session, &mut known).expect("append once");
-        append_source_session_event(&store, &profile, &session, &mut known).expect("append twice");
+        let chunks = Vec::new();
+        append_source_session_event(&store, Some(&profile), &session, &chunks, &mut known)
+            .expect("append once");
+        append_source_session_event(&store, Some(&profile), &session, &chunks, &mut known)
+            .expect("append twice");
 
         let events = store.read_queued_events().expect("events");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_id, source_session_event_id(&session));
+        assert_eq!(events[0].event_id, source_session_event_id(&session, &[]));
         assert_eq!(
             events[0].event_type,
             brick_protocol::EventType::SourceSessionObserved
         );
+    }
+
+    #[test]
+    fn append_source_session_event_allows_chunk_backfill_after_empty_event() {
+        let base = std::env::temp_dir().join(format!("source-session-backfill-{}", Uuid::new_v4()));
+        let repo = base.join("repo");
+        let store_root = base.join("store");
+        fs::create_dir_all(&repo).expect("repo dir");
+        let store = LocalStore::with_options(
+            &repo,
+            StorageOptions::new().with_explicit_store_root(Some(store_root)),
+        )
+        .expect("store");
+        let profile = test_profile();
+        let mut session = test_source_session("session-1");
+        session.repo_path = Some(repo);
+        let mut known = store.known_event_ids().expect("known ids");
+
+        append_source_session_event(&store, Some(&profile), &session, &[], &mut known)
+            .expect("append empty event");
+        let mut chunk = ActivityChunk::new("session-1", "message", "assistant");
+        chunk.result = json!({"content": "backfilled"});
+        append_source_session_event(&store, Some(&profile), &session, &[chunk], &mut known)
+            .expect("append chunked event");
+
+        let events = store.read_queued_events().expect("events");
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].event_id, events[1].event_id);
+        assert!(events[0].payload["normalized_chunks"].as_array().is_none());
+        assert_eq!(
+            events[1].payload["normalized_chunks"][0]["result"]["content"],
+            "backfilled"
+        );
+    }
+
+    #[test]
+    fn append_source_session_event_carries_normalized_chunks_when_present() {
+        let base = std::env::temp_dir().join(format!("source-session-log-{}", Uuid::new_v4()));
+        let repo = base.join("repo");
+        let store_root = base.join("store");
+        fs::create_dir_all(&repo).expect("repo dir");
+        let source_log = base.join("session.jsonl");
+        fs::write(&source_log, "{\"message\":\"hello\"}\n").expect("write source log");
+        let store = LocalStore::with_options(
+            &repo,
+            StorageOptions::new().with_explicit_store_root(Some(store_root)),
+        )
+        .expect("store");
+        let profile = test_profile();
+        let mut session = test_source_session("session-1");
+        session.repo_path = Some(repo);
+        session.source_path = Some(source_log);
+        let mut known = store.known_event_ids().expect("known ids");
+
+        let mut chunk = ActivityChunk::new("session-1", "message", "assistant");
+        chunk.result = json!({"content": "hello"});
+        let chunks = vec![chunk];
+        append_source_session_event(&store, Some(&profile), &session, &chunks, &mut known)
+            .expect("append source session");
+
+        let events = store.read_queued_events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            brick_protocol::EventType::SourceSessionObserved
+        );
+        let normalized_chunks = events[0].payload["normalized_chunks"]
+            .as_array()
+            .expect("normalized chunks");
+        assert_eq!(normalized_chunks.len(), 1);
+        assert_eq!(normalized_chunks[0]["result"]["content"], "hello");
     }
 
     #[test]

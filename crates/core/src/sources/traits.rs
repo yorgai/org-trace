@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use std::path::{Path, PathBuf};
 
@@ -120,6 +120,26 @@ pub fn list_source_plans(profile: &SourceProfile) -> Result<Vec<SourcePlanWithEd
     }
 }
 
+pub fn fused_source_session_chunks(
+    source_id: &str,
+    external_session_id: &str,
+) -> Result<Vec<ActivityChunk>> {
+    let db = crate::MetadataDb::open_global()?;
+    let rows = db.list_source_session_chunks(source_id, external_session_id)?;
+    rows.into_iter()
+        .map(|row| {
+            serde_json::from_value(row.raw_json)
+                .map_err(anyhow::Error::from)
+                .with_context(|| {
+                    format!(
+                        "failed to decode fused source-session chunk {}:{}:{}",
+                        row.source_id, row.external_session_id, row.chunk_id
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Formats source records as activity chunk JSON for one source session when supported.
 pub fn format_source_session_chunks(
     source_id: &str,
@@ -160,7 +180,10 @@ pub fn turn_final_assistant_message(
     source_path: Option<&Path>,
     occurred_at: &str,
 ) -> Result<Option<String>> {
-    let chunks = format_source_session_chunks(source_id, external_session_id, source_path)?;
+    let chunks = match fused_source_session_chunks(source_id, external_session_id) {
+        Ok(chunks) if !chunks.is_empty() => chunks,
+        _ => format_source_session_chunks(source_id, external_session_id, source_path)?,
+    };
     Ok(select_turn_final_message(&chunks, occurred_at))
 }
 
@@ -173,7 +196,10 @@ pub fn infer_session_rationale(
     source_path: Option<&Path>,
     occurred_at: &str,
 ) -> Result<InferredRationale> {
-    let chunks = format_source_session_chunks(source_id, external_session_id, source_path)?;
+    let chunks = match fused_source_session_chunks(source_id, external_session_id) {
+        Ok(chunks) if !chunks.is_empty() => chunks,
+        _ => format_source_session_chunks(source_id, external_session_id, source_path)?,
+    };
     Ok(infer_turn_rationale(&chunks, occurred_at))
 }
 

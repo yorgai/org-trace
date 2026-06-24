@@ -12,8 +12,6 @@ use serde_json::Value;
 
 use crate::SourceProfile;
 
-const DEFAULT_NATIVE_SESSION_LIMIT: usize = 50;
-const MAX_NATIVE_SCAN_ENTRIES: usize = 10_000;
 pub(crate) const GENERIC_NATIVE_FILE_PARSER_VERSION: &str = "native-file-v1";
 
 /// Whether a source session appears to be running right now.
@@ -134,7 +132,6 @@ pub(crate) fn list_file_source_sessions_with_filter(
     extract: impl Fn(&Path) -> Result<NativeSessionMetadata>,
     include: impl Fn(&Path) -> bool,
 ) -> Result<Vec<NativeSourceSession>> {
-    let scan_limit = limit.unwrap_or(DEFAULT_NATIVE_SESSION_LIMIT);
     let mut roots = Vec::new();
     if let Some(path) = &profile.session_log_path {
         roots.push(path.clone());
@@ -149,15 +146,25 @@ pub(crate) fn list_file_source_sessions_with_filter(
         .unwrap_or_else(|| profile.name.clone());
     let mut sessions = Vec::new();
     for root in roots {
-        collect_session_files(&root, &app_id, since, &extract, &include, &mut sessions)?;
-        if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
+        collect_session_files(
+            &root,
+            &app_id,
+            since,
+            &extract,
+            &include,
+            limit,
+            &mut sessions,
+        )?;
+        if limit.is_some_and(|limit| sessions.len() >= limit) {
             break;
         }
     }
 
     sessions.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     sessions.dedup_by(|left, right| left.path == right.path);
-    sessions.truncate(scan_limit);
+    if let Some(limit) = limit {
+        sessions.truncate(limit);
+    }
     Ok(sessions)
 }
 
@@ -167,6 +174,7 @@ fn collect_session_files(
     since: Option<SystemTime>,
     extract: &impl Fn(&Path) -> Result<NativeSessionMetadata>,
     include: &impl Fn(&Path) -> bool,
+    limit: Option<usize>,
     sessions: &mut Vec<NativeSourceSession>,
 ) -> Result<()> {
     if !root.exists() {
@@ -210,7 +218,7 @@ fn collect_session_files(
                 continue;
             }
             sessions.push(session_from_path(&path, app_id, extract)?);
-            if sessions.len() >= MAX_NATIVE_SCAN_ENTRIES {
+            if limit.is_some_and(|limit| sessions.len() >= limit) {
                 return Ok(());
             }
         }

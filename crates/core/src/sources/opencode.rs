@@ -19,7 +19,6 @@ const OPENCODE_SOURCE_ID: &str = "opencode";
 const OPENCODE_SQLITE_PARSER_VERSION: &str = "opencode-sqlite-v1";
 const OPENCODE_PROVIDER_SLUG: &str = "opencode";
 const OPENCODE_DB_FILE: &str = "opencode.db";
-const DEFAULT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone)]
 struct TableSchema {
@@ -72,7 +71,7 @@ pub(super) fn list_sessions(
         .app_id
         .clone()
         .unwrap_or_else(|| OPENCODE_SOURCE_ID.to_string());
-    let sql = session_query_sql(&session_schema, limit.unwrap_or(DEFAULT_LIMIT));
+    let sql = session_query_sql(&session_schema, limit);
     let mut statement = connection
         .prepare(&sql)
         .context("failed to prepare OpenCode session metadata query")?;
@@ -215,7 +214,7 @@ fn table_schema(connection: &Connection, table: &str) -> Result<TableSchema> {
     Ok(TableSchema { columns })
 }
 
-fn session_query_sql(schema: &TableSchema, limit: usize) -> String {
+fn session_query_sql(schema: &TableSchema, limit: Option<usize>) -> String {
     let title = optional_column_expression(schema, "s", "title");
     let directory = optional_column_expression(schema, "s", "directory");
     let model = optional_column_expression(schema, "s", "model");
@@ -234,10 +233,13 @@ fn session_query_sql(schema: &TableSchema, limit: usize) -> String {
     } else {
         format!("s.{} DESC", quote_identifier("id"))
     };
+    let limit_clause = limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
     format!(
         "SELECT s.{id}, {title}, {directory}, {model}, {time_created}, {time_updated}, \
          {tokens_input}, {tokens_cache_read}, {tokens_cache_write}, {tokens_output}, {tokens_reasoning} \
-         FROM {session_table} s {archive_filter} ORDER BY {order_by} LIMIT {limit}",
+         FROM {session_table} s {archive_filter} ORDER BY {order_by}{limit_clause}",
         id = quote_identifier("id"),
         session_table = quote_identifier("session"),
     )
