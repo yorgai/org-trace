@@ -41,8 +41,37 @@ create table if not exists public.brick_events (
 
 alter table public.brick_events enable row level security;
 
+create table if not exists public.brick_event_chunks (
+  event_id uuid not null references public.brick_events(event_id) on delete cascade,
+  repo_id text not null,
+  org_id text not null references public.brick_orgs(org_id) on delete cascade,
+  source_id text not null,
+  external_session_id text not null,
+  chunk_index integer not null,
+  chunk_kind text,
+  role text,
+  actor_id text,
+  occurred_at timestamptz,
+  text text,
+  raw jsonb not null,
+  inserted_at timestamptz not null default now(),
+  primary key (event_id, chunk_index)
+);
+
+alter table public.brick_event_chunks enable row level security;
+
 create index if not exists brick_events_repo_occurred_idx
   on public.brick_events (repo_id, occurred_at);
+
+create index if not exists brick_event_chunks_repo_session_idx
+  on public.brick_event_chunks (repo_id, source_id, external_session_id, chunk_index);
+
+create index if not exists brick_event_chunks_repo_occurred_idx
+  on public.brick_event_chunks (repo_id, occurred_at);
+
+create index if not exists brick_event_chunks_text_fts_idx
+  on public.brick_event_chunks
+  using gin (to_tsvector('english', coalesce(text, '')));
 
 create or replace function public.brick_is_org_member(p_org_id text)
 returns boolean
@@ -116,6 +145,128 @@ create policy "members can insert brick events"
     and public.brick_is_org_member(org_id)
   );
 
+drop policy if exists "members can read brick event chunks" on public.brick_event_chunks;
+create policy "members can read brick event chunks"
+  on public.brick_event_chunks for select
+  using (public.brick_is_org_member(org_id));
+
+create or replace function public.brick_can_insert_event_chunk(
+  p_event_id uuid,
+  p_repo_id text,
+  p_org_id text
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.brick_events e
+    where e.event_id = p_event_id
+      and e.repo_id = p_repo_id
+      and e.org_id = p_org_id
+      and public.brick_is_org_member(e.org_id)
+  );
+$$;
+
+drop policy if exists "members can insert brick event chunks" on public.brick_event_chunks;
+create policy "members can insert brick event chunks"
+  on public.brick_event_chunks for insert
+  with check (public.brick_can_insert_event_chunk(event_id, repo_id, org_id));
+
+create or replace function public.brick_backfill_event_chunks(
+  p_event_id uuid,
+  p_offset integer default 0,
+  p_limit integer default 500
+)
+returns bigint
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  indexed_count bigint;
+begin
+  insert into public.brick_event_chunks (
+    event_id,
+    repo_id,
+    org_id,
+    source_id,
+    external_session_id,
+    chunk_index,
+    chunk_kind,
+    role,
+    actor_id,
+    occurred_at,
+    text,
+    raw
+  )
+  select
+    e.event_id,
+    e.repo_id,
+    e.org_id,
+    e.event->'payload'->>'source_id',
+    e.event->'payload'->>'external_session_id',
+    chunk.ordinality - 1,
+    coalesce(chunk.value->>'action_type', chunk.value->>'kind', chunk.value->>'type', chunk.value->>'function'),
+    coalesce(chunk.value->>'role', chunk.value->'result'->>'role', chunk.value->'result'->'message'->>'role'),
+    coalesce(chunk.value->>'actor_id', chunk.value->'actor'->>'actor_id'),
+    case
+      when coalesce(chunk.value->>'created_at', chunk.value->>'occurred_at', chunk.value->>'timestamp') ~ '^\d{4}-\d{2}-\d{2}T'
+        then coalesce(chunk.value->>'created_at', chunk.value->>'occurred_at', chunk.value->>'timestamp')::timestamptz
+      else null
+    end,
+    coalesce(
+      chunk.value->>'text',
+      chunk.value->>'content',
+      chunk.value->'message'->>'content',
+      chunk.value->'result'->>'content',
+      chunk.value->'result'->'message'->>'content',
+      chunk.value->'result'->>'observation',
+      chunk.value->'result'->>'output'
+    ),
+    chunk.value
+  from public.brick_events e
+  cross join lateral jsonb_array_elements(coalesce(e.event->'payload'->'normalized_chunks', '[]'::jsonb))
+    with ordinality as chunk(value, ordinality)
+  where e.event_id = p_event_id
+    and e.event->>'event_type' = 'source.session_observed'
+    and chunk.ordinality > greatest(p_offset, 0)
+    and chunk.ordinality <= greatest(p_offset, 0) + greatest(p_limit, 1)
+  on conflict (event_id, chunk_index) do nothing;
+
+  get diagnostics indexed_count = row_count;
+  return indexed_count;
+end;
+$$;
+
+create or replace function public.brick_backfill_next_event_chunk_batch(p_limit integer default 500)
+returns table(event_id uuid, chunk_count bigint)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+  with pending as (
+    select
+      e.event_id,
+      coalesce(max(c.chunk_index) + 1, 0) as chunk_offset
+    from public.brick_events e
+    left join public.brick_event_chunks c on c.event_id = e.event_id
+    where e.event->>'event_type' = 'source.session_observed'
+    group by e.event_id, e.event, e.occurred_at
+    having jsonb_array_length(coalesce(e.event->'payload'->'normalized_chunks', '[]'::jsonb)) > coalesce(max(c.chunk_index) + 1, 0)
+    order by e.occurred_at, e.event_id
+    limit 1
+  )
+  select pending.event_id, public.brick_backfill_event_chunks(pending.event_id, pending.chunk_offset::integer, p_limit)
+  from pending;
+end;
+$$;
+
 create or replace function public.brick_create_org(p_org_id text)
 returns void
 language plpgsql
@@ -187,6 +338,9 @@ $$;
 
 grant execute on function public.brick_is_org_member(text) to authenticated;
 grant execute on function public.brick_is_org_owner(text) to authenticated;
+grant execute on function public.brick_can_insert_event_chunk(uuid, text, text) to authenticated;
+grant execute on function public.brick_backfill_event_chunks(uuid, integer, integer) to authenticated;
+grant execute on function public.brick_backfill_next_event_chunk_batch(integer) to authenticated;
 grant execute on function public.brick_create_org(text) to authenticated;
 grant execute on function public.brick_invite_org_member(text, text) to authenticated;
 grant execute on function public.brick_accept_invites() to authenticated;
