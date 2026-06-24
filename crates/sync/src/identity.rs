@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use brick_core::resolve_brick_home;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -147,7 +148,7 @@ fn set_owner_only(_path: &Path) {}
 /// back to the compiled-in defaults. Returns an error only if no URL is set and
 /// no default is compiled in (so login fails loudly rather than hitting a bogus
 /// host).
-fn supabase_config() -> Result<(String, String)> {
+pub fn supabase_config() -> Result<(String, String)> {
     let url = std::env::var(SUPABASE_URL_ENV)
         .ok()
         .or_else(|| option_env!("BRICK_SUPABASE_URL").map(str::to_string))
@@ -222,6 +223,54 @@ pub fn verify_email_otp(email: &str, code: &str) -> Result<Identity> {
     };
     save(&identity)?;
     Ok(identity)
+}
+
+pub fn save_magic_link_callback(callback_url: &str) -> Result<Identity> {
+    let url = url::Url::parse(callback_url).context("failed to parse Supabase callback URL")?;
+    let fragment = url
+        .fragment()
+        .context("Supabase callback URL is missing the #access_token fragment")?;
+    let params: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(fragment.as_bytes()).collect();
+    let access_token = params
+        .get("access_token")
+        .context("Supabase callback URL is missing access_token")?
+        .to_string();
+    let refresh_token = params
+        .get("refresh_token")
+        .context("Supabase callback URL is missing refresh_token")?
+        .to_string();
+    let expires_at = params
+        .get("expires_at")
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0));
+    let claims = decode_jwt_claims(&access_token)?;
+    let identity = Identity {
+        user_id: claims.sub,
+        email: claims.email,
+        access_token,
+        refresh_token,
+        expires_at,
+    };
+    save(&identity)?;
+    Ok(identity)
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessTokenClaims {
+    sub: String,
+    email: Option<String>,
+}
+
+fn decode_jwt_claims(access_token: &str) -> Result<AccessTokenClaims> {
+    let payload = access_token
+        .split('.')
+        .nth(1)
+        .context("Supabase access token is not a JWT")?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("failed to decode Supabase access token claims")?;
+    serde_json::from_slice(&decoded).context("failed to parse Supabase access token claims")
 }
 
 /// Posts a single `/auth/v1/verify` attempt with an explicit OTP `type`.
@@ -306,6 +355,28 @@ mod tests {
     fn missing_file_is_not_logged_in() {
         let path = tmp_path("missing");
         assert_eq!(load_from(&path).expect("load"), None);
+    }
+
+    #[test]
+    fn parses_magic_link_callback_url() {
+        let token = "header.eyJzdWIiOiJ1c2VyLTEyMyIsImVtYWlsIjoiYUBiLmMifQ.sig";
+        let callback = format!(
+            "http://localhost:3000/#access_token={token}&refresh_token=refresh&expires_at=1893456000"
+        );
+
+        let url = url::Url::parse(&callback).expect("url");
+        let fragment = url.fragment().expect("fragment");
+        let params: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(fragment.as_bytes()).collect();
+        let claims =
+            decode_jwt_claims(params.get("access_token").expect("access token")).expect("claims");
+
+        assert_eq!(claims.sub, "user-123");
+        assert_eq!(claims.email.as_deref(), Some("a@b.c"));
+        assert_eq!(
+            params.get("refresh_token").map(|v| v.as_ref()),
+            Some("refresh")
+        );
     }
 
     #[test]

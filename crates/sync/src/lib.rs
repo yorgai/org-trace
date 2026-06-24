@@ -12,11 +12,18 @@
 //! separate inbound log and deduplicates by event ID before writing.
 
 pub mod identity;
+pub mod supabase;
 pub mod wire;
 
 use anyhow::{Context, Result};
-use brick_core::{repo_id_for_root, LocalStore};
-use brick_protocol::TraceEvent;
+use brick_core::{
+    repo_id_for_root, ActivityChunk, LocalStore, MetadataDb, SourceSessionChunksUpsert,
+    SourceSessionUpsert,
+};
+use brick_protocol::{OrgId, SourceSessionObservedPayload, TraceEvent};
+use chrono::Utc;
+use std::path::PathBuf;
+use std::str::FromStr;
 
 pub use identity::{is_logged_in, Identity};
 pub use wire::{EventCursor, ListEventsResponse, PushEventsRequest, PushEventsResponse};
@@ -43,11 +50,13 @@ pub fn auto_push_best_effort(store: &LocalStore) {
 fn auto_pull(store: &LocalStore) -> Result<()> {
     let identity = identity::refresh_if_needed()?;
     let remote = auto_sync_remote();
-    let response = get_all_events_from_remote(
-        &remote,
-        Some(&repo_id_for_root(store.repo_root())),
-        Some(&identity.access_token),
-    )?;
+    let repo_id = repo_id_for_root(store.repo_root());
+    let response = if supabase::is_supabase_remote(&remote) {
+        supabase::SupabaseRemote::from_env()?
+            .get_all_events(Some(&repo_id), &identity.access_token)?
+    } else {
+        get_all_events_from_remote(&remote, Some(&repo_id), Some(&identity.access_token))?
+    };
     let _ = pull_events(store, response.events, false)?;
     Ok(())
 }
@@ -58,13 +67,26 @@ fn auto_push(store: &LocalStore) -> Result<()> {
         return Ok(());
     }
     let identity = identity::refresh_if_needed()?;
-    let request = PushEventsRequest { events };
-    let _ = push_events_to_remote(
-        &auto_sync_remote(),
-        Some(&repo_id_for_root(store.repo_root())),
-        &request,
-        Some(&identity.access_token),
-    )?;
+    let remote = auto_sync_remote();
+    let repo_id = repo_id_for_root(store.repo_root());
+    let org_id = std::env::var("BRICK_SYNC_ORG_ID").ok();
+    let request = PushEventsRequest {
+        events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
+    };
+    if supabase::is_supabase_remote(&remote) {
+        supabase::SupabaseRemote::from_env()?.push_events(
+            Some(&repo_id),
+            &request,
+            &identity.access_token,
+        )?;
+    } else {
+        push_events_to_remote(
+            &remote,
+            Some(&repo_id),
+            &request,
+            Some(&identity.access_token),
+        )?;
+    };
     Ok(())
 }
 
@@ -91,13 +113,16 @@ pub fn handle_push(
     dry_run: bool,
     remote: Option<String>,
     repo_id: Option<String>,
+    org_id: Option<String>,
 ) -> Result<()> {
     let events = store.read_queued_events()?;
     let remote = normalized_remote(remote);
+    let repo_id = repo_id.unwrap_or_else(|| repo_id_for_root(store.repo_root()));
     if dry_run {
         println!("push_dry_run=true");
         println!("remote={remote}");
-        println!("repo_id={}", repo_id.as_deref().unwrap_or(""));
+        println!("repo_id={repo_id}");
+        println!("org_id={}", org_id.as_deref().unwrap_or(""));
         println!("queued_event_count={}", events.len());
         return Ok(());
     }
@@ -108,13 +133,23 @@ pub fn handle_push(
     let identity = identity::refresh_if_needed()
         .context("upload requires a Brick account. Run `brick login` first")?;
 
-    let request = PushEventsRequest { events };
-    let response = push_events_to_remote(
-        &remote,
-        repo_id.as_deref(),
-        &request,
-        Some(&identity.access_token),
-    )?;
+    let request = PushEventsRequest {
+        events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
+    };
+    let response = if supabase::is_supabase_remote(&remote) {
+        supabase::SupabaseRemote::from_env()?.push_events(
+            Some(&repo_id),
+            &request,
+            &identity.access_token,
+        )?
+    } else {
+        push_events_to_remote(
+            &remote,
+            Some(&repo_id),
+            &request,
+            Some(&identity.access_token),
+        )?
+    };
     print_push_result(&response, request.events.len());
     Ok(())
 }
@@ -129,10 +164,20 @@ pub fn handle_pull(
     let remote = normalized_remote(remote);
     let identity = identity::refresh_if_needed()
         .context("pull requires a Brick account. Run `brick sync login` first")?;
-    let response =
-        get_all_events_from_remote(&remote, repo_id.as_deref(), Some(&identity.access_token))?;
+    let repo_id_for_print = repo_id.clone().or_else(|| {
+        supabase::is_supabase_remote(&remote).then(|| repo_id_for_root(store.repo_root()))
+    });
+    let response = if supabase::is_supabase_remote(&remote) {
+        let repo_id = repo_id_for_print
+            .clone()
+            .context("Supabase sync requires --repo-id or a git repository root")?;
+        supabase::SupabaseRemote::from_env()?
+            .get_all_events(Some(&repo_id), &identity.access_token)?
+    } else {
+        get_all_events_from_remote(&remote, repo_id.as_deref(), Some(&identity.access_token))?
+    };
     let outcome = pull_events(store, response.events, dry_run)?;
-    print_pull_result(&remote, repo_id.as_deref(), dry_run, &outcome);
+    print_pull_result(&remote, repo_id_for_print.as_deref(), dry_run, &outcome);
     Ok(())
 }
 
@@ -142,10 +187,48 @@ pub fn handle_sync(
     dry_run: bool,
     remote: Option<String>,
     repo_id: Option<String>,
+    org_id: Option<String>,
 ) -> Result<()> {
     let remote = normalized_remote(remote);
     handle_pull(store, dry_run, Some(remote.clone()), repo_id.clone())?;
-    handle_push(store, dry_run, Some(remote), repo_id)?;
+    handle_push(store, dry_run, Some(remote), repo_id, org_id)?;
+    Ok(())
+}
+
+/// Creates a Supabase-backed Brick org and makes the logged-in user owner.
+pub fn handle_create_org(org_id: String) -> Result<()> {
+    let identity = identity::refresh_if_needed()
+        .context("create-org requires a Brick account. Run `brick sync login` first")?;
+    supabase::SupabaseRemote::from_env()?.create_org(&org_id, &identity.access_token)?;
+    println!("org_created=true");
+    println!("org_id={org_id}");
+    println!("owner_user_id={}", identity.user_id);
+    Ok(())
+}
+
+/// Invites an email address into an org through Supabase-native membership RPC.
+pub fn handle_invite(org_id: String, email: String) -> Result<()> {
+    let identity = identity::refresh_if_needed()
+        .context("invite requires a Brick account. Run `brick sync login` first")?;
+    supabase::SupabaseRemote::from_env()?.invite_org_member(
+        &org_id,
+        &email,
+        &identity.access_token,
+    )?;
+    println!("invite_sent=true");
+    println!("org_id={org_id}");
+    println!("email={email}");
+    Ok(())
+}
+
+/// Accepts pending email invites for the logged-in Supabase account.
+pub fn handle_accept_invites() -> Result<()> {
+    let identity = identity::refresh_if_needed()
+        .context("accept-invites requires a Brick account. Run `brick sync login` first")?;
+    supabase::SupabaseRemote::from_env()?.accept_invites(&identity.access_token)?;
+    println!("accepted_invites=true");
+    println!("user_id={}", identity.user_id);
+    println!("email={}", identity.email.as_deref().unwrap_or(""));
     Ok(())
 }
 
@@ -172,6 +255,39 @@ fn events_page_url(remote: &str, repo_id: Option<&str>, after: Option<&str>) -> 
     url
 }
 
+fn scoped_events(
+    events: Vec<TraceEvent>,
+    repo_id: Option<&str>,
+    org_id: Option<&str>,
+) -> Result<Vec<TraceEvent>> {
+    let org_id = org_id
+        .filter(|value| !value.trim().is_empty())
+        .map(OrgId::from_str)
+        .transpose()
+        .context("invalid --org-id")?;
+    events
+        .into_iter()
+        .map(|mut event| {
+            if let Some(repo_id) = repo_id {
+                match event.repo_id.as_deref() {
+                    Some(existing) if existing != repo_id => {
+                        anyhow::bail!(
+                            "event {} repo_id {existing:?} does not match push repo_id {repo_id:?}",
+                            event.event_id
+                        );
+                    }
+                    Some(_) => {}
+                    None => event.repo_id = Some(repo_id.to_string()),
+                }
+            }
+            if event.org_id.is_none() {
+                event.org_id = org_id.clone();
+            }
+            Ok(event)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PullOutcome {
     remote_event_count: usize,
@@ -187,8 +303,13 @@ fn pull_events(
 ) -> Result<PullOutcome> {
     let remote_event_count = remote_events.len();
     let pulled_events = store.dedupe_remote_events(remote_events)?;
+    let duplicate_count = remote_event_count.saturating_sub(pulled_events.len());
+    let pulled_events = if dry_run {
+        pulled_events
+    } else {
+        ingest_pulled_source_sessions(pulled_events)?
+    };
     let pulled_event_count = pulled_events.len();
-    let duplicate_count = remote_event_count.saturating_sub(pulled_event_count);
     let inbound_path = if dry_run || pulled_events.is_empty() {
         None
     } else {
@@ -206,6 +327,81 @@ fn pull_events(
         duplicate_count,
         inbound_path,
     })
+}
+
+fn ingest_pulled_source_sessions(mut events: Vec<TraceEvent>) -> Result<Vec<TraceEvent>> {
+    let mut metadata_db = MetadataDb::open_global()?;
+    ingest_source_sessions_into_metadata(&mut metadata_db, &mut events)?;
+    Ok(events)
+}
+
+fn ingest_source_sessions_into_metadata(
+    metadata_db: &mut MetadataDb,
+    events: &mut [TraceEvent],
+) -> Result<()> {
+    for event in events {
+        if event.event_type != brick_protocol::EventType::SourceSessionObserved {
+            continue;
+        }
+        let payload: SourceSessionObservedPayload =
+            serde_json::from_value(event.payload.clone())
+                .context("failed to decode source session observed payload")?;
+        metadata_db.upsert_source_session(&source_session_upsert_from_payload(&payload)?)?;
+        if !payload.normalized_chunks.is_empty() {
+            let chunks: Vec<ActivityChunk> = payload
+                .normalized_chunks
+                .iter()
+                .cloned()
+                .map(serde_json::from_value)
+                .collect::<serde_json::Result<Vec<_>>>()
+                .context("failed to decode normalized source-session chunks")?;
+            metadata_db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+                source_id: payload.source_id.clone(),
+                external_session_id: payload.external_session_id.clone(),
+                chunks,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn source_session_upsert_from_payload(
+    payload: &SourceSessionObservedPayload,
+) -> Result<SourceSessionUpsert> {
+    let now = Utc::now();
+    Ok(SourceSessionUpsert {
+        source_id: payload.source_id.clone(),
+        external_session_id: payload.external_session_id.clone(),
+        title: payload.title.clone(),
+        name: payload.title.clone(),
+        source_path: payload.source_path.as_ref().map(PathBuf::from),
+        source_uri: payload.source_uri.clone(),
+        source_mtime: parse_rfc3339(payload.source_mtime.as_deref()),
+        source_size: payload.source_size,
+        source_fingerprint: payload.source_fingerprint.clone(),
+        parser_version: payload.parser_version.clone(),
+        session_created_at: parse_rfc3339(payload.session_created_at.as_deref()),
+        session_updated_at: parse_rfc3339(payload.session_updated_at.as_deref()),
+        model: payload.model.clone(),
+        input_tokens: payload.input_tokens,
+        output_tokens: payload.output_tokens,
+        repo_path: payload.repo_path.as_ref().map(PathBuf::from),
+        branch: payload.branch.clone(),
+        files_changed: payload.files_changed,
+        lines_added: payload.lines_added,
+        lines_removed: payload.lines_removed,
+        touched_files_json: Some(serde_json::to_value(&payload.touched_files)?),
+        listable: true,
+        discovered_at: now,
+        last_seen_at: now,
+        metadata_json: payload.metadata_json.clone(),
+    })
+}
+
+fn parse_rfc3339(value: Option<&str>) -> Option<chrono::DateTime<Utc>> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn print_push_result(response: &PushEventsResponse, queued_event_count: usize) {
@@ -347,6 +543,92 @@ mod tests {
     }
 
     #[test]
+    fn source_session_payload_materializes_to_metadata_upsert() {
+        let payload = source_session_payload();
+
+        let upsert = source_session_upsert_from_payload(&payload).expect("upsert");
+
+        assert_eq!(upsert.source_id, "codex");
+        assert_eq!(upsert.external_session_id, "session-1");
+        assert_eq!(upsert.source_path, Some(PathBuf::from("/local/blob")));
+        assert_eq!(
+            upsert.touched_files_json,
+            Some(serde_json::json!(["src/lib.rs"]))
+        );
+        assert_eq!(payload.normalized_chunks.len(), 1);
+    }
+
+    #[test]
+    fn pulled_source_session_materializes_normalized_chunks_to_metadata_db() {
+        let path = temp_repo_root("pulled-chunks").join("metadata.sqlite");
+        let mut metadata_db = MetadataDb::open_path(&path).expect("open metadata DB");
+        let mut events = vec![TraceEvent::source_session_observed(
+            ActorRef {
+                actor_type: ActorType::Agent,
+                actor_id: "codex".to_string(),
+                display_name: None,
+            },
+            source_session_payload(),
+        )
+        .expect("build source session event")];
+
+        ingest_source_sessions_into_metadata(&mut metadata_db, &mut events)
+            .expect("ingest source session");
+
+        let sessions = metadata_db
+            .list_source_sessions(&brick_core::SourceSessionListQuery {
+                source_id: Some("codex".to_string()),
+                limit: 10,
+                offset: 0,
+            })
+            .expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        let chunks = metadata_db
+            .list_source_session_chunks("codex", "session-1")
+            .expect("list chunks");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].result_json,
+            serde_json::json!({"content": "done"})
+        );
+    }
+
+    fn source_session_payload() -> SourceSessionObservedPayload {
+        SourceSessionObservedPayload {
+            source_id: "codex".to_string(),
+            external_session_id: "session-1".to_string(),
+            title: Some("Investigate".to_string()),
+            source_path: Some("/local/blob".to_string()),
+            source_uri: Some("file:///local/blob".to_string()),
+            source_mtime: None,
+            source_size: Some(5),
+            source_fingerprint: Some("fingerprint".to_string()),
+            parser_version: Some("parser".to_string()),
+            session_created_at: None,
+            session_updated_at: None,
+            model: Some("model".to_string()),
+            input_tokens: Some(1),
+            output_tokens: Some(2),
+            repo_path: Some("/repo".to_string()),
+            branch: Some("main".to_string()),
+            files_changed: Some(1),
+            lines_added: Some(2),
+            lines_removed: Some(0),
+            touched_files: vec!["src/lib.rs".to_string()],
+            metadata_json: None,
+            normalized_chunks: vec![serde_json::json!({
+                "chunk_id": "chunk-1",
+                "session_id": "session-1",
+                "action_type": "message",
+                "function": "assistant",
+                "args": {},
+                "result": {"content": "done"},
+                "created_at": "2026-01-01T00:00:00Z"
+            })],
+        }
+    }
+
+    #[test]
     fn dry_run_pull_dedupes_without_writing_inbound_events() {
         let repo_root = temp_repo_root("dry-run-pull");
         let store = LocalStore::new(&repo_root);
@@ -387,6 +669,22 @@ mod tests {
     }
 
     #[test]
+    fn scoped_events_tags_repo_and_org_for_upload() {
+        let scoped = scoped_events(vec![event("queued")], Some("repo-a"), Some("org_shared"))
+            .expect("scope events");
+
+        assert_eq!(scoped[0].repo_id.as_deref(), Some("repo-a"));
+        assert_eq!(
+            scoped[0]
+                .org_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("org_shared")
+        );
+    }
+
+    #[test]
     fn push_dry_run_does_not_require_login() {
         // A dry-run push must work for anyone (it makes no network call and sends
         // no token), so it returns Ok even with no identity on disk.
@@ -397,6 +695,7 @@ mod tests {
             &store,
             true,
             Some("http://127.0.0.1:7821".to_string()),
+            None,
             None,
         );
         assert!(

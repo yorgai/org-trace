@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 mod agent;
 mod args;
 mod claude_hook;
-mod defaults;
 mod history;
 mod mcp;
 mod mcp_config;
@@ -25,7 +24,8 @@ use args::{
 use args::SyncCommand;
 #[cfg(feature = "sync")]
 use brick_sync::{
-    auto_pull_best_effort, auto_push_best_effort, handle_pull, handle_push, handle_sync, identity,
+    auto_pull_best_effort, auto_push_best_effort, handle_accept_invites, handle_create_org,
+    handle_invite, handle_pull, handle_push, handle_sync, identity,
 };
 
 fn main() -> Result<()> {
@@ -77,16 +77,23 @@ fn main() -> Result<()> {
         Command::HookExplain => metadata::run_explain_hook(&store)?,
         #[cfg(feature = "sync")]
         Command::Sync { command } => match command {
-            SyncCommand::Run(args) => handle_sync(&store, args.dry_run, args.remote, args.repo_id)?,
+            SyncCommand::Run(args) => {
+                handle_sync(&store, args.dry_run, args.remote, args.repo_id, args.org_id)?
+            }
             SyncCommand::Push(args) => {
-                handle_push(&store, args.dry_run, args.remote, args.repo_id)?
+                handle_push(&store, args.dry_run, args.remote, args.repo_id, args.org_id)?
             }
             SyncCommand::Pull(args) => {
                 handle_pull(&store, args.dry_run, args.remote, args.repo_id)?
             }
-            SyncCommand::Login(args) => handle_sync_login(args.email, args.code)?,
+            SyncCommand::Login(args) => {
+                handle_sync_login(args.email, args.code, args.callback_url)?
+            }
             SyncCommand::Logout => handle_sync_logout()?,
             SyncCommand::Whoami => handle_sync_whoami()?,
+            SyncCommand::CreateOrg(args) => handle_create_org(args.org_id)?,
+            SyncCommand::Invite(args) => handle_invite(args.org_id, args.email)?,
+            SyncCommand::AcceptInvites => handle_accept_invites()?,
         },
     }
 
@@ -146,7 +153,23 @@ fn handle_setup(args: SetupArgs) -> Result<()> {
 }
 
 #[cfg(feature = "sync")]
-fn handle_sync_login(email: String, code: Option<String>) -> Result<()> {
+fn handle_sync_login(
+    email: Option<String>,
+    code: Option<String>,
+    callback_url: Option<String>,
+) -> Result<()> {
+    if let Some(callback_url) = callback_url {
+        if email.is_some() || code.is_some() {
+            anyhow::bail!("--callback-url cannot be combined with --email or --code");
+        }
+        let identity = identity::save_magic_link_callback(&callback_url)?;
+        println!("logged_in=true");
+        println!("user_id={}", identity.user_id);
+        println!("email={}", identity.email.as_deref().unwrap_or(""));
+        return Ok(());
+    }
+
+    let email = email.context("sync login requires --email or --callback-url")?;
     match code {
         Some(code) => {
             let identity = identity::verify_email_otp(&email, &code)?;

@@ -125,15 +125,39 @@ pub enum SyncCommand {
     Login(LoginArgs),
     Logout,
     Whoami,
+    /// Create a Supabase-backed Brick org and make this account owner.
+    CreateOrg(CreateOrgArgs),
+    /// Invite an email address into a Supabase-backed Brick org.
+    Invite(InviteArgs),
+    /// Accept pending Supabase-backed Brick org invites for this account.
+    AcceptInvites,
 }
 
 #[cfg(feature = "sync")]
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     #[arg(long)]
-    pub email: String,
+    pub email: Option<String>,
     #[arg(long)]
     pub code: Option<String>,
+    #[arg(long)]
+    pub callback_url: Option<String>,
+}
+
+#[cfg(feature = "sync")]
+#[derive(Debug, Args)]
+pub struct CreateOrgArgs {
+    #[arg(long)]
+    pub org_id: String,
+}
+
+#[cfg(feature = "sync")]
+#[derive(Debug, Args)]
+pub struct InviteArgs {
+    #[arg(long)]
+    pub org_id: String,
+    #[arg(long)]
+    pub email: String,
 }
 
 #[cfg(feature = "sync")]
@@ -145,6 +169,8 @@ pub struct SyncArgs {
     pub remote: Option<String>,
     #[arg(long)]
     pub repo_id: Option<String>,
+    #[arg(long, env = "BRICK_SYNC_ORG_ID")]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
