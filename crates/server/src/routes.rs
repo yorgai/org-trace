@@ -1,8 +1,9 @@
 //! HTTP routes for the self-hosted trace server.
 //!
-//! The sync surface is intentionally unauthenticated and append-only so the
-//! protocol can be exercised locally before authorization is designed. Repo IDs
-//! are route/query boundaries only, not auth scopes yet.
+//! The sync surface is append-only and can run open for local experiments or
+//! behind bearer auth. Repo IDs are route/query boundaries; with Supabase Auth
+//! enabled, repo-scoped routes are additionally owned by the first user that
+//! pushes to that repo.
 
 use std::{path::PathBuf, process::Stdio, sync::Arc};
 
@@ -20,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Command;
 
-use crate::auth::{self, AuditLog, AuthedIdentity, TokenStore};
+use crate::auth::{self, AuditLog, AuthKind, AuthedIdentity, TokenStore};
 use crate::index::{
     query_server_sessions, rebuild_server_index, server_index_status, ServerIndexStatus,
     ServerSessionQuery, ServerSessionsResponse,
@@ -40,6 +41,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct AuthConfig {
     tokens: Arc<TokenStore>,
+    supabase: Option<Arc<auth::SupabaseJwtVerifier>>,
     audit: Arc<AuditLog>,
     /// Whether any token has an `Org` scope, so the gate only pays the repo→org
     /// resolution cost when it can actually affect an authorization decision.
@@ -49,10 +51,15 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn new(tokens: TokenStore, audit: AuditLog) -> Self {
+    pub fn new(
+        tokens: TokenStore,
+        supabase: Option<auth::SupabaseJwtVerifier>,
+        audit: AuditLog,
+    ) -> Self {
         let needs_org_resolution = tokens.has_org_scope();
         Self {
             tokens: Arc::new(tokens),
+            supabase: supabase.map(Arc::new),
             audit: Arc::new(audit),
             needs_org_resolution,
             store: None,
@@ -62,6 +69,24 @@ impl AuthConfig {
     fn with_store(mut self, store: Arc<ServerStore>) -> Self {
         self.store = Some(store);
         self
+    }
+
+    fn authorize(
+        &self,
+        token: &str,
+        target: &auth::ResourceTarget,
+        required: auth::Access,
+    ) -> Result<AuthedIdentity, auth::AuthDenial> {
+        match self.tokens.authorize(token, target, required) {
+            Ok(identity) => Ok(identity),
+            Err(auth::AuthDenial::UnknownToken) => self
+                .supabase
+                .as_ref()
+                .map_or(Err(auth::AuthDenial::UnknownToken), |supabase| {
+                    supabase.verify(token)
+                }),
+            Err(denial) => Err(denial),
+        }
     }
 }
 
@@ -194,7 +219,7 @@ async fn require_bearer_token(
         },
     );
     let required = auth::required_access(request.method());
-    match auth.tokens.authorize(token, &target, required) {
+    match auth.authorize(token, &target, required) {
         Ok(identity) => {
             if required == auth::Access::Write {
                 auth.audit.record(&auth::AuditEntry {
@@ -253,8 +278,10 @@ async fn list_events(
 async fn list_repo_events(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
+    identity: Option<Extension<AuthedIdentity>>,
     Query(query): Query<ListEventsQuery>,
 ) -> std::result::Result<Json<ListEventsResponse>, (StatusCode, String)> {
+    enforce_repo_owner(identity.as_deref(), &state, &repo_id, false)?;
     let response = state
         .store
         .list_events_page(Some(&repo_id), query.after.as_deref(), query.limit)
@@ -281,12 +308,40 @@ async fn push_repo_events(
     identity: Option<Extension<AuthedIdentity>>,
     Json(request): Json<PushEventsRequest>,
 ) -> std::result::Result<Json<PushEventsResponse>, (StatusCode, String)> {
-    enforce_actor_binding(identity.as_deref(), &request.events)?;
+    let identity_ref = identity.as_deref();
+    enforce_repo_owner(identity_ref, &state, &repo_id, true)?;
+    enforce_actor_binding(identity_ref, &request.events)?;
     let response = state
         .store
         .append_events_for_repo(Some(&repo_id), &request.events)
         .map_err(route_error)?;
     Ok(Json(response))
+}
+
+fn enforce_repo_owner(
+    identity: Option<&AuthedIdentity>,
+    state: &AppState,
+    repo_id: &str,
+    claim_if_missing: bool,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let Some(AuthKind::Supabase { user_id, .. }) = identity.map(|identity| &identity.kind) else {
+        return Ok(());
+    };
+    match state.store.resolve_repo_owner(repo_id) {
+        Some(owner) if owner == *user_id => Ok(()),
+        Some(_) => Err((
+            StatusCode::FORBIDDEN,
+            "repo is owned by a different Supabase user".to_string(),
+        )),
+        None if claim_if_missing => state
+            .store
+            .claim_repo_owner(repo_id, user_id)
+            .map_err(route_error),
+        None => Err((
+            StatusCode::FORBIDDEN,
+            "repo has not been claimed by this Supabase user".to_string(),
+        )),
+    }
 }
 
 /// Enforces a token's bound actor against the events it is pushing.
@@ -741,6 +796,8 @@ mod tests {
         ActorRef, ActorType, MissionCreatedPayload, MissionId, MissionStatus, ProjectId, TraceEvent,
     };
     use chrono::Utc;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::Serialize;
     use tower::ServiceExt;
 
     use super::*;
@@ -771,6 +828,42 @@ mod tests {
         .expect("mission event");
         event.repo_id = repo_id.map(ToString::to_string);
         event
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TestClaims<'a> {
+        sub: &'a str,
+        email: &'a str,
+        iss: &'a str,
+        exp: usize,
+    }
+
+    fn supabase_auth(secret: &str) -> AuthConfig {
+        AuthConfig::new(
+            TokenStore::default(),
+            Some(
+                auth::SupabaseJwtVerifier::new(
+                    "https://brick-example.supabase.co".to_string(),
+                    secret.to_string(),
+                )
+                .expect("supabase verifier"),
+            ),
+            AuditLog::new(&temp_data_dir("supabase-audit")),
+        )
+    }
+
+    fn supabase_token(secret: &str, user_id: &str) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &TestClaims {
+                sub: user_id,
+                email: "user@example.com",
+                iss: "https://brick-example.supabase.co/auth/v1",
+                exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
     }
 
     #[tokio::test]
@@ -856,6 +949,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supabase_repo_owner_claims_on_first_push_and_blocks_other_users() {
+        let store = ServerStore::new(temp_data_dir("supabase-owner"));
+        let app = build_router(store, None, Some(supabase_auth("jwt-secret")));
+        let user_one = supabase_token("jwt-secret", "user-1");
+        let user_two = supabase_token("jwt-secret", "user-2");
+        let request = PushEventsRequest {
+            events: vec![event(None)],
+        };
+        let body = serde_json::to_vec(&request).expect("serialize request");
+
+        let first_push = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/repos/repo-a/events")
+                    .header("content-type", "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_one}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("first push");
+        assert_eq!(first_push.status(), StatusCode::OK);
+
+        let read_as_owner = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/repos/repo-a/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_one}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("owner read");
+        assert_eq!(read_as_owner.status(), StatusCode::OK);
+
+        let read_as_other = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/repos/repo-a/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_two}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("other read");
+        assert_eq!(read_as_other.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn repo_events_route_rejects_mismatched_repo() {
         let store = ServerStore::new(temp_data_dir("repo-mismatch"));
         let app = build_router(store, None, None);
@@ -888,6 +1035,7 @@ mod tests {
             None,
             Some(AuthConfig::new(
                 crate::auth::single_token_store("s3cret"),
+                None,
                 crate::auth::AuditLog::new(&audit_dir),
             )),
         );
@@ -976,6 +1124,7 @@ mod tests {
         let unbound = AuthedIdentity {
             label: "admin".to_string(),
             actor_id: None,
+            kind: crate::auth::AuthKind::LocalToken,
         };
         assert!(enforce_actor_binding(Some(&unbound), &[event_with_actor("anyone")]).is_ok());
     }
@@ -985,6 +1134,7 @@ mod tests {
         let bound = AuthedIdentity {
             label: "agent-ci".to_string(),
             actor_id: Some("agent-ci".to_string()),
+            kind: crate::auth::AuthKind::LocalToken,
         };
         // Matching actor passes.
         assert!(enforce_actor_binding(Some(&bound), &[event_with_actor("agent-ci")]).is_ok());
@@ -1010,7 +1160,7 @@ mod tests {
             expires_at: None,
             actor_id: Some("agent-ci".to_string()),
         });
-        AuthConfig::new(tokens, AuditLog::new(data_dir))
+        AuthConfig::new(tokens, None, AuditLog::new(data_dir))
     }
 
     async fn push_with_token(app: &Router, token: &str, actor_id: &str) -> StatusCode {

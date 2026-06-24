@@ -15,7 +15,7 @@ pub mod identity;
 pub mod wire;
 
 use anyhow::{Context, Result};
-use brick_core::LocalStore;
+use brick_core::{repo_id_for_root, LocalStore};
 use brick_protocol::TraceEvent;
 
 pub use identity::{is_logged_in, Identity};
@@ -23,6 +23,61 @@ pub use wire::{EventCursor, ListEventsResponse, PushEventsRequest, PushEventsRes
 
 const DEFAULT_REMOTE: &str = "http://127.0.0.1:7821";
 const PULL_PAGE_LIMIT: usize = 500;
+const AUTO_SYNC_REMOTE_ENV: &str = "BRICK_AUTO_SYNC_REMOTE";
+const AUTO_SYNC_DISABLE_ENV: &str = "BRICK_AUTO_SYNC_DISABLE";
+
+pub fn auto_pull_best_effort(store: &LocalStore) {
+    if auto_sync_disabled() {
+        return;
+    }
+    let _ = auto_pull(store);
+}
+
+pub fn auto_push_best_effort(store: &LocalStore) {
+    if auto_sync_disabled() {
+        return;
+    }
+    let _ = auto_push(store);
+}
+
+fn auto_pull(store: &LocalStore) -> Result<()> {
+    let identity = identity::refresh_if_needed()?;
+    let remote = auto_sync_remote();
+    let response = get_all_events_from_remote(
+        &remote,
+        Some(&repo_id_for_root(store.repo_root())),
+        Some(&identity.access_token),
+    )?;
+    let _ = pull_events(store, response.events, false)?;
+    Ok(())
+}
+
+fn auto_push(store: &LocalStore) -> Result<()> {
+    let events = store.read_queued_events()?;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let identity = identity::refresh_if_needed()?;
+    let request = PushEventsRequest { events };
+    let _ = push_events_to_remote(
+        &auto_sync_remote(),
+        Some(&repo_id_for_root(store.repo_root())),
+        &request,
+        Some(&identity.access_token),
+    )?;
+    Ok(())
+}
+
+fn auto_sync_remote() -> String {
+    normalized_remote(std::env::var(AUTO_SYNC_REMOTE_ENV).ok())
+}
+
+fn auto_sync_disabled() -> bool {
+    matches!(
+        std::env::var(AUTO_SYNC_DISABLE_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
 
 /// Handles `push` by posting queued events without draining the local queue.
 ///
@@ -72,7 +127,10 @@ pub fn handle_pull(
     repo_id: Option<String>,
 ) -> Result<()> {
     let remote = normalized_remote(remote);
-    let response = get_all_events_from_remote(&remote, repo_id.as_deref())?;
+    let identity = identity::refresh_if_needed()
+        .context("pull requires a Brick account. Run `brick sync login` first")?;
+    let response =
+        get_all_events_from_remote(&remote, repo_id.as_deref(), Some(&identity.access_token))?;
     let outcome = pull_events(store, response.events, dry_run)?;
     print_pull_result(&remote, repo_id.as_deref(), dry_run, &outcome);
     Ok(())
@@ -191,11 +249,15 @@ fn push_events_to_remote(
         .with_context(|| format!("failed to decode push response from {url}"))
 }
 
-fn get_all_events_from_remote(remote: &str, repo_id: Option<&str>) -> Result<ListEventsResponse> {
+fn get_all_events_from_remote(
+    remote: &str,
+    repo_id: Option<&str>,
+    bearer: Option<&str>,
+) -> Result<ListEventsResponse> {
     let mut events = Vec::new();
     let mut after: Option<EventCursor> = None;
     loop {
-        let response = get_events_page_from_remote(remote, repo_id, after.as_deref())?;
+        let response = get_events_page_from_remote(remote, repo_id, after.as_deref(), bearer)?;
         events.extend(response.events);
         match response.next_cursor {
             Some(next_cursor) => after = Some(next_cursor),
@@ -208,9 +270,14 @@ fn get_events_page_from_remote(
     remote: &str,
     repo_id: Option<&str>,
     after: Option<&str>,
+    bearer: Option<&str>,
 ) -> Result<ListEventsResponse> {
     let url = events_page_url(remote, repo_id, after);
-    let mut response = ureq::get(&url)
+    let mut builder = ureq::get(&url);
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", &format!("Bearer {token}"));
+    }
+    let mut response = builder
         .call()
         .with_context(|| format!("failed to GET events from {url}"))?;
     response
@@ -300,6 +367,23 @@ mod tests {
             .read_inbound_events()
             .expect("read inbound")
             .is_empty());
+    }
+
+    #[test]
+    fn auto_sync_env_controls_remote_and_disable_flag() {
+        std::env::set_var(AUTO_SYNC_REMOTE_ENV, "http://127.0.0.1:7821///");
+        assert_eq!(auto_sync_remote(), "http://127.0.0.1:7821");
+        std::env::remove_var(AUTO_SYNC_REMOTE_ENV);
+
+        std::env::remove_var(AUTO_SYNC_DISABLE_ENV);
+        assert!(!auto_sync_disabled());
+        std::env::set_var(AUTO_SYNC_DISABLE_ENV, "1");
+        assert!(auto_sync_disabled());
+        std::env::set_var(AUTO_SYNC_DISABLE_ENV, "true");
+        assert!(auto_sync_disabled());
+        std::env::set_var(AUTO_SYNC_DISABLE_ENV, "0");
+        assert!(!auto_sync_disabled());
+        std::env::remove_var(AUTO_SYNC_DISABLE_ENV);
     }
 
     #[test]

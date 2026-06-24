@@ -103,6 +103,18 @@ pub enum SyncCommand {
     Run(SyncArgs),
     Push(SyncArgs),
     Pull(SyncArgs),
+    Login(LoginArgs),
+    Logout,
+    Whoami,
+}
+
+#[cfg(feature = "sync")]
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    #[arg(long)]
+    pub email: String,
+    #[arg(long)]
+    pub code: Option<String>,
 }
 
 #[cfg(feature = "sync")]

@@ -32,10 +32,13 @@ async fn main() -> Result<()> {
             brick_bin,
             repo_root,
             auth_token,
+            supabase_url,
+            supabase_jwt_secret,
         } => {
             let history_bridge =
                 enable_local_history.then(|| LocalHistoryBridge::new(brick_bin, repo_root));
-            let auth = resolve_serve_auth(&data_dir, auth_token)?;
+            let auth =
+                resolve_serve_auth(&data_dir, auth_token, supabase_url, supabase_jwt_secret)?;
             serve(bind, ServerStore::new(data_dir), history_bridge, auth).await?
         }
         Command::RebuildIndex { data_dir, repo_id } => {
@@ -77,6 +80,8 @@ async fn main() -> Result<()> {
 fn resolve_serve_auth(
     data_dir: &std::path::Path,
     auth_token: Option<String>,
+    supabase_url: Option<String>,
+    supabase_jwt_secret: Option<String>,
 ) -> Result<Option<AuthConfig>> {
     let mut tokens = TokenStore::load(data_dir)?;
     if let Some(plaintext) = auth_token.filter(|token| !token.is_empty()) {
@@ -89,10 +94,20 @@ fn resolve_serve_auth(
             actor_id: None,
         });
     }
-    if tokens.is_empty() {
+    let supabase = match (supabase_url, supabase_jwt_secret) {
+        (Some(url), Some(secret)) if !url.trim().is_empty() && !secret.trim().is_empty() => {
+            Some(auth::SupabaseJwtVerifier::new(url, secret)?)
+        }
+        _ => None,
+    };
+    if tokens.is_empty() && supabase.is_none() {
         Ok(None)
     } else {
-        Ok(Some(AuthConfig::new(tokens, auth::AuditLog::new(data_dir))))
+        Ok(Some(AuthConfig::new(
+            tokens,
+            supabase,
+            auth::AuditLog::new(data_dir),
+        )))
     }
 }
 
@@ -226,7 +241,7 @@ mod tests {
             "brick-serve-auth-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let auth = resolve_serve_auth(&dir, None).expect("resolve");
+        let auth = resolve_serve_auth(&dir, None, None, None).expect("resolve");
         assert!(auth.is_none());
     }
 
@@ -236,7 +251,8 @@ mod tests {
             "brick-serve-auth-flag-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let auth = resolve_serve_auth(&dir, Some("secret".to_string())).expect("resolve");
+        let auth =
+            resolve_serve_auth(&dir, Some("secret".to_string()), None, None).expect("resolve");
         assert!(auth.is_some());
     }
 

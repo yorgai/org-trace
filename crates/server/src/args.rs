@@ -34,6 +34,13 @@ pub enum Command {
         /// `/health`. When unset the server stays open (append-only MVP).
         #[arg(long, env = "BRICK_SERVER_AUTH_TOKEN")]
         auth_token: Option<String>,
+        /// Supabase project URL used to validate JWT issuer. Required together
+        /// with `--supabase-jwt-secret` to accept Supabase bearer tokens.
+        #[arg(long, env = "BRICK_SUPABASE_URL")]
+        supabase_url: Option<String>,
+        /// Supabase project's JWT secret for HS256 access-token verification.
+        #[arg(long, env = "BRICK_SUPABASE_JWT_SECRET")]
+        supabase_jwt_secret: Option<String>,
     },
     RebuildIndex {
         #[arg(long, default_value = ".brick-server")]

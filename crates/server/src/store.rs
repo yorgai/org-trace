@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 const SERVER_EVENTS_FILE: &str = "events.jsonl";
 const REPO_ORG_FILE: &str = "repo_org.json";
+const REPO_OWNER_FILE: &str = "repo_owner.json";
 const DEFAULT_EVENT_LIMIT: usize = 100;
 const MAX_EVENT_LIMIT: usize = 1000;
 
@@ -34,6 +35,7 @@ const MAX_EVENT_LIMIT: usize = 1000;
 pub struct ServerStore {
     data_dir: PathBuf,
     repo_org: Arc<RwLock<RepoOrgProjection>>,
+    repo_owner: Arc<RwLock<RepoOwnerProjection>>,
 }
 
 /// In-memory cache of the persisted repo→org projection. `loaded` is `None`
@@ -41,6 +43,11 @@ pub struct ServerStore {
 /// event log), then holds the full map for the process lifetime.
 #[derive(Debug, Default)]
 struct RepoOrgProjection {
+    loaded: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default)]
+struct RepoOwnerProjection {
     loaded: Option<BTreeMap<String, String>>,
 }
 
@@ -56,6 +63,7 @@ impl ServerStore {
         Self {
             data_dir: data_dir.into(),
             repo_org: Arc::new(RwLock::new(RepoOrgProjection::default())),
+            repo_owner: Arc::new(RwLock::new(RepoOwnerProjection::default())),
         }
     }
 
@@ -214,6 +222,31 @@ impl ServerStore {
         guard.loaded.as_ref()?.get(repo_id).cloned()
     }
 
+    pub fn resolve_repo_owner(&self, repo_id: &str) -> Option<String> {
+        if let Ok(guard) = self.repo_owner.read() {
+            if let Some(map) = guard.loaded.as_ref() {
+                return map.get(repo_id).cloned();
+            }
+        }
+        self.ensure_repo_owner_loaded().ok()?;
+        let guard = self.repo_owner.read().ok()?;
+        guard.loaded.as_ref()?.get(repo_id).cloned()
+    }
+
+    pub fn claim_repo_owner(&self, repo_id: &str, user_id: &str) -> Result<()> {
+        self.ensure_repo_owner_loaded()?;
+        let mut guard = self
+            .repo_owner
+            .write()
+            .map_err(|_| anyhow!("repo→owner cache lock poisoned"))?;
+        let map = guard.loaded.get_or_insert_with(BTreeMap::new);
+        if !map.contains_key(repo_id) {
+            map.insert(repo_id.to_string(), user_id.to_string());
+            self.write_repo_owner_file(map)?;
+        }
+        Ok(())
+    }
+
     /// Populates the in-memory repo→org cache if it has not been loaded yet,
     /// preferring the persisted file and falling back to rebuilding from the log
     /// (which also writes the file so subsequent starts are cheap).
@@ -270,35 +303,79 @@ impl ServerStore {
         Ok(())
     }
 
+    fn ensure_repo_owner_loaded(&self) -> Result<()> {
+        {
+            let guard = self
+                .repo_owner
+                .read()
+                .map_err(|_| anyhow!("repo→owner cache lock poisoned"))?;
+            if guard.loaded.is_some() {
+                return Ok(());
+            }
+        }
+        let map = self.load_repo_owner_file()?.unwrap_or_default();
+        let mut guard = self
+            .repo_owner
+            .write()
+            .map_err(|_| anyhow!("repo→owner cache lock poisoned"))?;
+        if guard.loaded.is_none() {
+            guard.loaded = Some(map);
+        }
+        Ok(())
+    }
+
     /// Reads the persisted repo→org file, returning `None` when it is absent so
     /// the caller can rebuild from the log.
     fn load_repo_org_file(&self) -> Result<Option<BTreeMap<String, String>>> {
-        let path = self.repo_org_path();
+        self.load_projection_file(self.repo_org_path(), "repo→org")
+    }
+
+    fn load_repo_owner_file(&self) -> Result<Option<BTreeMap<String, String>>> {
+        self.load_projection_file(self.repo_owner_path(), "repo→owner")
+    }
+
+    fn load_projection_file(
+        &self,
+        path: PathBuf,
+        label: &str,
+    ) -> Result<Option<BTreeMap<String, String>>> {
         if !path.exists() {
             return Ok(None);
         }
         let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read repo→org map at {}", path.display()))?;
+            .with_context(|| format!("failed to read {label} map at {}", path.display()))?;
         if contents.trim().is_empty() {
             return Ok(Some(BTreeMap::new()));
         }
         let map = serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse repo→org map at {}", path.display()))?;
+            .with_context(|| format!("failed to parse {label} map at {}", path.display()))?;
         Ok(Some(map))
     }
 
     /// Writes the repo→org file atomically (temp file + rename) so a crash
     /// mid-write cannot leave a truncated map.
     fn write_repo_org_file(&self, map: &BTreeMap<String, String>) -> Result<()> {
+        self.write_projection_file(self.repo_org_path(), map, "repo→org")
+    }
+
+    fn write_repo_owner_file(&self, map: &BTreeMap<String, String>) -> Result<()> {
+        self.write_projection_file(self.repo_owner_path(), map, "repo→owner")
+    }
+
+    fn write_projection_file(
+        &self,
+        path: PathBuf,
+        map: &BTreeMap<String, String>,
+        label: &str,
+    ) -> Result<()> {
         self.init()?;
-        let path = self.repo_org_path();
         let tmp = path.with_extension("json.tmp");
-        let serialized =
-            serde_json::to_string_pretty(map).context("failed to serialize repo→org map")?;
+        let serialized = serde_json::to_string_pretty(map)
+            .with_context(|| format!("failed to serialize {label} map"))?;
         fs::write(&tmp, serialized)
-            .with_context(|| format!("failed to write repo→org map at {}", tmp.display()))?;
+            .with_context(|| format!("failed to write {label} map at {}", tmp.display()))?;
         fs::rename(&tmp, &path)
-            .with_context(|| format!("failed to commit repo→org map at {}", path.display()))?;
+            .with_context(|| format!("failed to commit {label} map at {}", path.display()))?;
         Ok(())
     }
 
@@ -350,6 +427,10 @@ impl ServerStore {
 
     fn repo_org_path(&self) -> PathBuf {
         self.data_dir.join(REPO_ORG_FILE)
+    }
+
+    fn repo_owner_path(&self) -> PathBuf {
+        self.data_dir.join(REPO_OWNER_FILE)
     }
 }
 
@@ -541,6 +622,31 @@ mod tests {
         assert_eq!(
             store.resolve_repo_org("repo-a"),
             Some(first_org.to_string())
+        );
+    }
+
+    #[test]
+    fn repo_owner_projection_claims_first_user_and_persists() {
+        let dir = temp_data_dir("repo-owner");
+        let store = ServerStore::new(&dir);
+        assert_eq!(store.resolve_repo_owner("repo-a"), None);
+        store
+            .claim_repo_owner("repo-a", "user-1")
+            .expect("claim owner");
+        store
+            .claim_repo_owner("repo-a", "user-2")
+            .expect("second claim is ignored");
+
+        assert_eq!(
+            store.resolve_repo_owner("repo-a"),
+            Some("user-1".to_string())
+        );
+        assert!(dir.join(REPO_OWNER_FILE).exists());
+
+        let reopened = ServerStore::new(&dir);
+        assert_eq!(
+            reopened.resolve_repo_owner("repo-a"),
+            Some("user-1".to_string())
         );
     }
 

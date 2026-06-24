@@ -30,6 +30,9 @@ use serde_json::{json, Value};
 
 use crate::history::build_live_broadcast;
 
+#[cfg(feature = "sync")]
+use brick_sync::{auto_pull_best_effort, auto_push_best_effort};
+
 /// MCP protocol revision this server speaks.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -539,6 +542,9 @@ fn explain_tool_call(
     };
     let store = &store;
 
+    #[cfg(feature = "sync")]
+    auto_pull_best_effort(store);
+
     // Zero-config freshness: refresh this repo's source index before reading, so
     // a change the agent just made is visible without the user ever running a
     // CLI refresh. Best-effort + throttled — never blocks or fails the read.
@@ -760,6 +766,8 @@ in the working tree), or pass an `effect` that names an existing event/commit."
     )
     .map_err(|err| anyhow::anyhow!("invalid causal edge: {err}"))?;
     store.append_event(&event)?;
+    #[cfg(feature = "sync")]
+    auto_push_best_effort(store);
 
     Ok(json!({
         "linked": true,
@@ -836,7 +844,16 @@ fn capture_working_diff_event(
     )?;
     let event_id = event.event_id;
     store.append_event(&event)?;
+    #[cfg(feature = "sync")]
+    auto_push_best_effort(store);
     Ok(Some(event_id))
+}
+
+fn append_event(store: &LocalStore, event: &TraceEvent) -> Result<()> {
+    store.append_event(event)?;
+    #[cfg(feature = "sync")]
+    auto_push_best_effort(store);
+    Ok(())
 }
 
 /// Planning-surface dispatch (mission / artifact tools).
@@ -919,7 +936,7 @@ fn dispatch_planning(store: &LocalStore, name: &str, args: &Value) -> Result<Val
                     repo_context_id: None,
                 },
             )?;
-            store.append_event(&event)?;
+            append_event(store, &event)?;
             json!({
                 "recorded": true,
                 "artifact_id": artifact_id.to_string(),
@@ -949,7 +966,7 @@ fn dispatch_planning(store: &LocalStore, name: &str, args: &Value) -> Result<Val
                     repo_context_id: None,
                 },
             )?;
-            store.append_event(&event)?;
+            append_event(store, &event)?;
             json!({ "attached": true, "artifact_id": artifact_id.to_string() })
         }
         other => return Err(anyhow::anyhow!("unknown planning tool: {other}")),
@@ -978,7 +995,7 @@ fn dispatch_mission(store: &LocalStore, args: &Value) -> Result<Value> {
                     repo_context_id: None,
                 },
             )?;
-            store.append_event(&event)?;
+            append_event(store, &event)?;
             Ok(json!({
                 "created": true,
                 "mission_id": mission_id.to_string(),
@@ -1020,7 +1037,7 @@ fn dispatch_mission(store: &LocalStore, args: &Value) -> Result<Value> {
                     repo_context_id: None,
                 },
             )?;
-            store.append_event(&event)?;
+            append_event(store, &event)?;
             Ok(json!({ "updated": true, "mission_id": mission_id.to_string() }))
         }
         other => Err(anyhow::anyhow!(

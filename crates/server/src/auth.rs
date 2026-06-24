@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -271,10 +272,54 @@ impl TokenStore {
             Ok(AuthedIdentity {
                 label: record.label.clone(),
                 actor_id: record.actor_id.clone(),
+                kind: AuthKind::LocalToken,
             })
         } else {
             Err(AuthDenial::Forbidden)
         }
+    }
+}
+
+/// Verifies Supabase Auth access tokens signed with the project's HS256 JWT secret.
+#[derive(Clone)]
+pub struct SupabaseJwtVerifier {
+    decoding_key: DecodingKey,
+    validation: Validation,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SupabaseClaims {
+    sub: String,
+    email: Option<String>,
+}
+
+impl SupabaseJwtVerifier {
+    pub fn new(project_url: String, jwt_secret: String) -> Result<Self> {
+        let issuer = format!("{}/auth/v1", project_url.trim_end_matches('/'));
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&[issuer.as_str()]);
+        validation.validate_aud = false;
+        Ok(Self {
+            decoding_key: DecodingKey::from_secret(jwt_secret.as_bytes()),
+            validation,
+        })
+    }
+
+    pub fn verify(&self, token: &str) -> Result<AuthedIdentity, AuthDenial> {
+        let claims = decode::<SupabaseClaims>(token, &self.decoding_key, &self.validation)
+            .map_err(|_| AuthDenial::UnknownToken)?
+            .claims;
+        if claims.sub.trim().is_empty() {
+            return Err(AuthDenial::UnknownToken);
+        }
+        Ok(AuthedIdentity {
+            label: format!("supabase:{}", claims.sub),
+            actor_id: None,
+            kind: AuthKind::Supabase {
+                user_id: claims.sub,
+                email: claims.email,
+            },
+        })
     }
 }
 
@@ -285,6 +330,16 @@ impl TokenStore {
 pub struct AuthedIdentity {
     pub label: String,
     pub actor_id: Option<String>,
+    pub kind: AuthKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthKind {
+    LocalToken,
+    Supabase {
+        user_id: String,
+        email: Option<String>,
+    },
 }
 
 /// Reason an authorization attempt failed.
@@ -512,6 +567,84 @@ fn describe_scope(scope: &Scope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    #[derive(Debug, Serialize)]
+    struct TestClaims<'a> {
+        sub: &'a str,
+        email: &'a str,
+        iss: &'a str,
+        exp: usize,
+    }
+
+    const TEST_SUPABASE_ISSUER: &str = "https://brick-example.supabase.co/auth/v1";
+
+    fn test_supabase_token(secret: &str, subject: &str, exp: usize) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &TestClaims {
+                sub: subject,
+                email: "user@example.com",
+                iss: TEST_SUPABASE_ISSUER,
+                exp,
+            },
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
+
+    #[test]
+    fn supabase_verifier_accepts_valid_access_token() {
+        let verifier = SupabaseJwtVerifier::new(
+            "https://brick-example.supabase.co".to_string(),
+            "jwt-secret".to_string(),
+        )
+        .expect("verifier");
+        let token = test_supabase_token(
+            "jwt-secret",
+            "user-123",
+            (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        );
+
+        let identity = verifier.verify(&token).expect("verify");
+        assert_eq!(identity.actor_id, None);
+        assert_eq!(identity.label, "supabase:user-123");
+        assert_eq!(
+            identity.kind,
+            AuthKind::Supabase {
+                user_id: "user-123".to_string(),
+                email: Some("user@example.com".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn supabase_verifier_rejects_wrong_secret_and_expired_token() {
+        let verifier = SupabaseJwtVerifier::new(
+            "https://brick-example.supabase.co".to_string(),
+            "jwt-secret".to_string(),
+        )
+        .expect("verifier");
+        let wrong_secret = test_supabase_token(
+            "other-secret",
+            "user-123",
+            (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        );
+        assert_eq!(
+            verifier.verify(&wrong_secret).expect_err("wrong secret"),
+            AuthDenial::UnknownToken
+        );
+
+        let expired = test_supabase_token(
+            "jwt-secret",
+            "user-123",
+            (Utc::now() - chrono::Duration::hours(1)).timestamp() as usize,
+        );
+        assert_eq!(
+            verifier.verify(&expired).expect_err("expired"),
+            AuthDenial::UnknownToken
+        );
+    }
 
     #[test]
     fn write_token_permits_read_and_write_in_scope() {

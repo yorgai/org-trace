@@ -22,7 +22,9 @@ use args::{Cli, Command};
 #[cfg(feature = "sync")]
 use args::SyncCommand;
 #[cfg(feature = "sync")]
-use brick_sync::{handle_pull, handle_push, handle_sync};
+use brick_sync::{
+    auto_pull_best_effort, auto_push_best_effort, handle_pull, handle_push, handle_sync, identity,
+};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -74,9 +76,58 @@ fn main() -> Result<()> {
             SyncCommand::Pull(args) => {
                 handle_pull(&store, args.dry_run, args.remote, args.repo_id)?
             }
+            SyncCommand::Login(args) => handle_sync_login(args.email, args.code)?,
+            SyncCommand::Logout => handle_sync_logout()?,
+            SyncCommand::Whoami => handle_sync_whoami()?,
         },
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "sync")]
+fn handle_sync_login(email: String, code: Option<String>) -> Result<()> {
+    match code {
+        Some(code) => {
+            let identity = identity::verify_email_otp(&email, &code)?;
+            println!("logged_in=true");
+            println!("user_id={}", identity.user_id);
+            println!("email={}", identity.email.as_deref().unwrap_or(""));
+        }
+        None => {
+            identity::request_email_otp(&email)?;
+            println!("otp_sent=true");
+            println!("email={email}");
+            println!("run `brick sync login --email {email} --code <code>` to finish");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sync")]
+fn handle_sync_logout() -> Result<()> {
+    let removed = identity::clear()?;
+    println!("logged_out={removed}");
+    Ok(())
+}
+
+#[cfg(feature = "sync")]
+fn handle_sync_whoami() -> Result<()> {
+    match identity::refresh_if_needed() {
+        Ok(identity) => {
+            println!("logged_in=true");
+            println!("user_id={}", identity.user_id);
+            println!("email={}", identity.email.as_deref().unwrap_or(""));
+            println!(
+                "expires_at={}",
+                identity
+                    .expires_at
+                    .map(|expiry| expiry.to_rfc3339())
+                    .unwrap_or_default()
+            );
+        }
+        Err(_) => println!("logged_in=false"),
+    }
     Ok(())
 }
 
@@ -86,6 +137,8 @@ fn handle_explain(
     depth: Option<usize>,
     format: args::HistoryFormatArg,
 ) -> Result<()> {
+    #[cfg(feature = "sync")]
+    auto_pull_best_effort(store);
     history::ensure_json(format);
     history::refresh_repo_sources_best_effort(store.repo_root());
     let events = store.read_all_events()?;
@@ -182,6 +235,8 @@ fn handle_link(
         args.insert("session".to_string(), json!(value));
     }
     let value = mcp::link_for_cli(store, &Value::Object(args))?;
+    #[cfg(feature = "sync")]
+    auto_push_best_effort(store);
     history::print_json(&value)
 }
 

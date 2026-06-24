@@ -1,40 +1,56 @@
 # Self-hosting
 
-`brick-server` runs a small unauthenticated provenance remote for local and lab self-hosting. Do not expose it to untrusted networks until authentication and repo authorization are implemented.
+`brick-server` runs a small provenance remote for local and lab self-hosting. It can run open for localhost experiments, use the legacy self-hosted token table, or verify Supabase Auth JWTs for account-scoped sync.
 
 ## Run the server
+
+Open local server:
 
 ```bash
 cargo run -p brick-server -- serve --bind 127.0.0.1:7821 --data-dir .brick-server
 curl http://127.0.0.1:7821/health
 ```
 
-The server stores an append-only `events.jsonl` log under `--data-dir`. That log is the server source of truth. Query and index routes rebuild derived views from the log for the MVP.
+Supabase-authenticated server:
+
+```bash
+export BRICK_SUPABASE_URL="https://<project>.supabase.co"
+export BRICK_SUPABASE_JWT_SECRET="<project-jwt-secret>"
+cargo run -p brick-server -- serve --bind 127.0.0.1:7821 --data-dir .brick-server
+```
+
+The server verifies Supabase access-token JWTs with the project JWT secret. Repo-scoped routes are account-owned: the first Supabase user to push to `/v1/repos/{repo_id}/events` claims that repo on the server, and later Supabase reads/writes for that repo must use the same user. The append-only event store remains `events.jsonl` under `--data-dir`; Supabase is used for Auth in this phase, not as the event database.
 
 ## Push and pull
 
 The default sync payload is metadata-first: mission events, session metadata events, artifact metadata, diff summaries, references, hashes, and storage URIs. Large transcript files, recordings, screenshots, and uploaded attachments are represented by content-addressed references in events. Full blob transfer is explicit future work; do not assume `push` uploads every referenced byte.
 
-Use a repo ID when synchronizing a specific repository boundary:
+Use a repo ID when synchronizing a specific repository boundary. The sync CLI is feature-gated for private builds:
 
 ```bash
-cargo run -p brick -- sync push --remote http://127.0.0.1:7821 --repo-id repo-a --org-id org_local
-cargo run -p brick -- sync pull --remote http://127.0.0.1:7821 --repo-id repo-a --org-id org_local
-cargo run -p brick -- sync --remote http://127.0.0.1:7821 --repo-id repo-a --dry-run
+export BRICK_SUPABASE_URL="https://<project>.supabase.co"
+export BRICK_SUPABASE_ANON_KEY="<project-anon-key>"
+cargo run -p brick --features sync -- sync login --email you@example.com
+cargo run -p brick --features sync -- sync login --email you@example.com --code <otp-code>
+cargo run -p brick --features sync -- sync push --remote http://127.0.0.1:7821 --repo-id repo-a
+cargo run -p brick --features sync -- sync pull --remote http://127.0.0.1:7821 --repo-id repo-a
+cargo run -p brick --features sync -- sync run --remote http://127.0.0.1:7821 --repo-id repo-a --dry-run
 ```
 
 `push` posts local queued events and prints accepted, duplicate, and queued counts. It does not drain or delete the local queue. `pull` pages remote events, deduplicates by event ID against local queued and inbound events, and writes new remote events under the local inbound log. `sync` currently runs pull followed by non-draining push.
 
-Omit `--repo-id` only for the global compatibility endpoint:
+With a `--features sync` build and a logged-in Supabase session, Brick also performs best-effort automatic sync on the normal agent path: `explain` tries to pull before reading, and successful `link` / planning writes try to push after appending a local event. Automatic sync uses repo-scoped routes with `repo_id_for_root(repo_root)` and defaults to `http://127.0.0.1:7821`. Set `BRICK_AUTO_SYNC_REMOTE` to another server, or `BRICK_AUTO_SYNC_DISABLE=1` to turn the automatic pull/push attempts off.
+
+Omit `--repo-id` only for the global compatibility endpoint. Supabase account ownership is only enforced on repo-scoped routes, so production sync should prefer `--repo-id`.
 
 ```bash
-cargo run -p brick -- sync push --remote http://127.0.0.1:7821 --org-id org_local
-cargo run -p brick -- sync pull --remote http://127.0.0.1:7821 --org-id org_local
+cargo run -p brick --features sync -- sync push --remote http://127.0.0.1:7821
+cargo run -p brick --features sync -- sync pull --remote http://127.0.0.1:7821
 ```
 
 ## Repo ID behavior
 
-Repo IDs scope event lists and server-derived query views. On `POST /v1/repos/{repo_id}/events`, the server fills missing event `repo_id` values from the route and rejects mismatches. Repo IDs are not access-control boundaries yet.
+Repo IDs scope event lists and server-derived query views. On `POST /v1/repos/{repo_id}/events`, the server fills missing event `repo_id` values from the route and rejects mismatches. With Supabase JWT auth enabled, the first user to push a repo claims it in `repo_owner.json`; later Supabase reads/writes for that repo must present a token for the same user. Legacy local token-table auth keeps its explicit token scopes.
 
 Preferred repo-scoped HTTP routes:
 
