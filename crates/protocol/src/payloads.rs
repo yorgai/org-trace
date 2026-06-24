@@ -5,6 +5,7 @@
 //! consumers share the same schema.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
@@ -242,6 +243,34 @@ pub struct ExternalRefLinkedPayload {
     pub ref_type: String,
     pub target: String,
     pub repo_context_id: Option<RepoContextId>,
+}
+
+/// Normalized, shareable metadata for one source-provider session observed on a machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSessionObservedPayload {
+    pub source_id: String,
+    pub external_session_id: String,
+    pub title: Option<String>,
+    pub source_path: Option<String>,
+    pub source_uri: Option<String>,
+    pub source_mtime: Option<String>,
+    pub source_size: Option<u64>,
+    pub source_fingerprint: Option<String>,
+    pub parser_version: Option<String>,
+    pub session_created_at: Option<String>,
+    pub session_updated_at: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub files_changed: Option<u64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<Value>,
 }
 
 /// Payload for a directed causal edge in the provenance graph.

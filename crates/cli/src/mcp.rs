@@ -548,7 +548,7 @@ fn explain_tool_call(
     // Zero-config freshness: refresh this repo's source index before reading, so
     // a change the agent just made is visible without the user ever running a
     // CLI refresh. Best-effort + throttled — never blocks or fails the read.
-    crate::history::refresh_repo_sources_best_effort(store.repo_root());
+    crate::history::refresh_repo_sources_best_effort(store);
 
     let events = store.read_all_events()?;
     let index = store.load_or_rebuild_index()?;
@@ -693,7 +693,7 @@ fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
     // Keep this repo's source index fresh on write too, so a follow-up `explain`
     // (or cause-anchor resolution here) sees the agent's latest sessions.
     // Best-effort + throttled — never blocks or fails the write.
-    crate::history::refresh_repo_sources_best_effort(store.repo_root());
+    crate::history::refresh_repo_sources_best_effort(store);
 
     let events = store.read_all_events()?;
 

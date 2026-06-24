@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use brick_protocol::{EventType, TraceEvent};
+use brick_protocol::{EventType, SourceSessionObservedPayload, TraceEvent};
 
 use crate::blame::blame_file;
 use crate::store::LocalStore;
@@ -317,8 +317,11 @@ pub fn resolve_file_anchor(events: &[TraceEvent], path: &str) -> ExplainAnchor {
     let rel = path.trim().trim_start_matches("./");
     let mut matches: Vec<&TraceEvent> = events
         .iter()
-        .filter(|event| event.event_type == EventType::DiffCaptured)
-        .filter(|event| diff_event_touches(event, rel))
+        .filter(|event| match event.event_type {
+            EventType::DiffCaptured => diff_event_touches(event, rel),
+            EventType::SourceSessionObserved => source_session_event_touches(event, rel),
+            _ => false,
+        })
         .collect();
     matches.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
     let resolved = matches
@@ -350,6 +353,17 @@ fn diff_event_touches(event: &TraceEvent, rel: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn source_session_event_touches(event: &TraceEvent, rel: &str) -> bool {
+    let Ok(payload) = serde_json::from_value::<SourceSessionObservedPayload>(event.payload.clone())
+    else {
+        return false;
+    };
+    payload
+        .touched_files
+        .iter()
+        .any(|path| path == rel || path.ends_with(&format!("/{rel}")) || rel.ends_with(path))
 }
 
 /// Resolves a `file:line` anchor to the event that produced that line, reusing
@@ -567,6 +581,9 @@ fn build_step(
     mission_titles: &BTreeMap<String, String>,
 ) -> CausalStep {
     match event {
+        Some(event) if event.event_type == EventType::SourceSessionObserved => {
+            build_source_session_step(event, event_id, relation, note, rationale_conf, depth)
+        }
         Some(event) => CausalStep {
             event_id: event_id.to_string(),
             event_type: event_type_wire(event.event_type).to_string(),
@@ -601,6 +618,53 @@ fn build_step(
             transcript: None,
             depth,
         },
+    }
+}
+
+fn build_source_session_step(
+    event: &TraceEvent,
+    event_id: &str,
+    relation: Option<String>,
+    note: Option<String>,
+    rationale_conf: Option<String>,
+    depth: usize,
+) -> CausalStep {
+    let payload =
+        serde_json::from_value::<SourceSessionObservedPayload>(event.payload.clone()).ok();
+    let source = payload
+        .as_ref()
+        .map(|payload| payload.source_id.clone())
+        .filter(|source| !source.is_empty());
+    let external = payload
+        .as_ref()
+        .map(|payload| payload.external_session_id.clone())
+        .filter(|external| !external.is_empty());
+    let source_path = payload
+        .as_ref()
+        .and_then(|payload| payload.source_path.clone());
+    CausalStep {
+        event_id: event_id.to_string(),
+        event_type: event_type_wire(event.event_type).to_string(),
+        title: payload.as_ref().and_then(|payload| payload.title.clone()),
+        actor_type: Some(actor_type_wire(event).to_string()),
+        actor_id: Some(event.actor.actor_id.clone()),
+        session_id: external.clone(),
+        mission_id: None,
+        mission_title: None,
+        occurred_at: payload
+            .as_ref()
+            .and_then(|payload| payload.session_updated_at.clone())
+            .unwrap_or_else(|| event.occurred_at.to_rfc3339()),
+        relation,
+        note,
+        confidence: rationale_conf.unwrap_or_else(|| confidence_wire(event)),
+        transcript: Some(TranscriptPointer {
+            source,
+            session_ref: source_path,
+            session_id: external,
+            read_session: None,
+        }),
+        depth,
     }
 }
 
@@ -767,6 +831,11 @@ fn describe_event(event: &TraceEvent) -> Option<String> {
             .get("title")
             .and_then(|value| value.as_str())
             .map(str::to_string),
+        EventType::SourceSessionObserved => event
+            .payload
+            .get("title")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -796,6 +865,7 @@ fn serde_event_str(event_type: EventType) -> Option<&'static str> {
         EventType::RepoContextCaptured => Some("repo_context.captured"),
         EventType::DiffCaptured => Some("diff.captured"),
         EventType::ExternalRefLinked => Some("external_ref.linked"),
+        EventType::SourceSessionObserved => Some("source.session_observed"),
         EventType::CausalLinked => Some("causal.linked"),
     }
 }
@@ -828,6 +898,7 @@ mod tests {
     use brick_protocol::{
         ActorRef, ActorType, CausalLinkedPayload, CausalRelation, ConfidenceLevel,
         DiffCapturedPayload, DiffFileChange, DiffFileChangeKind, DiffTarget, SessionId,
+        SourceSessionObservedPayload,
     };
     use uuid::Uuid;
 
@@ -868,6 +939,36 @@ mod tests {
         event
     }
 
+    fn source_session_event(path: &str) -> TraceEvent {
+        TraceEvent::source_session_observed(
+            actor(),
+            SourceSessionObservedPayload {
+                source_id: "orgii".to_string(),
+                external_session_id: "session-1".to_string(),
+                title: Some("Investigate sync design".to_string()),
+                source_path: Some("/Users/me/.orgii/sessions.db".to_string()),
+                source_uri: Some("file:///Users/me/.orgii/sessions.db".to_string()),
+                source_mtime: None,
+                source_size: Some(123),
+                source_fingerprint: Some("fp".to_string()),
+                parser_version: Some("test".to_string()),
+                session_created_at: Some("2026-06-23T00:00:00Z".to_string()),
+                session_updated_at: Some("2026-06-23T00:01:00Z".to_string()),
+                model: Some("test-model".to_string()),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                repo_path: Some("/repo".to_string()),
+                branch: Some("main".to_string()),
+                files_changed: Some(1),
+                lines_added: Some(2),
+                lines_removed: Some(0),
+                touched_files: vec![path.to_string()],
+                metadata_json: None,
+            },
+        )
+        .expect("source session event")
+    }
+
     fn causal(
         effect: Uuid,
         causes: Vec<Uuid>,
@@ -887,6 +988,34 @@ mod tests {
             },
         )
         .expect("causal edge")
+    }
+
+    #[test]
+    fn whole_file_anchor_resolves_source_session_events() {
+        let event = source_session_event("crates/core/src/explain.rs");
+        let event_id = event.event_id.to_string();
+        let events = vec![event];
+        let index = TraceIndex::build(&events).expect("index");
+
+        let anchor = resolve_file_anchor(&events, "src/explain.rs");
+        assert_eq!(anchor.resolved_events, vec![event_id.clone()]);
+        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
+
+        assert_eq!(chain.steps.len(), 1);
+        assert_eq!(chain.steps[0].event_id, event_id);
+        assert_eq!(chain.steps[0].event_type, "source.session_observed");
+        assert_eq!(
+            chain.steps[0].title.as_deref(),
+            Some("Investigate sync design")
+        );
+        assert_eq!(chain.steps[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            chain.steps[0]
+                .transcript
+                .as_ref()
+                .and_then(|t| t.source.as_deref()),
+            Some("orgii")
+        );
     }
 
     #[test]

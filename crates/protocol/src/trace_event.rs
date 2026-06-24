@@ -17,6 +17,7 @@ use crate::{
     OrgCreatedPayload, OrgId, OrgUpdatedPayload, ProjectCreatedPayload, ProjectId,
     ProjectUpdatedPayload, RepoContextCapturedPayload, RepoContextId, SessionId,
     SessionLinkedToMissionPayload, SessionLogUploadedPayload, SessionStartedPayload,
+    SourceSessionObservedPayload,
 };
 
 /// Current protocol schema version for event envelopes and typed payloads.
@@ -292,6 +293,16 @@ impl TraceEvent {
         event.session_id = session_id;
         event.artifact_id = artifact_id;
         event.repo_context_id = repo_context_id;
+        Ok(event)
+    }
+
+    /// Builds a normalized source-session observation event for sync.
+    pub fn source_session_observed(
+        actor: ActorRef,
+        payload: SourceSessionObservedPayload,
+    ) -> serde_json::Result<Self> {
+        let mut event = Self::from_payload(EventType::SourceSessionObserved, actor, payload)?;
+        event.confidence = ConfidenceLevel::Observed;
         Ok(event)
     }
 

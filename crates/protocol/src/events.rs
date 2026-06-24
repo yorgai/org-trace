@@ -47,6 +47,8 @@ pub enum EventType {
     DiffCaptured,
     #[serde(rename = "external_ref.linked")]
     ExternalRefLinked,
+    #[serde(rename = "source.session_observed")]
+    SourceSessionObserved,
     /// A directed causal edge: one effect event was caused by zero or more
     /// upstream events and/or carries a standalone rationale. This is what turns
     /// the time-ordered event stream into a causal graph — the core of Brick's

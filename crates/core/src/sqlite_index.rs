@@ -1080,6 +1080,7 @@ fn event_type_name(event_type: EventType) -> &'static str {
         EventType::RepoContextCaptured => "repo_context.captured",
         EventType::DiffCaptured => "diff.captured",
         EventType::ExternalRefLinked => "external_ref.linked",
+        EventType::SourceSessionObserved => "source.session_observed",
         EventType::CausalLinked => "causal.linked",
     }
 }

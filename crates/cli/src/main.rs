@@ -200,7 +200,7 @@ fn handle_explain(
     #[cfg(feature = "sync")]
     auto_pull_best_effort(store);
     history::ensure_json(format);
-    history::refresh_repo_sources_best_effort(store.repo_root());
+    history::refresh_repo_sources_best_effort(store);
     let events = store.read_all_events()?;
     let index = store.load_or_rebuild_index()?;
     let depth = depth.unwrap_or(brick_core::DEFAULT_EXPLAIN_DEPTH);
