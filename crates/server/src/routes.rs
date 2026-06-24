@@ -79,12 +79,17 @@ impl AuthConfig {
     ) -> Result<AuthedIdentity, auth::AuthDenial> {
         match self.tokens.authorize(token, target, required) {
             Ok(identity) => Ok(identity),
-            Err(auth::AuthDenial::UnknownToken) => self
-                .supabase
-                .as_ref()
-                .map_or(Err(auth::AuthDenial::UnknownToken), |supabase| {
-                    supabase.verify(token)
-                }),
+            Err(auth::AuthDenial::UnknownToken) => {
+                self.supabase
+                    .as_ref()
+                    .map_or(Err(auth::AuthDenial::UnknownToken), |supabase| {
+                        let identity = supabase.verify(token)?;
+                        match target {
+                            auth::ResourceTarget::Repo { .. } => Ok(identity),
+                            auth::ResourceTarget::Global => Err(auth::AuthDenial::Forbidden),
+                        }
+                    })
+            }
             Err(denial) => Err(denial),
         }
     }
@@ -281,7 +286,7 @@ async fn list_repo_events(
     identity: Option<Extension<AuthedIdentity>>,
     Query(query): Query<ListEventsQuery>,
 ) -> std::result::Result<Json<ListEventsResponse>, (StatusCode, String)> {
-    enforce_repo_owner(identity.as_deref(), &state, &repo_id, false)?;
+    enforce_repo_member(identity.as_deref(), &state, &repo_id, false, &[])?;
     let response = state
         .store
         .list_events_page(Some(&repo_id), query.after.as_deref(), query.limit)
@@ -309,7 +314,7 @@ async fn push_repo_events(
     Json(request): Json<PushEventsRequest>,
 ) -> std::result::Result<Json<PushEventsResponse>, (StatusCode, String)> {
     let identity_ref = identity.as_deref();
-    enforce_repo_owner(identity_ref, &state, &repo_id, true)?;
+    enforce_repo_member(identity_ref, &state, &repo_id, true, &request.events)?;
     enforce_actor_binding(identity_ref, &request.events)?;
     let response = state
         .store
@@ -318,28 +323,41 @@ async fn push_repo_events(
     Ok(Json(response))
 }
 
-fn enforce_repo_owner(
+fn enforce_repo_member(
     identity: Option<&AuthedIdentity>,
     state: &AppState,
     repo_id: &str,
     claim_if_missing: bool,
+    events: &[TraceEvent],
 ) -> std::result::Result<(), (StatusCode, String)> {
     let Some(AuthKind::Supabase { user_id, .. }) = identity.map(|identity| &identity.kind) else {
         return Ok(());
     };
-    match state.store.resolve_repo_owner(repo_id) {
-        Some(owner) if owner == *user_id => Ok(()),
+    match state.store.resolve_repo_org(repo_id) {
+        Some(org_id) if state.store.is_org_member(&org_id, user_id) => Ok(()),
         Some(_) => Err((
             StatusCode::FORBIDDEN,
-            "repo is owned by a different Supabase user".to_string(),
+            "repo belongs to an org this Supabase user is not a member of".to_string(),
         )),
-        None if claim_if_missing => state
-            .store
-            .claim_repo_owner(repo_id, user_id)
-            .map_err(route_error),
+        None if claim_if_missing => {
+            let Some(org_id) = events
+                .iter()
+                .filter_map(|event| event.org_id.as_ref().map(ToString::to_string))
+                .find(|org_id| state.store.is_org_member(org_id, user_id))
+            else {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "repo has no org binding yet; push at least one event tagged with an org_id this user belongs to".to_string(),
+                ));
+            };
+            state
+                .store
+                .claim_repo_org(repo_id, &org_id)
+                .map_err(route_error)
+        }
         None => Err((
             StatusCode::FORBIDDEN,
-            "repo has not been claimed by this Supabase user".to_string(),
+            "repo has not been bound to an org".to_string(),
         )),
     }
 }
@@ -949,13 +967,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supabase_repo_owner_claims_on_first_push_and_blocks_other_users() {
-        let store = ServerStore::new(temp_data_dir("supabase-owner"));
+    async fn supabase_repo_org_members_can_collaborate_and_non_members_are_blocked() {
+        let store = ServerStore::new(temp_data_dir("supabase-org"));
+        store
+            .add_org_member("org_shared", "user-1")
+            .expect("add first member");
+        store
+            .add_org_member("org_shared", "user-2")
+            .expect("add second member");
         let app = build_router(store, None, Some(supabase_auth("jwt-secret")));
         let user_one = supabase_token("jwt-secret", "user-1");
         let user_two = supabase_token("jwt-secret", "user-2");
+        let outsider = supabase_token("jwt-secret", "user-3");
+        let mut event = event(None);
+        event.org_id = Some("org_shared".parse().expect("org id"));
         let request = PushEventsRequest {
-            events: vec![event(None)],
+            events: vec![event],
         };
         let body = serde_json::to_vec(&request).expect("serialize request");
 
@@ -974,21 +1001,8 @@ mod tests {
             .expect("first push");
         assert_eq!(first_push.status(), StatusCode::OK);
 
-        let read_as_owner = app
+        let read_as_member = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/v1/repos/repo-a/events")
-                    .header(header::AUTHORIZATION, format!("Bearer {user_one}"))
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("owner read");
-        assert_eq!(read_as_owner.status(), StatusCode::OK);
-
-        let read_as_other = app
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -998,8 +1012,21 @@ mod tests {
                     .expect("build request"),
             )
             .await
-            .expect("other read");
-        assert_eq!(read_as_other.status(), StatusCode::FORBIDDEN);
+            .expect("member read");
+        assert_eq!(read_as_member.status(), StatusCode::OK);
+
+        let read_as_outsider = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/repos/repo-a/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {outsider}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("outsider read");
+        assert_eq!(read_as_outsider.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

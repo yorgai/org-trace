@@ -105,4 +105,29 @@ pub enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Add a Supabase user id to an org membership.
+    AddOrgMember {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        org_id: String,
+        #[arg(long)]
+        user_id: String,
+    },
+    /// Remove a Supabase user id from an org membership.
+    RemoveOrgMember {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        org_id: String,
+        #[arg(long)]
+        user_id: String,
+    },
+    /// List Supabase user ids that belong to an org.
+    ListOrgMembers {
+        #[arg(long, default_value = ".brick-server")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        org_id: String,
+    },
 }

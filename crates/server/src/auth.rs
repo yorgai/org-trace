@@ -613,7 +613,7 @@ mod tests {
             identity.kind,
             AuthKind::Supabase {
                 user_id: "user-123".to_string(),
-                email: Some("user@example.com".to_string())
+                email: Some("user@example.com".to_string()),
             }
         );
     }

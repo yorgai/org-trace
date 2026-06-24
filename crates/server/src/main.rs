@@ -66,6 +66,17 @@ async fn main() -> Result<()> {
             expires_in_days,
         } => rotate_token(&data_dir, &label, expires_in_days)?,
         Command::Audit { data_dir, limit } => show_audit(&data_dir, limit)?,
+        Command::AddOrgMember {
+            data_dir,
+            org_id,
+            user_id,
+        } => add_org_member(&data_dir, &org_id, &user_id)?,
+        Command::RemoveOrgMember {
+            data_dir,
+            org_id,
+            user_id,
+        } => remove_org_member(&data_dir, &org_id, &user_id)?,
+        Command::ListOrgMembers { data_dir, org_id } => list_org_members(&data_dir, &org_id)?,
     }
 
     Ok(())
@@ -227,6 +238,27 @@ fn show_audit(data_dir: &std::path::Path, limit: Option<usize>) -> Result<()> {
             entry.path,
             actor
         );
+    }
+    Ok(())
+}
+
+fn add_org_member(data_dir: &std::path::Path, org_id: &str, user_id: &str) -> Result<()> {
+    ServerStore::new(data_dir).add_org_member(org_id, user_id)?;
+    println!("added org_id={org_id} user_id={user_id}");
+    Ok(())
+}
+
+fn remove_org_member(data_dir: &std::path::Path, org_id: &str, user_id: &str) -> Result<()> {
+    let removed = ServerStore::new(data_dir).remove_org_member(org_id, user_id)?;
+    println!("removed={removed} org_id={org_id} user_id={user_id}");
+    Ok(())
+}
+
+fn list_org_members(data_dir: &std::path::Path, org_id: &str) -> Result<()> {
+    let members = ServerStore::new(data_dir).org_members(org_id)?;
+    println!("member_count={}", members.len());
+    for member in members {
+        println!("user_id={member}");
     }
     Ok(())
 }

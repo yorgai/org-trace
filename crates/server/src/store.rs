@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 const SERVER_EVENTS_FILE: &str = "events.jsonl";
 const REPO_ORG_FILE: &str = "repo_org.json";
-const REPO_OWNER_FILE: &str = "repo_owner.json";
+const ORG_MEMBERS_FILE: &str = "org_members.json";
 const DEFAULT_EVENT_LIMIT: usize = 100;
 const MAX_EVENT_LIMIT: usize = 1000;
 
@@ -35,7 +35,7 @@ const MAX_EVENT_LIMIT: usize = 1000;
 pub struct ServerStore {
     data_dir: PathBuf,
     repo_org: Arc<RwLock<RepoOrgProjection>>,
-    repo_owner: Arc<RwLock<RepoOwnerProjection>>,
+    org_members: Arc<RwLock<OrgMembersProjection>>,
 }
 
 /// In-memory cache of the persisted repo→org projection. `loaded` is `None`
@@ -47,8 +47,8 @@ struct RepoOrgProjection {
 }
 
 #[derive(Debug, Default)]
-struct RepoOwnerProjection {
-    loaded: Option<BTreeMap<String, String>>,
+struct OrgMembersProjection {
+    loaded: Option<BTreeMap<String, BTreeSet<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl ServerStore {
         Self {
             data_dir: data_dir.into(),
             repo_org: Arc::new(RwLock::new(RepoOrgProjection::default())),
-            repo_owner: Arc::new(RwLock::new(RepoOwnerProjection::default())),
+            org_members: Arc::new(RwLock::new(OrgMembersProjection::default())),
         }
     }
 
@@ -222,29 +222,59 @@ impl ServerStore {
         guard.loaded.as_ref()?.get(repo_id).cloned()
     }
 
-    pub fn resolve_repo_owner(&self, repo_id: &str) -> Option<String> {
-        if let Ok(guard) = self.repo_owner.read() {
-            if let Some(map) = guard.loaded.as_ref() {
-                return map.get(repo_id).cloned();
-            }
-        }
-        self.ensure_repo_owner_loaded().ok()?;
-        let guard = self.repo_owner.read().ok()?;
-        guard.loaded.as_ref()?.get(repo_id).cloned()
+    pub fn claim_repo_org(&self, repo_id: &str, org_id: &str) -> Result<()> {
+        self.record_repo_orgs(vec![(repo_id.to_string(), org_id.to_string())])
     }
 
-    pub fn claim_repo_owner(&self, repo_id: &str, user_id: &str) -> Result<()> {
-        self.ensure_repo_owner_loaded()?;
+    pub fn add_org_member(&self, org_id: &str, user_id: &str) -> Result<()> {
+        self.ensure_org_members_loaded()?;
         let mut guard = self
-            .repo_owner
+            .org_members
             .write()
-            .map_err(|_| anyhow!("repo→owner cache lock poisoned"))?;
+            .map_err(|_| anyhow!("org-members cache lock poisoned"))?;
         let map = guard.loaded.get_or_insert_with(BTreeMap::new);
-        if !map.contains_key(repo_id) {
-            map.insert(repo_id.to_string(), user_id.to_string());
-            self.write_repo_owner_file(map)?;
+        let members = map.entry(org_id.to_string()).or_insert_with(BTreeSet::new);
+        if members.insert(user_id.to_string()) {
+            self.write_org_members_file(map)?;
         }
         Ok(())
+    }
+
+    pub fn remove_org_member(&self, org_id: &str, user_id: &str) -> Result<bool> {
+        self.ensure_org_members_loaded()?;
+        let mut guard = self
+            .org_members
+            .write()
+            .map_err(|_| anyhow!("org-members cache lock poisoned"))?;
+        let map = guard.loaded.get_or_insert_with(BTreeMap::new);
+        let removed = map
+            .get_mut(org_id)
+            .map(|members| members.remove(user_id))
+            .unwrap_or(false);
+        if removed {
+            self.write_org_members_file(map)?;
+        }
+        Ok(removed)
+    }
+
+    pub fn org_members(&self, org_id: &str) -> Result<Vec<String>> {
+        self.ensure_org_members_loaded()?;
+        let guard = self
+            .org_members
+            .read()
+            .map_err(|_| anyhow!("org-members cache lock poisoned"))?;
+        Ok(guard
+            .loaded
+            .as_ref()
+            .and_then(|map| map.get(org_id))
+            .map(|members| members.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    pub fn is_org_member(&self, org_id: &str, user_id: &str) -> bool {
+        self.org_members(org_id)
+            .map(|members| members.iter().any(|member| member == user_id))
+            .unwrap_or(false)
     }
 
     /// Populates the in-memory repo→org cache if it has not been loaded yet,
@@ -280,6 +310,55 @@ impl ServerStore {
         Ok(())
     }
 
+    fn ensure_org_members_loaded(&self) -> Result<()> {
+        {
+            let guard = self
+                .org_members
+                .read()
+                .map_err(|_| anyhow!("org-members cache lock poisoned"))?;
+            if guard.loaded.is_some() {
+                return Ok(());
+            }
+        }
+        let map = self.load_org_members_file()?.unwrap_or_default();
+        let mut guard = self
+            .org_members
+            .write()
+            .map_err(|_| anyhow!("org-members cache lock poisoned"))?;
+        if guard.loaded.is_none() {
+            guard.loaded = Some(map);
+        }
+        Ok(())
+    }
+
+    fn load_org_members_file(&self) -> Result<Option<BTreeMap<String, BTreeSet<String>>>> {
+        let path = self.org_members_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read org-members map at {}", path.display()))?;
+        if contents.trim().is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse org-members map at {}", path.display()))
+            .map(Some)
+    }
+
+    fn write_org_members_file(&self, map: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
+        self.init()?;
+        let path = self.org_members_path();
+        let tmp = path.with_extension("json.tmp");
+        let serialized =
+            serde_json::to_string_pretty(map).context("failed to serialize org-members map")?;
+        fs::write(&tmp, serialized)
+            .with_context(|| format!("failed to write org-members map at {}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to commit org-members map at {}", path.display()))?;
+        Ok(())
+    }
+
     /// Records repo→org bindings for newly accepted events into both the cache
     /// (if loaded) and the persisted file. First binding for a repo wins, mirror
     /// of the historical "first event ties the repo to an org" semantics.
@@ -303,35 +382,10 @@ impl ServerStore {
         Ok(())
     }
 
-    fn ensure_repo_owner_loaded(&self) -> Result<()> {
-        {
-            let guard = self
-                .repo_owner
-                .read()
-                .map_err(|_| anyhow!("repo→owner cache lock poisoned"))?;
-            if guard.loaded.is_some() {
-                return Ok(());
-            }
-        }
-        let map = self.load_repo_owner_file()?.unwrap_or_default();
-        let mut guard = self
-            .repo_owner
-            .write()
-            .map_err(|_| anyhow!("repo→owner cache lock poisoned"))?;
-        if guard.loaded.is_none() {
-            guard.loaded = Some(map);
-        }
-        Ok(())
-    }
-
     /// Reads the persisted repo→org file, returning `None` when it is absent so
     /// the caller can rebuild from the log.
     fn load_repo_org_file(&self) -> Result<Option<BTreeMap<String, String>>> {
         self.load_projection_file(self.repo_org_path(), "repo→org")
-    }
-
-    fn load_repo_owner_file(&self) -> Result<Option<BTreeMap<String, String>>> {
-        self.load_projection_file(self.repo_owner_path(), "repo→owner")
     }
 
     fn load_projection_file(
@@ -356,10 +410,6 @@ impl ServerStore {
     /// mid-write cannot leave a truncated map.
     fn write_repo_org_file(&self, map: &BTreeMap<String, String>) -> Result<()> {
         self.write_projection_file(self.repo_org_path(), map, "repo→org")
-    }
-
-    fn write_repo_owner_file(&self, map: &BTreeMap<String, String>) -> Result<()> {
-        self.write_projection_file(self.repo_owner_path(), map, "repo→owner")
     }
 
     fn write_projection_file(
@@ -429,8 +479,8 @@ impl ServerStore {
         self.data_dir.join(REPO_ORG_FILE)
     }
 
-    fn repo_owner_path(&self) -> PathBuf {
-        self.data_dir.join(REPO_OWNER_FILE)
+    fn org_members_path(&self) -> PathBuf {
+        self.data_dir.join(ORG_MEMBERS_FILE)
     }
 }
 
@@ -626,31 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_owner_projection_claims_first_user_and_persists() {
-        let dir = temp_data_dir("repo-owner");
-        let store = ServerStore::new(&dir);
-        assert_eq!(store.resolve_repo_owner("repo-a"), None);
-        store
-            .claim_repo_owner("repo-a", "user-1")
-            .expect("claim owner");
-        store
-            .claim_repo_owner("repo-a", "user-2")
-            .expect("second claim is ignored");
-
-        assert_eq!(
-            store.resolve_repo_owner("repo-a"),
-            Some("user-1".to_string())
-        );
-        assert!(dir.join(REPO_OWNER_FILE).exists());
-
-        let reopened = ServerStore::new(&dir);
-        assert_eq!(
-            reopened.resolve_repo_owner("repo-a"),
-            Some("user-1".to_string())
-        );
-    }
-
-    #[test]
     fn cloned_store_shares_repo_org_cache() {
         use brick_protocol::OrgId;
         let store = ServerStore::new(temp_data_dir("repo-org-clone"));
@@ -661,6 +686,25 @@ mod tests {
         // Append through one handle; the clone observes it via the shared cache.
         store.append_events(&[tagged]).expect("append");
         assert_eq!(clone.resolve_repo_org("repo-a"), Some(org.to_string()));
+    }
+
+    #[test]
+    fn org_members_persist_and_are_shared_by_clones() {
+        let dir = temp_data_dir("org-members");
+        let store = ServerStore::new(&dir);
+        let clone = store.clone();
+        store.add_org_member("org-a", "user-1").expect("add member");
+
+        assert!(clone.is_org_member("org-a", "user-1"));
+        assert!(!clone.is_org_member("org-a", "user-2"));
+        assert_eq!(clone.org_members("org-a").expect("list"), vec!["user-1"]);
+
+        let reopened = ServerStore::new(&dir);
+        assert!(reopened.is_org_member("org-a", "user-1"));
+        assert!(reopened
+            .remove_org_member("org-a", "user-1")
+            .expect("remove"));
+        assert!(!reopened.is_org_member("org-a", "user-1"));
     }
 
     #[test]
