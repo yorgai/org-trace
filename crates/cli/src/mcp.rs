@@ -1138,10 +1138,8 @@ fn store_for_anchor(default: &LocalStore, anchor: &str) -> Option<LocalStore> {
             .ok()
             .map(|repo_root| LocalStore::new(repo_root));
     }
-    // Relative anchor: fall back to the default (cwd-derived) store only when its
-    // repo root is a real git repo — otherwise there is nothing to read.
     if discover_repo_root(default.repo_root()).is_ok() {
-        Some(LocalStore::new(default.repo_root().to_path_buf()))
+        Some(default.clone())
     } else {
         None
     }

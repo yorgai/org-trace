@@ -2,8 +2,8 @@
 //!
 //! The sync surface is append-only and can run open for local experiments or
 //! behind bearer auth. Repo IDs are route/query boundaries; with Supabase Auth
-//! enabled, repo-scoped routes are additionally owned by the first user that
-//! pushes to that repo.
+//! enabled, repo-scoped routes are additionally restricted to configured org
+//! members.
 
 use std::{path::PathBuf, process::Stdio, sync::Arc};
 

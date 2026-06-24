@@ -2,12 +2,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/brick-mvp-smoke.XXXXXX")"
+SCRATCH_ROOT="${ORGII_SCRATCHPAD:-/private/var/folders/sj/tbzp59657v35lt95bs16l_040000gn/T/orgii-501/Users_vinceorz_Projects_Brick-Vault/sdeagent-3b425f71-3901-49e9-9818-324a6029eb9e/scratchpad}"
+mkdir -p "${SCRATCH_ROOT}"
+TMP_ROOT="$(mktemp -d "${SCRATCH_ROOT}/brick-mvp-smoke.XXXXXX")"
 SERVER_PID=""
-SERVER_LOG="$TMP_ROOT/server.log"
+SERVER_LOG="${TMP_ROOT}/server.log"
 PORT="${BRICK_SMOKE_PORT:-17821}"
 REMOTE="http://127.0.0.1:${PORT}"
 REPO_ID="smoke-repo-$(date +%s)-$$"
+ORG_ID="org_smoke"
 
 cleanup() {
   local exit_code=$?
@@ -39,14 +42,14 @@ require_output() {
   fi
 }
 
-extract_value() {
+json_value() {
   local output="$1"
   local key="$2"
-  awk -F= -v key="${key}" '$1 == key { print substr($0, length(key) + 2); exit }' <<<"${output}"
+  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "${key}" <<<"${output}"
 }
 
 brick() {
-  cargo run --quiet --manifest-path "${ROOT_DIR}/Cargo.toml" -p brick -- "$@"
+  cargo run --quiet --manifest-path "${ROOT_DIR}/Cargo.toml" -p brick --features sync -- "$@"
 }
 
 brick_server() {
@@ -73,7 +76,7 @@ wait_for_server() {
 
 printf 'Brick MVP smoke temp root: %s\n' "${TMP_ROOT}"
 
-run cargo build --quiet --manifest-path "${ROOT_DIR}/Cargo.toml" -p brick -p brick-server
+run cargo build --quiet --manifest-path "${ROOT_DIR}/Cargo.toml" -p brick -p brick-server --features sync
 
 REPO_ONE="${TMP_ROOT}/repo-one"
 STORE_ONE="${TMP_ROOT}/store-one"
@@ -88,96 +91,31 @@ run git add tracked.txt
 run git commit --quiet -m "initial smoke commit"
 printf 'working change\n' >> tracked.txt
 
-run brick --store-root "${STORE_ONE}" init
-run brick source config --default-full-evidence-upload false --metadata-only-local true
-NATIVE_LOG_ROOT="${TMP_ROOT}/native-claude/projects/repo"
-mkdir -p "${NATIVE_LOG_ROOT}"
-printf '{"role":"assistant","message":"native smoke"}\n' > "${NATIVE_LOG_ROOT}/native-smoke.jsonl"
-run brick source configure --name cursor --app-id cursor --actor-id smoke-agent --actor-type agent --store-root "${STORE_ONE}" --evidence-root "${TMP_ROOT}/.orgii" --default-full-evidence-upload false --notes "Smoke source"
-run brick source configure --name claude_code --app-id claude_code --actor-id smoke-agent --actor-type agent --store-root "${STORE_ONE}" --session-log-path "${TMP_ROOT}/native-claude/projects" --default-full-evidence-upload false --notes "Native smoke source"
-run brick source use --name cursor
-run brick --source cursor source show --name cursor
+link_output="$(capture brick --store-root "${STORE_ONE}" --actor-id smoke-agent --actor-type agent --session 11111111-1111-4111-8111-111111111111 link --note "Smoke captured working diff")"
+printf '%s\n' "${link_output}"
+require_output "${link_output}" '"linked":true'
+require_output "${link_output}" 'tracked.txt'
+effect_event="$(json_value "${link_output}" effect_event)"
 
-org_output="$(capture brick --source cursor org create "Smoke Org" --description "End-to-end smoke org")"
-printf '%s\n' "${org_output}"
-org_id="$(extract_value "${org_output}" org_id)"
-[[ -n "${org_id}" ]]
-
-project_output="$(capture brick --source cursor project create --org "${org_id}" "Smoke Project" --description "End-to-end smoke project")"
-printf '%s\n' "${project_output}"
-project_id="$(extract_value "${project_output}" project_id)"
-[[ -n "${project_id}" ]]
-
-mission_output="$(capture brick --source cursor mission create --project "${project_id}" "Smoke MVP mission" --description "End-to-end smoke" --status active)"
-printf '%s\n' "${mission_output}"
-mission_id="$(extract_value "${mission_output}" mission_id)"
-[[ -n "${mission_id}" ]]
-
-session_output="$(capture brick --source cursor session start --mission "${mission_id}" --name "Smoke session" --set-current --print-env)"
-printf '%s\n' "${session_output}"
-require_output "${session_output}" "BRICK_SESSION_ID"
-session_id="$(extract_value "${session_output}" session_id)"
-[[ -n "${session_id}" ]]
-run brick --source cursor session current
-run brick --source cursor context show
-
-artifact_output="$(capture brick --source cursor artifact create --mission "${mission_id}" --session "${session_id}" --kind decision "Smoke decision" --body "Choose the MVP smoke path")"
-printf '%s\n' "${artifact_output}"
-artifact_id="$(extract_value "${artifact_output}" artifact_id)"
-[[ -n "${artifact_id}" ]]
-run brick --source cursor artifact update "${artifact_id}" --session "${session_id}" --title "Updated smoke decision" --body "Updated by smoke harness" --kind review
-
-ATTACHMENT_FILE="${TMP_ROOT}/attachment.txt"
-SESSION_LOG_FILE="${TMP_ROOT}/session.log"
-printf 'attachment body\n' > "${ATTACHMENT_FILE}"
-printf '{"role":"assistant","message":"smoke"}\n' > "${SESSION_LOG_FILE}"
-run brick --source cursor evidence attach --artifact "${artifact_id}" --session "${session_id}" --path "${ATTACHMENT_FILE}" --name smoke.txt --content-type text/plain
-run brick --source cursor evidence log --session "${session_id}" --path "${SESSION_LOG_FILE}" --format jsonl --source cursor
-
-run brick --source cursor evidence diff --artifact "${artifact_id}" --session "${session_id}" --target working
-run git add tracked.txt
-run brick --source cursor evidence diff --artifact "${artifact_id}" --session "${session_id}" --target staged
-run brick --source cursor evidence file --artifact "${artifact_id}" --session "${session_id}" tracked.txt
-
-run brick --source cursor maintenance index rebuild
-run brick --source cursor maintenance index status
-run brick --source cursor maintenance db rebuild
-run brick --source cursor maintenance db status
-run brick --source cursor maintenance db sessions --limit 10 --app-id cursor --actor-id smoke-agent
-run brick --source cursor maintenance db artifacts --limit 10 --session "${session_id}" --mission "${mission_id}"
-run brick --source cursor org show "${org_id}"
-run brick --source cursor project show "${project_id}"
-run brick --source cursor mission show "${mission_id}"
-run brick --source cursor session show "${session_id}"
-run brick --source cursor artifact show "${artifact_id}"
-run brick --source cursor evidence file-show tracked.txt
-
-CURSOR_FIXTURE="${TMP_ROOT}/cursor.jsonl"
-CI_FIXTURE="${TMP_ROOT}/ci.json"
-printf '{"role":"user","message":"imported smoke prompt","title":"Smoke import"}\n' > "${CURSOR_FIXTURE}"
-cat > "${CI_FIXTURE}" <<'JSON'
-{
-  "job_name": "smoke-ci",
-  "status": "success",
-  "url": "https://ci.example.invalid/smoke",
-  "commit": "0000000000000000000000000000000000000000"
-}
-JSON
-run brick --source cursor import cursor --path "${CURSOR_FIXTURE}" --session "${session_id}" --mission "${mission_id}" --app-session-id cursor-smoke --app-session-name "Cursor Smoke"
-run brick --source claude_code import native list --limit 5
-run brick --source claude_code import native ingest --external-session-id native-smoke --mission "${mission_id}"
-run brick --source cursor import ci --path "${CI_FIXTURE}" --mission "${mission_id}" --session "${session_id}"
-run brick --source cursor maintenance index rebuild
-run brick --source cursor maintenance db rebuild
+explain_output="$(capture brick --store-root "${STORE_ONE}" explain "${effect_event}")"
+printf '%s\n' "${explain_output}"
+require_output "${explain_output}" 'Smoke captured working diff'
 
 cd "${ROOT_DIR}"
+brick_server add-org-member --data-dir "${SERVER_DATA}" --org-id "${ORG_ID}" --user-id smoke-user >/dev/null
+members_output="$(capture brick_server list-org-members --data-dir "${SERVER_DATA}" --org-id "${ORG_ID}")"
+printf '%s\n' "${members_output}"
+require_output "${members_output}" 'member_count=1'
+require_output "${members_output}" 'user_id=smoke-user'
 brick_server serve --bind "127.0.0.1:${PORT}" --data-dir "${SERVER_DATA}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 wait_for_server
 run curl -fsS "${REMOTE}/health"
 
 cd "${REPO_ONE}"
-run brick --source cursor sync push --remote "${REMOTE}" --repo-id "${REPO_ID}" --org-id "${org_id}"
+push_output="$(capture brick --store-root "${STORE_ONE}" sync push --remote "${REMOTE}" --repo-id "${REPO_ID}" --org-id "${ORG_ID}")"
+printf '%s\n' "${push_output}"
+require_output "${push_output}" 'accepted_count='
 run curl -fsS "${REMOTE}/v1/repos/${REPO_ID}/index/status"
 run curl -fsS "${REMOTE}/v1/repos/${REPO_ID}/sessions?limit=20"
 
@@ -191,14 +129,12 @@ run git config user.name "Brick Smoke"
 printf 'second repo\n' > README.md
 run git add README.md
 run git commit --quiet -m "initial second repo"
-run brick --store-root "${STORE_TWO}" init
-run brick --store-root "${STORE_TWO}" sync pull --remote "${REMOTE}" --repo-id "${REPO_ID}" --org-id "${org_id}"
-run brick --store-root "${STORE_TWO}" maintenance index rebuild
-run brick --store-root "${STORE_TWO}" maintenance db rebuild
-run brick --store-root "${STORE_TWO}" maintenance db sessions --limit 20
-run brick --store-root "${STORE_TWO}" maintenance db artifacts --limit 20 --mission "${mission_id}"
+pull_output="$(capture brick --store-root "${STORE_TWO}" sync pull --remote "${REMOTE}" --repo-id "${REPO_ID}")"
+printf '%s\n' "${pull_output}"
+require_output "${pull_output}" 'pulled_event_count='
+pulled_explain_output="$(capture brick --store-root "${STORE_TWO}" explain "${effect_event}")"
+printf '%s\n' "${pulled_explain_output}"
+require_output "${pulled_explain_output}" 'Smoke captured working diff'
 
 cd "${ROOT_DIR}"
-run brick_server rebuild-index --data-dir "${SERVER_DATA}" --repo-id "${REPO_ID}"
-
 printf '\nBrick MVP smoke completed successfully for repo_id=%s\n' "${REPO_ID}"
