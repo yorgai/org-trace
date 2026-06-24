@@ -43,6 +43,14 @@ brick agent status             # see which agents are wired up
    agent can call Brick's two tools on demand: **`explain`** (who changed this
    code and why) and **`link`** (record why after a change).
 
+```sh
+brick setup                    # local-only; wires agents and does not require an account
+brick setup --email you@example.com
+brick setup --email you@example.com --code <otp-code>
+```
+
+Without `--email`, Brick stays local-only. With Supabase login, Brick enables best-effort sharing sync for the normal agent path: `explain` pulls before reading and `link` pushes after writes.
+
 ## Use it directly
 
 ```sh

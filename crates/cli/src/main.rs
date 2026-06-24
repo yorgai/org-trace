@@ -17,7 +17,9 @@ mod native_hook;
 mod skill;
 
 use agent::handle_agent;
-use args::{Cli, Command};
+use args::{
+    AgentFormatArg, AgentInstallArgs, AgentTargetArg, AgentTargetArgs, Cli, Command, SetupArgs,
+};
 
 #[cfg(feature = "sync")]
 use args::SyncCommand;
@@ -36,12 +38,17 @@ fn main() -> Result<()> {
     let work_dir = std::env::current_dir().context("failed to read current directory")?;
     let repo_root = match discover_repo_root(&work_dir) {
         Ok(root) => root,
-        Err(_) if matches!(cli.command, Command::McpServe { .. }) => work_dir.clone(),
+        Err(_) if matches!(cli.command, Command::McpServe { .. } | Command::Setup(_)) => {
+            work_dir.clone()
+        }
         Err(err) => return Err(err),
     };
     let source_profiles = SourceProfileStore::new(repo_root.clone());
     let selected_source_profile = match &cli.command {
-        Command::McpServe { .. } | Command::Agent { .. } | Command::HookExplain => None,
+        Command::McpServe { .. }
+        | Command::Agent { .. }
+        | Command::Setup(_)
+        | Command::HookExplain => None,
         _ => source_profiles.selected_profile(cli.source.as_deref())?,
     };
     let store = LocalStore::with_options(
@@ -54,6 +61,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Version { .. } => unreachable!("version handled before repo discovery"),
         Command::Agent { command } => handle_agent(command)?,
+        Command::Setup(args) => handle_setup(args)?,
         Command::McpServe { planning } => mcp::serve(&source_profiles, &store, planning)?,
         Command::Explain {
             anchor,
@@ -80,6 +88,58 @@ fn main() -> Result<()> {
             SyncCommand::Logout => handle_sync_logout()?,
             SyncCommand::Whoami => handle_sync_whoami()?,
         },
+    }
+
+    Ok(())
+}
+
+fn handle_setup(args: SetupArgs) -> Result<()> {
+    if args.agents {
+        agent::install(AgentInstallArgs {
+            target: AgentTargetArgs {
+                global: true,
+                target: AgentTargetArg::All,
+                dir: None,
+                format: AgentFormatArg::Text,
+            },
+            force: false,
+            print: false,
+        })?;
+    }
+
+    #[cfg(feature = "sync")]
+    {
+        match (args.email, args.code) {
+            (Some(email), Some(code)) => {
+                let identity = identity::verify_email_otp(&email, &code)?;
+                println!("share_enabled=true");
+                println!("logged_in=true");
+                println!("user_id={}", identity.user_id);
+                println!("email={}", identity.email.as_deref().unwrap_or(""));
+            }
+            (Some(email), None) => {
+                identity::request_email_otp(&email)?;
+                println!("share_enabled=pending");
+                println!("otp_sent=true");
+                println!("email={email}");
+                println!("run `brick setup --email {email} --code <code>` to enable sharing");
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("--code requires --email");
+            }
+            (None, None) => {
+                println!("share_enabled=false");
+                println!("Brick is ready for local-only use.");
+                println!("Run `brick setup --email <you@example.com>` later to enable sharing.");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sync"))]
+    {
+        println!("share_enabled=false");
+        println!("Brick is ready for local-only use.");
+        println!("This binary was built without the sync feature, so Supabase sharing login is unavailable.");
     }
 
     Ok(())

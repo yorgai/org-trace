@@ -58,6 +58,8 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Set up local agent integration, with optional Supabase sharing login.
+    Setup(SetupArgs),
     /// Run as an MCP server over stdio so any MCP-capable agent can query Brick.
     McpServe {
         /// Expose the planning tool surface instead of the default coding-agent
@@ -95,6 +97,23 @@ pub enum Command {
         #[command(subcommand)]
         command: SyncCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Install Brick into per-user agent configs/memory files.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub agents: bool,
+
+    /// Email address for optional Supabase login. Omit to keep Brick local-only.
+    #[cfg(feature = "sync")]
+    #[arg(long)]
+    pub email: Option<String>,
+
+    /// One-time code emailed by Supabase; pass with --email to finish login.
+    #[cfg(feature = "sync")]
+    #[arg(long)]
+    pub code: Option<String>,
 }
 
 #[cfg(feature = "sync")]

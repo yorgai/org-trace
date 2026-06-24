@@ -120,7 +120,7 @@ pub fn handle_agent(command: AgentCommand) -> Result<()> {
     }
 }
 
-fn install(args: AgentInstallArgs) -> Result<()> {
+pub(crate) fn install(args: AgentInstallArgs) -> Result<()> {
     if args.print {
         println!("{}", managed_block());
         return Ok(());

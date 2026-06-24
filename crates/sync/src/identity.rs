@@ -33,6 +33,8 @@ const IDENTITY_FILE: &str = "identity.json";
 /// URL + anon key (safe to ship); the user still has to authenticate.
 const SUPABASE_URL_ENV: &str = "BRICK_SUPABASE_URL";
 const SUPABASE_ANON_KEY_ENV: &str = "BRICK_SUPABASE_ANON_KEY";
+const DEFAULT_SUPABASE_URL: &str = "https://vplfljdsixvzglrxubjp.supabase.co";
+const DEFAULT_SUPABASE_ANON_KEY: &str = "sb_publishable__ichJ1uIlems6meDErcTxQ_kXudNSgm";
 
 /// A persisted login session: the Supabase tokens plus who they belong to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,17 +151,11 @@ fn supabase_config() -> Result<(String, String)> {
     let url = std::env::var(SUPABASE_URL_ENV)
         .ok()
         .or_else(|| option_env!("BRICK_SUPABASE_URL").map(str::to_string))
-        .context(
-            "Supabase project URL is not configured. Set BRICK_SUPABASE_URL (and \
-             BRICK_SUPABASE_ANON_KEY) to your project's values.",
-        )?;
+        .unwrap_or_else(|| DEFAULT_SUPABASE_URL.to_string());
     let anon_key = std::env::var(SUPABASE_ANON_KEY_ENV)
         .ok()
         .or_else(|| option_env!("BRICK_SUPABASE_ANON_KEY").map(str::to_string))
-        .context(
-            "Supabase anon key is not configured. Set BRICK_SUPABASE_ANON_KEY to your \
-             project's anon public key.",
-        )?;
+        .unwrap_or_else(|| DEFAULT_SUPABASE_ANON_KEY.to_string());
     Ok((url.trim_end_matches('/').to_string(), anon_key))
 }
 
