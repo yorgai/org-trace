@@ -169,23 +169,11 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
              dirty INTEGER NOT NULL,
              captured_at TEXT NOT NULL
          );
-         CREATE TABLE IF NOT EXISTS causal_edges (
-             source_event_id TEXT NOT NULL,
-             effect_event TEXT NOT NULL,
-             cause_event TEXT,
-             relation TEXT NOT NULL,
-             note TEXT,
-             confidence TEXT NOT NULL,
-             recorded_at TEXT NOT NULL,
-             PRIMARY KEY (source_event_id, effect_event, cause_event)
-         );
          CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(app_id, actor_id, runtime_id, last_event_at);
          CREATE INDEX IF NOT EXISTS idx_session_logs_session ON session_logs(session_id, uploaded_at);
          CREATE INDEX IF NOT EXISTS idx_artifact_sessions_session ON artifact_sessions(session_id);
          CREATE INDEX IF NOT EXISTS idx_artifact_missions_mission ON artifact_missions(mission_id);
-         CREATE INDEX IF NOT EXISTS idx_attachments_sha256 ON attachments(sha256);
-         CREATE INDEX IF NOT EXISTS idx_causal_edges_effect ON causal_edges(effect_event);
-         CREATE INDEX IF NOT EXISTS idx_causal_edges_cause ON causal_edges(cause_event);",
+         CREATE INDEX IF NOT EXISTS idx_attachments_sha256 ON attachments(sha256);",
     )?;
     Ok(())
 }
@@ -211,7 +199,6 @@ pub(crate) fn reset_schema(connection: &Connection) -> Result<()> {
         "artifact_attachments",
         "file_refs",
         "repo_contexts",
-        "causal_edges",
     ] {
         connection.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
     }
@@ -239,7 +226,6 @@ pub(crate) fn clear_tables(connection: &Connection) -> Result<()> {
         "artifact_attachments",
         "file_refs",
         "repo_contexts",
-        "causal_edges",
     ] {
         connection.execute(&format!("DELETE FROM {table}"), [])?;
     }

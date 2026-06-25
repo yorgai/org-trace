@@ -14,17 +14,16 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    capture_diff, discover_repo_root, explain_from_events, infer_session_rationale,
-    merge_source_steps_into, resolve_direct_anchor, resolve_file_anchor, resolve_file_line_anchor,
-    resolve_file_range_anchor, source_sessions_to_steps, CausalChain, DiffCaptureRequest,
-    InferredRelation, LocalStore, MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore,
-    DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
+    discover_repo_root, explain_from_events, infer_session_rationale, merge_source_steps_into,
+    resolve_direct_anchor, resolve_file_anchor, resolve_file_line_anchor,
+    resolve_file_range_anchor, source_sessions_to_steps, CausalChain, InferredRelation, LocalStore,
+    MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH,
+    MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
-    ArtifactKind, CausalLinkedPayload, CausalRelation, ConfidenceLevel, DiffTarget, FileRefId,
-    MissionCreatedPayload, MissionId, MissionStatus, MissionUpdatedPayload, ProjectId, SessionId,
-    TraceEvent,
+    ArtifactKind, FileRefId, MissionCreatedPayload, MissionId, MissionStatus,
+    MissionUpdatedPayload, ProjectId, SessionId, TraceEvent,
 };
 use serde_json::{json, Value};
 
@@ -41,8 +40,8 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// a fatal stdout write failure propagates.
 ///
 /// `planning` selects the tool surface. The default (false) is the minimal
-/// coding-agent surface — just `explain` (read WHY) and `link` (write a causal
-/// edge). With `planning=true` the planning tools (`mission`, `mission_list`,
+/// coding-agent surface — just `explain` (read the file-history timeline / WHY).
+/// With `planning=true` the planning tools (`mission`, `mission_list`,
 /// `show_mission`, `artifact_add`, `artifact_attach`) are added; this is the
 /// surface meant for a dedicated planning custom agent, not the main agent.
 pub fn serve(profiles: &SourceProfileStore, store: &LocalStore, planning: bool) -> Result<()> {
@@ -112,13 +111,13 @@ artifact_attach."
         "Brick is the causal memory of this codebase — it answers WHY code looks \
 the way it does, across every AI tool that touched it. \
 When you locate a file or code you are about to change, call `explain` on it \
-BEFORE drawing conclusions from the code alone: it returns who changed it, why \
-(the rationale that can't be read from the code), what was derived from it, and \
-who is editing it right now. `explain` is your FIRST step into existing code — \
+BEFORE drawing conclusions from the code alone: it returns a newest-first \
+timeline of the sessions that changed it — who changed it, when, the mission \
+they did it under, a transcript pointer to read the full session, and who is \
+editing it right now. `explain` is your FIRST step into existing code — \
 prefer it over grep and `git log`, which are only a fallback when Brick has no \
-record. \
-After you make a non-trivial change, call `link` to record WHY in one line so \
-the next agent (or you, in three months) can recover your reasoning."
+record. It is read-only: there is nothing to record after you change code — the \
+next agent recovers your reasoning from the session transcript automatically."
     };
     json!({
         "protocolVersion": PROTOCOL_VERSION,
@@ -182,75 +181,11 @@ fn explain_tool() -> Value {
     })
 }
 
-/// The `link` tool schema — the single write entry point for causal edges.
-fn link_tool() -> Value {
-    json!({
-        "name": "link",
-        "description": "Record an EXPLICIT causal edge that Brick cannot infer on \
-    its own. You usually do NOT need this: `explain` already recovers the WHY of \
-    ordinary single-session edits from the transcript automatically (as `observed` \
-    rationale), so day-to-day work needs no `link` call. Reach for `link` only for \
-    the few things inference can't reconstruct: (1) a CROSS-REPO or CROSS-SESSION \
-    cause — this change was driven by a decision/change made elsewhere (set `cause` \
-    to that artifact/mission/event id with relation='derived_from' or \
-    'triggered_by'); (2) a SUPERSEDES edge — this change replaces/corrects an earlier \
-    one (set `cause` to the superseded event id, relation='supersedes'); (3) a \
-    high-stakes rationale you want recorded at `explicit` confidence rather than left \
-    to transcript inference. When you do call it: `link` binds to a real change \
-    event, so call it BEFORE committing (it captures your still-uncommitted work) or \
-    pass an `effect` naming an existing event/file. Every `link` has an effect (the \
-    change) and a WHY (`note` and/or a `cause` + `relation`).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "effect": {
-                    "type": "string",
-                    "description": "The change you are explaining. USUALLY OMIT \
-    THIS — when omitted, Brick captures your current uncommitted edits and binds the \
-    reason to exactly those files (so call `link` before committing). Only pass \
-    `effect` to point at a change Brick has ALREADY recorded: an event id, or a \
-    `path`/`path:line` (prefer an ABSOLUTE path) that resolves through blame to an \
-    existing change event. An `effect` that resolves to nothing is an error — it does \
-    NOT create a free-floating note; omit it and let Brick capture the diff instead."
-                },
-                "cause": {
-                    "type": "string",
-                    "description": "Optional anchor that caused/motivated this \
-    change: a `path`, `path:line` (prefer an ABSOLUTE path), artifact, mission, or \
-    event id. If you are implementing a planned work item, pass that `mission_…` id \
-    here (with relation='derived_from') so the planning record links to the actual \
-    code — do NOT just mention the mission in `note`, that leaves the graph \
-    disconnected. Omit for a standalone rationale."
-                },
-                "relation": {
-                    "type": "string",
-                    "description": "How the effect relates to the cause. Use 'rationale' \
-    for a standalone reason (no cause).",
-                    "enum": ["triggered_by", "derived_from", "supersedes", "responds_to", "rationale"]
-                },
-                "note": {
-                    "type": "string",
-                    "description": "One line: WHY. Required when there is no cause."
-                },
-                "session": {
-                    "type": "string",
-                    "description": "Optional: the id of the coding session you are \
-    working in (your tool's session/conversation id). Brick records it on the \
-    change so a later `explain` can hand the next agent a transcript pointer back \
-    to this session — the original context behind the change. Omit if you don't \
-    have one."
-                }
-            },
-            "required": []
-        }
-    })
-}
-
 fn tools_list_result(planning: bool) -> Value {
     if planning {
         return json!({ "tools": planning_tools() });
     }
-    json!({ "tools": [ explain_tool(), link_tool() ] })
+    json!({ "tools": [ explain_tool() ] })
 }
 
 /// Planning tools, exposed only on the planning surface (a dedicated planning
@@ -374,6 +309,14 @@ anchor — it returns who changed it, why, and a transcript pointer."
             "retired: live coordination is now the `live` field of an `explain` \
 response; there is no separate coordination tool."
         }
+        // `link` (explicit causal-edge write) is retired. Brick is now a
+        // file-history timeline: `explain` recovers WHO/WHEN/WHY for a file from
+        // the indexed session history, so there is no separate write step.
+        "link" => {
+            "retired: Brick no longer records explicit causal edges. Just use \
+`explain <path>` — it returns the timeline of sessions that changed the file, \
+newest first, each with a transcript pointer."
+        }
         // Planning tools — moved to the planning surface (`brick mcp-serve
         // --planning`), used by a dedicated planning agent, not the main agent.
         "mission" | "manage_mission" | "mission_list" | "list_missions" | "show_mission"
@@ -419,7 +362,6 @@ fn handle_tool_call(
     } else {
         match raw_name {
             "explain" => explain_tool_call(profiles, store, &args)?,
-            "link" => link_tool_call(store, &args)?,
             other => {
                 // A retired name gets an actionable migration hint; a truly
                 // unknown name gets the generic error.
@@ -551,7 +493,6 @@ fn explain_tool_call(
     crate::history::refresh_repo_sources_best_effort(store);
 
     let events = store.read_all_events()?;
-    let index = store.load_or_rebuild_index()?;
 
     // file:line and file:start-end anchors need git + the working tree; direct
     // ids do not.
@@ -580,7 +521,7 @@ fn explain_tool_call(
             (resolve_direct_anchor(&events, &anchor_input), None, false)
         };
 
-    let mut chain = explain_from_events(&index, &events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
+    let mut chain = explain_from_events(&events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
     // One db, one explain: when a WHOLE-FILE anchor has no recorded trace events,
     // the metadata db's indexed `source_sessions` ARE the chain. Shared with the
     // CLI `explain` command so both entry points behave identically.
@@ -673,180 +614,6 @@ more changes flow through Brick, explain gets richer."
     }
 
     Ok(value)
-}
-
-/// `link` dispatch: write a `causal.linked` event. Supports a standalone
-/// rationale (note only) or a cross-event edge (cause anchor + relation).
-pub(crate) fn link_for_cli(store: &LocalStore, args: &Value) -> Result<Value> {
-    link_tool_call(store, args)
-}
-
-fn link_tool_call(store: &LocalStore, args: &Value) -> Result<Value> {
-    // Resolve the store from the effect anchor (or cause) so a server spawned
-    // with `cwd=/` still writes into the agent's actual repo, not `/.brick`.
-    let anchor_hint = opt_str_arg(args, "effect")
-        .or_else(|| opt_str_arg(args, "cause"))
-        .unwrap_or_default();
-    let resolved_store = store_for_anchor(store, &anchor_hint);
-    let store = resolved_store.as_ref().unwrap_or(store);
-
-    // Keep this repo's source index fresh on write too, so a follow-up `explain`
-    // (or cause-anchor resolution here) sees the agent's latest sessions.
-    // Best-effort + throttled — never blocks or fails the write.
-    crate::history::refresh_repo_sources_best_effort(store);
-
-    let events = store.read_all_events()?;
-
-    // Track whether we synthesized a diff so the response can tell the agent
-    // which files the rationale was bound to (otherwise it silently binds to
-    // whatever it could resolve, which used to be an unrelated stale diff).
-    let mut captured_files: Vec<String> = Vec::new();
-
-    // A `link` edge always binds to ONE real change event — either an `effect`
-    // anchor that resolves to an existing event, or a fresh `diff.captured` taken
-    // from the agent's uncommitted work. There is no path/repo pseudo-anchor: a
-    // rationale with nothing to bind to is a hard error with actionable guidance,
-    // not a silently-mis-bound note. The fix for "nothing to capture" lives in
-    // the workflow (call `link` before committing), not in a runtime fallback.
-    let effect_event = match opt_str_arg(args, "effect") {
-        // An explicit anchor must resolve to a real event. A `path`/`path:line`
-        // resolves through blame to the change event that last touched it.
-        Some(anchor) => resolve_anchor_to_event(store, &events, &anchor)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "effect anchor '{anchor}' does not resolve to a Brick change event. \
-`link` records WHY against a change Brick already saw. Either omit `effect` and \
-call `link` BEFORE you commit (so the uncommitted diff is captured), or pass an \
-`effect` that names an existing event/commit Brick has indexed."
-            )
-        })?,
-        // No explicit effect: capture the agent's current uncommitted work and
-        // bind the rationale to exactly those files. A clean tree means there is
-        // nothing to attach a reason to — a hard error, never a stale mis-bind.
-        None => match capture_working_diff_event(store, args, &mut captured_files)? {
-            Some(event_id) => event_id,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "no `effect` given and no uncommitted changes to capture. `link` binds a \
-reason to a real change, so call it BEFORE committing (while your edits are still \
-in the working tree), or pass an `effect` that names an existing event/commit."
-                ));
-            }
-        },
-    };
-
-    let cause_anchor = opt_str_arg(args, "cause");
-    let cause_events = match &cause_anchor {
-        Some(anchor) => resolve_anchor_to_event(store, &events, anchor)?
-            .into_iter()
-            .collect(),
-        None => Vec::new(),
-    };
-
-    let note = opt_str_arg(args, "note");
-    let relation = parse_relation(args.get("relation").and_then(Value::as_str), &cause_events)?;
-
-    // Invariant mirror: a standalone edge needs a note.
-    if cause_events.is_empty() && note.is_none() {
-        return Err(anyhow::anyhow!(
-            "link needs either a cause anchor or a note explaining the change"
-        ));
-    }
-
-    // Confidence is `explicit` — the agent asserted this edge directly.
-    let event = TraceEvent::causal_linked(
-        mcp_actor(args),
-        ConfidenceLevel::Explicit,
-        CausalLinkedPayload {
-            effect_event,
-            cause_events: cause_events.clone(),
-            relation,
-            note: note.clone(),
-            repo_context_id: None,
-        },
-    )
-    .map_err(|err| anyhow::anyhow!("invalid causal edge: {err}"))?;
-    store.append_event(&event)?;
-    #[cfg(feature = "sync")]
-    auto_push_best_effort(store);
-
-    Ok(json!({
-        "linked": true,
-        "effect_event": effect_event.to_string(),
-        "cause_events": cause_events.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "relation": relation_wire(relation),
-        "note": note,
-        "captured_files": captured_files,
-        "note_hint": "Recorded. The next agent can recover this with `explain`."
-    }))
-}
-
-/// When `link` is called with no `effect`, the agent has just edited code with
-/// its own tools (which leave no Brick event). Capture everything the agent
-/// changed since the last commit — BOTH unstaged (`Working`) and staged
-/// (`Staged`) changes — so the rationale binds to the files actually touched,
-/// and return the new `diff.captured` event id. Returns `None` when there are no
-/// changes at all. Merging both targets matters: an agent (or its harness) that
-/// `git add`s its work before calling `link` would otherwise capture nothing and
-/// the reason would mis-bind to a stale prior diff.
-fn capture_working_diff_event(
-    store: &LocalStore,
-    args: &Value,
-    captured_files: &mut Vec<String>,
-) -> Result<Option<uuid::Uuid>> {
-    let cwd = std::env::current_dir()?;
-    let Ok(repo_root) = discover_repo_root(&cwd) else {
-        return Ok(None);
-    };
-    let mut payload = capture_diff(
-        &repo_root,
-        DiffCaptureRequest {
-            target: DiffTarget::Working,
-            base_commit: None,
-            head_commit: None,
-            repo_context_id: None,
-        },
-    )?;
-    // Fold in staged changes the working-tree diff doesn't see, deduping by path
-    // so a file that is both staged and further edited isn't listed twice.
-    let staged = capture_diff(
-        &repo_root,
-        DiffCaptureRequest {
-            target: DiffTarget::Staged,
-            base_commit: None,
-            head_commit: None,
-            repo_context_id: None,
-        },
-    )?;
-    for change in staged.file_changes {
-        if !payload
-            .file_changes
-            .iter()
-            .any(|existing| existing.path == change.path)
-        {
-            payload.file_changes.push(change);
-        }
-    }
-    if payload.file_changes.is_empty() {
-        return Ok(None);
-    }
-    captured_files.extend(
-        payload
-            .file_changes
-            .iter()
-            .map(|change| change.path.clone()),
-    );
-    let event = TraceEvent::diff_captured(
-        mcp_actor(args),
-        ArtifactId::new(),
-        link_session_id(args),
-        None,
-        payload,
-    )?;
-    let event_id = event.event_id;
-    store.append_event(&event)?;
-    #[cfg(feature = "sync")]
-    auto_push_best_effort(store);
-    Ok(Some(event_id))
 }
 
 fn append_event(store: &LocalStore, event: &TraceEvent) -> Result<()> {
@@ -1158,129 +925,6 @@ fn planning_store_fallback(default: &LocalStore) -> Option<LocalStore> {
     brick_core::resolve_brick_home().ok().map(LocalStore::new)
 }
 
-/// Resolves any anchor (file:line, artifact/mission/event id) to a single event
-/// id for `link`. file:line uses blame; ids reuse the direct resolver.
-fn resolve_anchor_to_event(
-    store: &LocalStore,
-    events: &[brick_protocol::TraceEvent],
-    anchor: &str,
-) -> Result<Option<uuid::Uuid>> {
-    if let Some((path, line)) = parse_file_line(anchor) {
-        let cwd = std::env::current_dir()?;
-        let repo_root = discover_repo_root(&cwd)?;
-        let rel_path = normalize_repo_relative(&repo_root, &path);
-        let resolved = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
-        return Ok(resolved
-            .resolved_events
-            .first()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok()));
-    }
-    if looks_like_path(anchor) {
-        let repo_root = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| discover_repo_root(&cwd).ok());
-        let rel_path = repo_root
-            .as_ref()
-            .map(|root| normalize_repo_relative(root, anchor))
-            .unwrap_or_else(|| anchor.to_string());
-        let resolved = resolve_file_anchor(events, &rel_path);
-        if let Some(id) = resolved
-            .resolved_events
-            .first()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok())
-        {
-            return Ok(Some(id));
-        }
-        // Fallback: the JSONL ledger has no event for this file (the common case
-        // for agents that edit with their own tools and rely on Brick's passive
-        // index). Resolve the anchor to a metadata source-session instead, and
-        // bind the edge to that session's id. This is what turns the "effect file
-        // has no Brick event" hard-failure into a real link for cross-repo /
-        // passively-indexed work.
-        if let Some(root) = repo_root.as_ref() {
-            return Ok(resolve_path_to_source_session(root, anchor));
-        }
-        return Ok(None);
-    }
-    let resolved = resolve_direct_anchor(events, anchor);
-    Ok(resolved
-        .resolved_events
-        .first()
-        .and_then(|id| uuid::Uuid::parse_str(id).ok()))
-}
-
-/// Resolves a file path anchor to the id of a metadata source-session that
-/// touched it, for `link`'s effect fallback. Picks the most-recent same-repo
-/// session whose `external_session_id` is a parseable UUID, and returns that
-/// UUID as the effect event. Returns `None` when nothing matches or the matched
-/// session's id isn't UUID-shaped (we never fabricate an id).
-fn resolve_path_to_source_session(repo_root: &std::path::Path, anchor: &str) -> Option<uuid::Uuid> {
-    let abs_path = if std::path::Path::new(anchor).is_absolute() {
-        anchor.to_string()
-    } else {
-        repo_root.join(anchor).display().to_string()
-    };
-    let db = MetadataDb::open_global().ok()?;
-    let query = SourceFileSessionBlameQuery {
-        file_path: abs_path,
-        source_id: None,
-        repo_path: Some(repo_root.to_path_buf()),
-        limit: MAX_EXPLAIN_DEPTH,
-    };
-    let rows = db.query_source_file_session_blame(&query).ok()?;
-    let want = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    rows.into_iter()
-        .filter(|row| {
-            row.source_pointer
-                .as_ref()
-                .and_then(|p| p.get("repo_path"))
-                .and_then(|v| v.as_str())
-                .map(|rp| {
-                    let have =
-                        std::fs::canonicalize(rp).unwrap_or_else(|_| std::path::PathBuf::from(rp));
-                    have == want
-                })
-                .unwrap_or(false)
-        })
-        .find_map(|row| {
-            row.external_session_id
-                .as_deref()
-                .and_then(|id| uuid::Uuid::parse_str(id).ok())
-        })
-}
-
-/// Parses the `relation` arg, defaulting to `derived_from` when a cause is given
-/// or `rationale` when it is not.
-fn parse_relation(raw: Option<&str>, cause_events: &[uuid::Uuid]) -> Result<CausalRelation> {
-    match raw.map(|value| value.trim().to_lowercase()).as_deref() {
-        Some("triggered_by") => Ok(CausalRelation::TriggeredBy),
-        Some("derived_from") => Ok(CausalRelation::DerivedFrom),
-        Some("supersedes") => Ok(CausalRelation::Supersedes),
-        Some("responds_to") => Ok(CausalRelation::RespondsTo),
-        Some("rationale") => Ok(CausalRelation::Rationale),
-        Some(other) => Err(anyhow::anyhow!(
-            "unknown relation: {other} (triggered_by|derived_from|supersedes|responds_to|rationale)"
-        )),
-        None => {
-            if cause_events.is_empty() {
-                Ok(CausalRelation::Rationale)
-            } else {
-                Ok(CausalRelation::DerivedFrom)
-            }
-        }
-    }
-}
-
-fn relation_wire(relation: CausalRelation) -> &'static str {
-    match relation {
-        CausalRelation::TriggeredBy => "triggered_by",
-        CausalRelation::DerivedFrom => "derived_from",
-        CausalRelation::Supersedes => "supersedes",
-        CausalRelation::RespondsTo => "responds_to",
-        CausalRelation::Rationale => "rationale",
-    }
-}
-
 /// Fills each step's transcript pointer with the concrete on-disk location: a
 /// file path for file-backed sources (Claude/Codex/Gemini), or a sqlite ref for
 /// db-backed ones (Cursor/ORGII). The core only knows the session id; the CLI
@@ -1298,14 +942,14 @@ fn enrich_transcripts(
     cwd_profiles: Option<&SourceProfileStore>,
     chain: &mut CausalChain,
 ) {
-    // Cheap exit: if no step or forward effect carries a session id, there is
-    // nothing to resolve and we skip the (potentially slow) source scan.
+    // Cheap exit: if no step carries a session id, there is nothing to resolve
+    // and we skip the (potentially slow) source scan.
     let needs_resolution = chain.steps.iter().any(|step| {
         step.transcript
             .as_ref()
             .and_then(|t| t.session_id.as_ref())
             .is_some()
-    }) || chain.forward.iter().any(|f| f.session_id.is_some());
+    });
     if !needs_resolution {
         return;
     }
@@ -1510,17 +1154,6 @@ fn mcp_actor(args: &Value) -> ActorRef {
         actor_id,
         display_name: None,
     }
-}
-
-/// The session a `link` write belongs to, if the caller named one. Lets the
-/// recorded `diff.captured` carry a `session_id`, which `explain` later turns
-/// into a transcript pointer — the seam that lets a curious agent open the
-/// original session that produced a change. Accepts `session` or the more
-/// explicit `session_id` arg; an empty/blank value resolves to `None`.
-fn link_session_id(args: &Value) -> Option<SessionId> {
-    opt_str_arg(args, "session")
-        .or_else(|| opt_str_arg(args, "session_id"))
-        .and_then(|value| SessionId::from_str(&value).ok())
 }
 
 /// snake_case wire string for a mission status (matches the serde rename).

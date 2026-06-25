@@ -3,7 +3,6 @@
 use anyhow::{Context, Result};
 use brick_core::{discover_repo_root, LocalStore, SourceProfileStore, StorageOptions};
 use clap::Parser;
-use serde_json::{json, Value};
 
 mod agent;
 mod args;
@@ -24,8 +23,8 @@ use args::{
 use args::SyncCommand;
 #[cfg(feature = "sync")]
 use brick_sync::{
-    auto_pull_best_effort, auto_push_best_effort, handle_accept_invites, handle_create_org,
-    handle_invite, handle_pull, handle_push, handle_sync, identity,
+    auto_pull_best_effort, handle_accept_invites, handle_create_org, handle_invite, handle_pull,
+    handle_push, handle_sync, identity,
 };
 
 fn main() -> Result<()> {
@@ -68,12 +67,6 @@ fn main() -> Result<()> {
             depth,
             format,
         } => handle_explain(&store, &anchor, depth, format)?,
-        Command::Link {
-            effect,
-            cause,
-            relation,
-            note,
-        } => handle_link(&store, effect, cause, relation, note, cli.identity.session)?,
         Command::HookExplain => metadata::run_explain_hook(&store)?,
         #[cfg(feature = "sync")]
         Command::Sync { command } => match command {
@@ -225,7 +218,6 @@ fn handle_explain(
     history::ensure_json(format);
     history::refresh_repo_sources_best_effort(store);
     let events = store.read_all_events()?;
-    let index = store.load_or_rebuild_index()?;
     let depth = depth.unwrap_or(brick_core::DEFAULT_EXPLAIN_DEPTH);
 
     let (resolved, anchored_path, is_file_line) =
@@ -275,7 +267,7 @@ fn handle_explain(
             )
         };
 
-    let mut chain = brick_core::explain_from_events(&index, &events, resolved, depth);
+    let mut chain = brick_core::explain_from_events(&events, resolved, depth);
     let index_session_hint = mcp::merge_index_sessions_into_chain(
         &mut chain,
         store.repo_root(),
@@ -290,36 +282,6 @@ fn handle_explain(
         anchored_path.as_deref(),
         index_session_hint,
     )?;
-    history::print_json(&value)
-}
-
-fn handle_link(
-    store: &LocalStore,
-    effect: Option<String>,
-    cause: Option<String>,
-    relation: Option<String>,
-    note: Option<String>,
-    session: Option<String>,
-) -> Result<()> {
-    let mut args = serde_json::Map::new();
-    if let Some(value) = effect {
-        args.insert("effect".to_string(), json!(value));
-    }
-    if let Some(value) = cause {
-        args.insert("cause".to_string(), json!(value));
-    }
-    if let Some(value) = relation {
-        args.insert("relation".to_string(), json!(value));
-    }
-    if let Some(value) = note {
-        args.insert("note".to_string(), json!(value));
-    }
-    if let Some(value) = session {
-        args.insert("session".to_string(), json!(value));
-    }
-    let value = mcp::link_for_cli(store, &Value::Object(args))?;
-    #[cfg(feature = "sync")]
-    auto_push_best_effort(store);
     history::print_json(&value)
 }
 

@@ -35,8 +35,6 @@ pub fn run_explain_hook(store: &LocalStore) -> Result<()> {
 
 fn build_explain_hook_context(store: &LocalStore, file_path: &str) -> Result<Option<String>> {
     let events = store.read_all_events()?;
-    let index = store.load_or_rebuild_index()?;
-
     let rel = file_path.trim_start_matches("./");
     let mut matches: Vec<&brick_protocol::TraceEvent> = events
         .iter()
@@ -50,8 +48,7 @@ fn build_explain_hook_context(store: &LocalStore, file_path: &str) -> Result<Opt
     let anchor_event = matches[0].event_id.to_string();
 
     let anchor = brick_core::resolve_direct_anchor(&events, &anchor_event);
-    let chain =
-        brick_core::explain_from_events(&index, &events, anchor, brick_core::DEFAULT_EXPLAIN_DEPTH);
+    let chain = brick_core::explain_from_events(&events, anchor, brick_core::DEFAULT_EXPLAIN_DEPTH);
 
     let whys: Vec<String> = chain
         .steps

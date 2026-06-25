@@ -390,7 +390,7 @@ First slice implemented in Brick:
 
 ## Incremental refresh model (shipped)
 
-Brick auto-refreshes the anchor repo's sources on every `explain`/`link` call, but the refresh is both throttled and incremental, so it stays near-real-time without a manual CLI refresh.
+Brick auto-refreshes the anchor repo's sources on every `explain` call, but the refresh is both throttled and incremental, so it stays near-real-time without a manual CLI refresh.
 
 - **Watermark table.** `source_index_watermark(source_id, last_indexed_updated_at, last_refreshed_at)` lives in `metadata.sqlite` (schema version 6) and tracks each source's high-water mark.
 - **Incremental entry point.** `list_source_sessions_since(profile, limit, since)` is the incremental scan path; `since` is the source's last indexed updated-at.
@@ -398,7 +398,7 @@ Brick auto-refreshes the anchor repo's sources on every `explain`/`link` call, b
   - File-mtime gate (JSONL/JSON file providers — `claude_code`, `codex_app`, `gemini`): the native file walker (`native_source.rs`) skips parsing any session file whose mtime is at or below the watermark. This is what eliminates the big-history full re-scan cost (codex went from 1413 parsed session files to ~1 on incremental runs).
   - SQL / column push-down (ORGII and OpenCode): `updated_at >= since` filters at the query / parsed-column level (`time_updated` for OpenCode).
   - KV-blob post-filter (cursor-family — `cursor_ide`, `windsurf`): `filter_sessions_since` shrinks the downstream upsert set after parsing, because the session's updated time lives inside a SQLite KV JSON blob that must be parsed anyway.
-- **Persistent cross-process throttle.** Auto-refresh is keyed on `source_index_watermark.last_refreshed_at` with a 10s window, so back-to-back `explain`/`link` calls across separate CLI processes stay cheap. (The earlier in-process `OnceLock` throttle never fired for the CLI, where each invocation is a fresh process.)
+- **Persistent cross-process throttle.** Auto-refresh is keyed on `source_index_watermark.last_refreshed_at` with a 10s window, so back-to-back `explain` calls across separate CLI processes stay cheap. (The earlier in-process `OnceLock` throttle never fired for the CLI, where each invocation is a fresh process.)
 - **Measured effect.** A throttle-expired `explain` over a multi-GB ORGII plus ~1400-file codex history dropped from ~30s (full re-scan of every source) to ~0.5s once the watermark is populated.
 
 ## Provider fixture validation

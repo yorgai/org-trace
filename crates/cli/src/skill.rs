@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 
 /// Bumped whenever `SKILL_BODY` or the frontmatter changes so `status` can report
 /// an installed skill as stale and `install --force` can roll it forward.
-const SKILL_VERSION: u32 = 1;
+const SKILL_VERSION: u32 = 2;
 
 /// The skill directory name (becomes the `/brick` command in Claude Code) and the
 /// frontmatter `name`. The directory name — not the frontmatter — drives skill
@@ -64,14 +64,15 @@ always: true\n\
 const DESCRIPTION: &str = "Recall WHY this codebase looks the way it does — the causal history across every AI tool that touched it. Use when investigating what caused a bug, explaining why some behavior or code exists, tracing what introduced a change, answering a \"how did this happen\" or \"why is this broken\" question, or reviewing code before you change it. Reach for this skill BEFORE grep, git log, reading files top-to-bottom, or web search — `brick explain` is the first move for any cause/history question.";
 
 /// The skill body — the procedure the agent follows once it decides Brick applies.
-/// Mirrors the `explain`/`link` workflow taught by the markdown block, written as
+/// Mirrors the `explain` workflow taught by the markdown block, written as
 /// imperative steps.
 const SKILL_BODY: &str = "\
 # Brick — causal memory of this codebase
 
 Brick answers WHY code looks the way it does, across every AI tool that has touched
-this repo. It is the causal layer git does not have. Its agent surface is two MCP
-tools: `explain` (read WHY) and `link` (the rare explicit write).
+this repo. It is the history layer git does not have: for any file it returns the
+timeline of AI sessions that changed it, newest first, each with a transcript
+pointer. Its agent surface is one MCP tool: `explain` (read WHY). It is read-only.
 
 ## When the task is about CAUSE or HISTORY
 
@@ -86,11 +87,12 @@ brick explain <path>:<start>-<end>   # explain a whole block at once
 ```
 
 (Or call the `explain` MCP tool.) The anchor can also be a whole file, an artifact,
-a mission, or an event id. It returns a `causal_chain`: who changed that code, WHEN,
-the `mission_title` they did it under, what was derived from or triggered by it, and
-whether another session is editing the file right now.
+a mission, or an event id. It returns a `causal_chain`: a newest-first timeline of
+the sessions that touched the anchor — who changed it, WHEN, the `mission_title`
+they did it under, and whether another session is editing the file right now. depth
+0 is the most recent change; higher depth is older.
 
-**What counts as a real Brick record.** A chain step carrying an `actor_id`, a
+**What counts as a real Brick record.** A timeline step carrying an `actor_id`, a
 `mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY even
 when its `note` is null. Only fall back to git/grep when `explain` returns an empty
 `causal_chain` or an explicit \"No Brick record\" note.
@@ -103,12 +105,8 @@ tool calls, errors, and reasoning end-to-end. The real cause lives in that deep 
 
 ## After you change code
 
-You usually do NOT need to record anything: `explain` recovers the WHY of ordinary
-edits from the session transcript automatically. Only call the `link` MCP tool for a
-causal edge Brick cannot infer — a cross-repo / cross-session cause
-(`relation=derived_from`/`triggered_by`), a change that supersedes an earlier one
-(`relation=supersedes`), or a high-stakes rationale you want recorded at `explicit`
-confidence.
+Nothing to record: Brick recovers the WHY of your edits from the session transcript
+automatically, so the next agent's `explain` will surface what you did and why.
 ";
 
 /// Result of an install/uninstall/status operation on a skill file.

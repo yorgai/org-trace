@@ -93,7 +93,7 @@ sequenceDiagram
 - **ORGII, OpenCode**: SQL / parsed-column `updated_at >= since` push-down at the query layer.
 - **cursor_ide, windsurf**: a KV-blob post-filter (`filter_sessions_since`), since their updated time lives inside a SQLite KV JSON blob that must be parsed anyway — this shrinks the downstream upsert set.
 
-A persistent, cross-process throttle keyed on `source_index_watermark.last_refreshed_at` (10s window) keeps back-to-back refreshes cheap across separate CLI processes. `explain` and `link` auto-refresh the anchor's repo sources on every call — throttled and incremental — so reads stay near-real-time without a manual CLI refresh.
+A persistent, cross-process throttle keyed on `source_index_watermark.last_refreshed_at` (10s window) keeps back-to-back refreshes cheap across separate CLI processes. `explain` auto-refreshes the anchor's repo sources on every call — throttled and incremental — so reads stay near-real-time without a manual CLI refresh.
 
 ## Provenance write path
 

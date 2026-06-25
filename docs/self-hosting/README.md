@@ -76,7 +76,7 @@ The server verifies Supabase access-token JWTs with the project JWT secret. Repo
 
 ## Legacy brick-server push and pull
 
-The default sync payload is one fused normalized stream: source session metadata plus normalized transcript chunks, mission events, artifacts, diffs, and causal edges. Provider-local sqlite/jsonl files are ingestion sources only; `push` uploads the normalized Brick rows/events incrementally, and `pull` backfills them into the local metadata DB so `explain` and session search read Brick's fused DB directly.
+The default sync payload is one fused normalized stream: source session metadata plus normalized transcript chunks, mission events, artifacts, and diffs. Provider-local sqlite/jsonl files are ingestion sources only; `push` uploads the normalized Brick rows/events incrementally, and `pull` backfills them into the local metadata DB so `explain` and session search read Brick's fused DB directly.
 
 Use a repo ID when synchronizing a specific repository boundary:
 
@@ -88,7 +88,7 @@ cargo run -p brick --features sync -- sync run --remote http://127.0.0.1:7821 --
 
 `push` posts local queued normalized events and prints accepted, duplicate, and queued counts. It does not drain or delete the local queue. `pull` pages remote events, deduplicates by event ID against local queued and inbound events, writes new remote events under the local inbound log, and backfills pulled `source.session_observed` metadata + normalized chunks into the local metadata DB. `sync` currently runs pull followed by non-draining push.
 
-With a `--features sync` build and a logged-in Supabase session, Brick also performs best-effort automatic sync on the normal agent path: `explain` tries to pull before reading, and successful `link` / planning writes try to push after appending a local event. Automatic sync uses repo-scoped routes with `repo_id_for_root(repo_root)`. Set `BRICK_AUTO_SYNC_REMOTE=supabase` for Supabase-native sync, set it to an HTTP server URL for legacy brick-server sync, or set `BRICK_AUTO_SYNC_DISABLE=1` to turn the automatic pull/push attempts off.
+With a `--features sync` build and a logged-in Supabase session, Brick also performs best-effort automatic sync on the normal agent path: `explain` tries to pull before reading, and successful planning writes try to push after appending a local event. Automatic sync uses repo-scoped routes with `repo_id_for_root(repo_root)`. Set `BRICK_AUTO_SYNC_REMOTE=supabase` for Supabase-native sync, set it to an HTTP server URL for legacy brick-server sync, or set `BRICK_AUTO_SYNC_DISABLE=1` to turn the automatic pull/push attempts off.
 
 ## Repo ID behavior
 
@@ -126,7 +126,7 @@ cargo run -p brick-server -- rebuild-index --data-dir .brick-server --repo-id re
 
 ## Source notes
 
-Brick's current user-facing path is `explain` / `link`. Native AI-tool history is
+Brick's current user-facing path is `explain`. Native AI-tool history is
 refreshed automatically as part of those calls when available; the old public
 `source` and `import` commands are no longer part of the supported CLI surface.
 

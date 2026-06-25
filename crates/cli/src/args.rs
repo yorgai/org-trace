@@ -63,7 +63,7 @@ pub enum Command {
     /// Run as an MCP server over stdio so any MCP-capable agent can query Brick.
     McpServe {
         /// Expose the planning tool surface instead of the default coding-agent
-        /// surface (explain + link).
+        /// surface (explain).
         #[arg(long)]
         planning: bool,
     },
@@ -72,22 +72,11 @@ pub enum Command {
         /// Anchor: `path:line`, `path:start-end`, whole-file path, artifact id,
         /// mission id, or event id.
         anchor: String,
-        /// Causal hops to walk back (default 3, max 8).
+        /// How many older changes to walk back in the timeline (default 3, max 8).
         #[arg(long)]
         depth: Option<usize>,
         #[arg(long, value_enum, default_value_t = HistoryFormatArg::Json)]
         format: HistoryFormatArg,
-    },
-    /// Record WHY for a change.
-    Link {
-        #[arg(long)]
-        effect: Option<String>,
-        #[arg(long)]
-        cause: Option<String>,
-        #[arg(long)]
-        relation: Option<String>,
-        #[arg(long)]
-        note: Option<String>,
     },
     /// Claude Code hook adapter: inject explain context before file inspection.
     #[command(name = "hook-explain", hide = true)]

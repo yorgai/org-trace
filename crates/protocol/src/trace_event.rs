@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{
     ActorRef, ArtifactAttachmentUploadedPayload, ArtifactCreatedPayload,
     ArtifactFileRefRecordedPayload, ArtifactId, ArtifactLinkedToMissionPayload,
-    ArtifactUpdatedPayload, CausalLinkedPayload, ConfidenceLevel, DiffCapturedPayload, EventType,
+    ArtifactUpdatedPayload, ConfidenceLevel, DiffCapturedPayload, EventType,
     ExternalRefLinkedPayload, MissionCreatedPayload, MissionId, MissionUpdatedPayload,
     OrgCreatedPayload, OrgId, OrgUpdatedPayload, ProjectCreatedPayload, ProjectId,
     ProjectUpdatedPayload, RepoContextCapturedPayload, RepoContextId, SessionId,
@@ -306,36 +306,6 @@ impl TraceEvent {
         Ok(event)
     }
 
-    /// Builds a `causal.linked` event recording a directed causal edge.
-    ///
-    /// `confidence` distinguishes how the edge was produced: `Explicit` (an agent
-    /// or human asserted it), `Observed` (a hook captured it from session
-    /// context), or `Inferred` (a fallback heuristic). The invariant — at least
-    /// one of `cause_events` or `note` must be non-empty — is enforced here so an
-    /// information-free edge can never enter the log.
-    pub fn causal_linked(
-        actor: ActorRef,
-        confidence: ConfidenceLevel,
-        payload: CausalLinkedPayload,
-    ) -> Result<Self, CausalLinkError> {
-        if payload.cause_events.is_empty()
-            && payload
-                .note
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-        {
-            return Err(CausalLinkError::Empty);
-        }
-        let repo_context_id = payload.repo_context_id.clone();
-        let mut event = Self::from_payload(EventType::CausalLinked, actor, payload)
-            .map_err(CausalLinkError::Serialize)?;
-        event.confidence = confidence;
-        event.repo_context_id = repo_context_id;
-        Ok(event)
-    }
-
     fn from_payload<T>(
         event_type: EventType,
         actor: ActorRef,
@@ -400,7 +370,7 @@ impl std::error::Error for CausalLinkError {
 mod tests {
     use crate::{
         ActorRef, ActorType, ArtifactAttachmentUploadedPayload, ArtifactId, ArtifactKind,
-        ArtifactUpdatedPayload, AttachmentId, CausalRelation, DiffCapturedPayload, DiffFileChange,
+        ArtifactUpdatedPayload, AttachmentId, DiffCapturedPayload, DiffFileChange,
         DiffFileChangeKind, DiffHunk, DiffTarget, EventType, EvidenceAvailability, LogRefId,
         SessionId, SessionLogFormat, SessionLogUploadedPayload, SessionSource,
         SessionStartedPayload,
@@ -570,104 +540,5 @@ mod tests {
         assert_eq!(event.payload["log_ref_id"], log_ref_id.as_str());
         assert_eq!(event.payload["format"], "jsonl");
         assert!(event.payload.get("content").is_none());
-    }
-
-    #[test]
-    fn causal_linked_serializes_cross_event_edge() {
-        let effect = Uuid::new_v4();
-        let cause = Uuid::new_v4();
-        let event = TraceEvent::causal_linked(
-            actor(),
-            ConfidenceLevel::Explicit,
-            CausalLinkedPayload {
-                effect_event: effect,
-                cause_events: vec![cause],
-                relation: CausalRelation::DerivedFrom,
-                note: Some("covers the race fix".to_string()),
-                repo_context_id: None,
-            },
-        )
-        .expect("build causal edge");
-
-        let serialized = serde_json::to_string(&event).expect("serialize causal edge");
-        assert!(serialized.contains("\"event_type\":\"causal.linked\""));
-        assert_eq!(event.event_type, EventType::CausalLinked);
-        assert_eq!(event.confidence, ConfidenceLevel::Explicit);
-        assert_eq!(event.payload["effect_event"], effect.to_string());
-        assert_eq!(event.payload["cause_events"][0], cause.to_string());
-        assert_eq!(event.payload["relation"], "derived_from");
-        assert_eq!(event.payload["note"], "covers the race fix");
-    }
-
-    #[test]
-    fn causal_linked_allows_standalone_rationale() {
-        let effect = Uuid::new_v4();
-        let event = TraceEvent::causal_linked(
-            actor(),
-            ConfidenceLevel::Observed,
-            CausalLinkedPayload {
-                effect_event: effect,
-                cause_events: vec![],
-                relation: CausalRelation::Rationale,
-                note: Some("token refresh has a concurrency race".to_string()),
-                repo_context_id: None,
-            },
-        )
-        .expect("build rationale edge");
-
-        assert_eq!(event.confidence, ConfidenceLevel::Observed);
-        assert_eq!(event.payload["relation"], "rationale");
-        // Empty cause_events is skipped on the wire.
-        assert!(event.payload.get("cause_events").is_none());
-    }
-
-    #[test]
-    fn causal_linked_round_trips() {
-        let event = TraceEvent::causal_linked(
-            actor(),
-            ConfidenceLevel::Inferred,
-            CausalLinkedPayload {
-                effect_event: Uuid::new_v4(),
-                cause_events: vec![Uuid::new_v4(), Uuid::new_v4()],
-                relation: CausalRelation::TriggeredBy,
-                note: None,
-                repo_context_id: None,
-            },
-        )
-        .expect("build causal edge");
-
-        let serialized = serde_json::to_string(&event).expect("serialize");
-        let decoded: TraceEvent = serde_json::from_str(&serialized).expect("deserialize");
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn causal_linked_rejects_information_free_edge() {
-        let result = TraceEvent::causal_linked(
-            actor(),
-            ConfidenceLevel::Explicit,
-            CausalLinkedPayload {
-                effect_event: Uuid::new_v4(),
-                cause_events: vec![],
-                relation: CausalRelation::Rationale,
-                note: Some("   ".to_string()),
-                repo_context_id: None,
-            },
-        );
-        assert!(matches!(result, Err(CausalLinkError::Empty)));
-    }
-
-    #[test]
-    fn causal_relation_wire_values_are_stable() {
-        let cases = [
-            (CausalRelation::TriggeredBy, "\"triggered_by\""),
-            (CausalRelation::DerivedFrom, "\"derived_from\""),
-            (CausalRelation::Supersedes, "\"supersedes\""),
-            (CausalRelation::RespondsTo, "\"responds_to\""),
-            (CausalRelation::Rationale, "\"rationale\""),
-        ];
-        for (relation, wire) in cases {
-            assert_eq!(serde_json::to_string(&relation).unwrap(), wire);
-        }
     }
 }

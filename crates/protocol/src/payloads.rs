@@ -6,11 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::{
-    ArtifactKind, AttachmentId, CausalRelation, ContextMode, DiffFileChangeKind, DiffTarget,
-    ExternalRefId, FileRefId, LogRefId, MissionStatus, OrgId, ProjectId, RepoContextId,
+    ArtifactKind, AttachmentId, ContextMode, DiffFileChangeKind, DiffTarget, ExternalRefId,
+    FileRefId, LogRefId, MissionStatus, OrgId, ProjectId, RepoContextId,
 };
 
 /// Source-application identity for a canonical Brick session.
@@ -273,25 +272,4 @@ pub struct SourceSessionObservedPayload {
     pub metadata_json: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normalized_chunks: Vec<Value>,
-}
-
-/// Payload for a directed causal edge in the provenance graph.
-///
-/// `effect_event` is the event that happened (usually a `diff.captured`);
-/// `cause_events` are the zero-or-more upstream events that caused it (any
-/// `event_id` — a diff, an artifact, another session's event, a mission — not
-/// just a mission). `cause_events` may be empty for a standalone `Rationale`.
-///
-/// Invariant (enforced by `TraceEvent::causal_linked`): at least one of
-/// `cause_events` (non-empty) or `note` (non-empty) must carry information — an
-/// edge with neither a cause nor a reason is pure noise and is rejected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CausalLinkedPayload {
-    pub effect_event: Uuid,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cause_events: Vec<Uuid>,
-    pub relation: CausalRelation,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    pub repo_context_id: Option<RepoContextId>,
 }

@@ -1,21 +1,15 @@
-//! `explain`: walk the causal graph backward from an anchor to answer WHY a
-//! piece of code looks the way it does — not just WHO last touched it (that is
-//! `blame`, a single hop). This is the read side of Brick's causal continuity
-//! layer.
+//! `explain`: a file-history timeline. Given an anchor (a file, a `file:line`,
+//! or a direct event/artifact/mission id), return the sessions/changes that
+//! touched it in reverse-chronological order — newest first (depth 0), older
+//! changes pushed further out. This answers "why does this code look the way it
+//! does" by showing WHO changed it, WHEN, under which mission, with a transcript
+//! pointer to read the full session — not via a separately-recorded causal graph.
 //!
-//! Two ideas keep this honest:
-//!
-//! 1. **Edges are built at index time, chains are walked at query time.** The
-//!    adjacency tables (`TraceIndex.causes` / `effects`) materialize the *edges*;
-//!    a *chain* is relative to an anchor + depth, so we BFS it here on demand
-//!    rather than pre-materializing every possible chain (which would explode).
-//! 2. **The graph is the goal; the timeline is only a degraded fallback.**
-//!    Explicit `causal.linked` edges (`explicit`/`observed`) are the real causal
-//!    graph. When an anchor event has no edges at all, we fall back to a shallow
-//!    same-session time-ordered guess and label every such step `inferred` — a
-//!    timeline, clearly marked as a guess, never dressed up as causality.
+//! The anchor resolvers (`resolve_file_anchor`, blame-backed `file:line`, direct
+//! id) already produce the matching events newest-first; `explain_from_events`
+//! just turns each into a timeline step and caps the count at `depth`.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +17,7 @@ use brick_protocol::{EventType, SourceSessionObservedPayload, TraceEvent};
 
 use crate::blame::blame_file;
 use crate::store::LocalStore;
-use crate::{CausalEdge, FileSessionBlameRow, TraceIndex};
+use crate::FileSessionBlameRow;
 
 /// Default backward traversal depth, and the hard cap callers cannot exceed.
 pub const DEFAULT_EXPLAIN_DEPTH: usize = 3;
@@ -72,8 +66,8 @@ pub struct TranscriptPointer {
     pub read_session: Option<String>,
 }
 
-/// One step in a causal chain: an event, who/when produced it, why (the rationale
-/// note + the relation to the step it caused), and how confident the attribution is.
+/// One step in a file-history timeline: an event/session, who/when produced it,
+/// the mission it belonged to, and a transcript pointer to read the full session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausalStep {
     pub event_id: String,
@@ -89,36 +83,28 @@ pub struct CausalStep {
     /// the WHY ("Harden token refresh") instead of an opaque id it discards.
     pub mission_title: Option<String>,
     pub occurred_at: String,
-    /// Relation of THIS step to the step it caused (the one nearer the anchor).
-    /// `None` for the anchor/root steps themselves.
+    /// Unused in the timeline model (kept for response-shape stability); always
+    /// `None`.
     pub relation: Option<String>,
-    /// The WHY: a standalone rationale recorded on this event, when present.
+    /// The WHY: a turn-final rationale recovered from the session transcript by
+    /// the CLI/MCP layer, when present.
     pub note: Option<String>,
-    /// `explicit` (asserted) / `observed` (hook-captured) / `inferred` (fallback).
+    /// `observed` (transcript-captured) / `inferred` (heuristic) / a blame
+    /// confidence for line anchors.
     pub confidence: String,
     pub transcript: Option<TranscriptPointer>,
-    /// Distance from the anchor (0 = anchor itself).
+    /// Distance from the anchor in the timeline (0 = newest / anchor itself).
     pub depth: usize,
 }
 
-/// A forward effect of the anchor: something derived from / triggered by it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForwardEffect {
-    pub event_id: String,
-    pub event_type: String,
-    pub title: Option<String>,
-    pub relation_to_anchor: Option<String>,
-    pub session_id: Option<String>,
-}
-
-/// The full result of an `explain` query.
+/// The full result of an `explain` query: a newest-first timeline of the
+/// sessions/changes that touched the anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausalChain {
     pub anchor: ExplainAnchor,
     #[serde(rename = "causal_chain")]
     pub steps: Vec<CausalStep>,
-    pub forward: Vec<ForwardEffect>,
-    /// True when traversal hit the depth cap and stopped before exhausting causes.
+    /// True when the timeline hit the depth cap and older changes were omitted.
     pub truncated: bool,
 }
 
@@ -450,10 +436,10 @@ pub fn resolve_file_range_anchor(
     })
 }
 
-/// Walks the causal graph backward from `anchor`'s resolved events, returning the
-/// chain of steps (newest/anchor first) plus the anchor's forward effects.
+/// Builds the file-history timeline for `anchor`: each resolved event becomes a
+/// step, newest first (the resolvers already sort newest-first), capped at
+/// `depth`. `truncated` is set when older changes were dropped at the cap.
 pub fn explain_from_events(
-    index: &TraceIndex,
     events: &[TraceEvent],
     anchor: ExplainAnchor,
     depth: usize,
@@ -466,123 +452,46 @@ pub fn explain_from_events(
     let mission_titles = mission_title_index(events);
 
     let mut steps = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut truncated = false;
 
-    // BFS backward. Each queue item carries the event, the relation by which it
-    // caused its parent (None for roots), and its depth from the anchor.
-    let mut queue: VecDeque<(String, Option<String>, usize)> = VecDeque::new();
-    for root in &anchor.resolved_events {
-        queue.push_back((root.clone(), None, 0));
-    }
-
-    while let Some((event_id, relation, step_depth)) = queue.pop_front() {
-        if !visited.insert(event_id.clone()) {
+    // The anchor's resolved events are already newest-first. Cap at depth+1 (the
+    // anchor itself is depth 0, then `depth` older changes); anything beyond is a
+    // truncation.
+    let limit = depth.saturating_add(1);
+    for event_id in &anchor.resolved_events {
+        if !seen.insert(event_id.clone()) {
             continue;
         }
-
-        let edges = index.causes.get(&event_id);
-        let (rationale_note, rationale_conf) = rationale_of(edges);
+        if steps.len() >= limit {
+            truncated = true;
+            break;
+        }
         let step = build_step(
-            by_id.get(&event_id).copied(),
-            &event_id,
-            relation,
-            rationale_note,
-            rationale_conf,
-            step_depth,
+            by_id.get(event_id).copied(),
+            event_id,
+            steps.len(),
             &mission_titles,
         );
         steps.push(step);
-
-        if step_depth >= depth {
-            if edges.map(|edges| edges.iter().any(|e| e.cause_event.is_some())) == Some(true) {
-                truncated = true;
-            }
-            continue;
-        }
-
-        if let Some(edges) = edges {
-            for edge in edges {
-                if let Some(cause) = &edge.cause_event {
-                    if !visited.contains(cause) {
-                        queue.push_back((cause.clone(), Some(relation_name(edge)), step_depth + 1));
-                    }
-                }
-            }
-        }
     }
-
-    // If the anchor event has no causal edges at all, degrade to a shallow
-    // same-session timeline guess — clearly labelled `inferred`.
-    if steps.len() == 1
-        && !index
-            .causes
-            .contains_key(&anchor.resolved_events.first().cloned().unwrap_or_default())
-    {
-        if let Some(anchor_event) = anchor
-            .resolved_events
-            .first()
-            .and_then(|id| by_id.get(id).copied())
-        {
-            for inferred in
-                inferred_same_session_steps(events, anchor_event, depth, &mission_titles)
-            {
-                if visited.insert(inferred.event_id.clone()) {
-                    steps.push(inferred);
-                }
-            }
-        }
-    }
-
-    let forward = forward_effects(index, &by_id, &anchor.resolved_events);
 
     CausalChain {
         anchor,
         steps,
-        forward,
         truncated,
     }
-}
-
-/// Extracts the standalone rationale (cause-less edge) note + confidence for an
-/// effect event, if one was recorded. Multiple rationales collapse to the first.
-fn rationale_of(edges: Option<&Vec<CausalEdge>>) -> (Option<String>, Option<String>) {
-    let Some(edges) = edges else {
-        return (None, None);
-    };
-    for edge in edges {
-        if edge.cause_event.is_none() {
-            return (edge.note.clone(), Some(edge.confidence.clone()));
-        }
-    }
-    // A cross-event edge can also carry a note explaining the link.
-    for edge in edges {
-        if edge.note.is_some() {
-            return (edge.note.clone(), Some(edge.confidence.clone()));
-        }
-    }
-    (None, edges.first().map(|edge| edge.confidence.clone()))
-}
-
-fn relation_name(edge: &CausalEdge) -> String {
-    serde_json::to_value(edge.relation)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "triggered_by".to_string())
 }
 
 fn build_step(
     event: Option<&TraceEvent>,
     event_id: &str,
-    relation: Option<String>,
-    note: Option<String>,
-    rationale_conf: Option<String>,
     depth: usize,
     mission_titles: &BTreeMap<String, String>,
 ) -> CausalStep {
     match event {
         Some(event) if event.event_type == EventType::SourceSessionObserved => {
-            build_source_session_step(event, event_id, relation, note, rationale_conf, depth)
+            build_source_session_step(event, event_id, depth)
         }
         Some(event) => CausalStep {
             event_id: event_id.to_string(),
@@ -594,14 +503,14 @@ fn build_step(
             mission_id: event.mission_id.as_ref().map(ToString::to_string),
             mission_title: mission_title_for(event, mission_titles),
             occurred_at: event.occurred_at.to_rfc3339(),
-            relation,
-            note,
-            confidence: rationale_conf.unwrap_or_else(|| confidence_wire(event)),
+            relation: None,
+            note: None,
+            confidence: confidence_wire(event),
             transcript: transcript_pointer(event),
             depth,
         },
-        // Edge references an event-id not present in the stream (e.g. a dangling
-        // cause). Report it honestly rather than dropping the link.
+        // Anchor resolved to an event-id not present in the stream (e.g. a stale
+        // blame pointer). Report it honestly rather than dropping the step.
         None => CausalStep {
             event_id: event_id.to_string(),
             event_type: "unknown".to_string(),
@@ -612,23 +521,16 @@ fn build_step(
             mission_id: None,
             mission_title: None,
             occurred_at: String::new(),
-            relation,
-            note,
-            confidence: rationale_conf.unwrap_or_else(|| "unknown".to_string()),
+            relation: None,
+            note: None,
+            confidence: "unknown".to_string(),
             transcript: None,
             depth,
         },
     }
 }
 
-fn build_source_session_step(
-    event: &TraceEvent,
-    event_id: &str,
-    relation: Option<String>,
-    note: Option<String>,
-    rationale_conf: Option<String>,
-    depth: usize,
-) -> CausalStep {
+fn build_source_session_step(event: &TraceEvent, event_id: &str, depth: usize) -> CausalStep {
     let payload =
         serde_json::from_value::<SourceSessionObservedPayload>(event.payload.clone()).ok();
     let source = payload
@@ -655,9 +557,9 @@ fn build_source_session_step(
             .as_ref()
             .and_then(|payload| payload.session_updated_at.clone())
             .unwrap_or_else(|| event.occurred_at.to_rfc3339()),
-        relation,
-        note,
-        confidence: rationale_conf.unwrap_or_else(|| confidence_wire(event)),
+        relation: None,
+        note: None,
+        confidence: confidence_wire(event),
         transcript: Some(TranscriptPointer {
             source,
             session_ref: source_path,
@@ -701,87 +603,6 @@ fn mission_title_for(
         .mission_id
         .as_ref()
         .and_then(|mission_id| mission_titles.get(&mission_id.to_string()).cloned())
-}
-
-/// Shallow fallback: when an anchor event has no causal edges, surface the most
-/// recent prior events in the SAME session as `inferred` context. This is a
-/// timeline, not a causal chain — every step is marked `inferred`.
-fn inferred_same_session_steps(
-    events: &[TraceEvent],
-    anchor_event: &TraceEvent,
-    depth: usize,
-    mission_titles: &BTreeMap<String, String>,
-) -> Vec<CausalStep> {
-    let Some(session) = anchor_event.session_id.as_ref() else {
-        return Vec::new();
-    };
-    let mut prior: Vec<&TraceEvent> = events
-        .iter()
-        .filter(|event| {
-            event.session_id.as_ref() == Some(session)
-                && event.event_id != anchor_event.event_id
-                && event.occurred_at <= anchor_event.occurred_at
-        })
-        .collect();
-    prior.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
-    prior
-        .into_iter()
-        .take(depth)
-        .enumerate()
-        .map(|(offset, event)| CausalStep {
-            event_id: event.event_id.to_string(),
-            event_type: event_type_wire(event.event_type).to_string(),
-            title: describe_event(event),
-            actor_type: Some(actor_type_wire(event).to_string()),
-            actor_id: Some(event.actor.actor_id.clone()),
-            session_id: event.session_id.as_ref().map(ToString::to_string),
-            mission_id: event.mission_id.as_ref().map(ToString::to_string),
-            mission_title: mission_title_for(event, mission_titles),
-            occurred_at: event.occurred_at.to_rfc3339(),
-            relation: Some("inferred_prior".to_string()),
-            note: None,
-            confidence: "inferred".to_string(),
-            transcript: transcript_pointer(event),
-            depth: offset + 1,
-        })
-        .collect()
-}
-
-fn forward_effects(
-    index: &TraceIndex,
-    by_id: &BTreeMap<String, &TraceEvent>,
-    roots: &[String],
-) -> Vec<ForwardEffect> {
-    let mut effects = Vec::new();
-    let mut seen = HashSet::new();
-    for root in roots {
-        let Some(downstream) = index.effects.get(root) else {
-            continue;
-        };
-        for effect_id in downstream {
-            if !seen.insert(effect_id.clone()) {
-                continue;
-            }
-            let relation = index.causes.get(effect_id).and_then(|edges| {
-                edges
-                    .iter()
-                    .find(|edge| edge.cause_event.as_deref() == Some(root.as_str()))
-                    .map(relation_name)
-            });
-            let event = by_id.get(effect_id).copied();
-            effects.push(ForwardEffect {
-                event_id: effect_id.clone(),
-                event_type: event
-                    .map(|event| event_type_wire(event.event_type).to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                title: event.and_then(describe_event),
-                relation_to_anchor: relation,
-                session_id: event
-                    .and_then(|event| event.session_id.as_ref().map(ToString::to_string)),
-            });
-        }
-    }
-    effects
 }
 
 fn transcript_pointer(event: &TraceEvent) -> Option<TranscriptPointer> {
@@ -866,7 +687,6 @@ fn serde_event_str(event_type: EventType) -> Option<&'static str> {
         EventType::DiffCaptured => Some("diff.captured"),
         EventType::ExternalRefLinked => Some("external_ref.linked"),
         EventType::SourceSessionObserved => Some("source.session_observed"),
-        EventType::CausalLinked => Some("causal.linked"),
     }
 }
 
@@ -896,11 +716,9 @@ fn confidence_wire(event: &TraceEvent) -> String {
 mod tests {
     use super::*;
     use brick_protocol::{
-        ActorRef, ActorType, CausalLinkedPayload, CausalRelation, ConfidenceLevel,
-        DiffCapturedPayload, DiffFileChange, DiffFileChangeKind, DiffTarget, SessionId,
-        SourceSessionObservedPayload,
+        ActorRef, ActorType, DiffCapturedPayload, DiffFileChange, DiffFileChangeKind, DiffTarget,
+        SessionId, SourceSessionObservedPayload,
     };
-    use uuid::Uuid;
 
     fn actor() -> ActorRef {
         ActorRef {
@@ -970,37 +788,15 @@ mod tests {
         .expect("source session event")
     }
 
-    fn causal(
-        effect: Uuid,
-        causes: Vec<Uuid>,
-        relation: CausalRelation,
-        note: &str,
-        confidence: ConfidenceLevel,
-    ) -> TraceEvent {
-        TraceEvent::causal_linked(
-            actor(),
-            confidence,
-            CausalLinkedPayload {
-                effect_event: effect,
-                cause_events: causes,
-                relation,
-                note: Some(note.to_string()),
-                repo_context_id: None,
-            },
-        )
-        .expect("causal edge")
-    }
-
     #[test]
     fn whole_file_anchor_resolves_source_session_events() {
         let event = source_session_event("crates/core/src/explain.rs");
         let event_id = event.event_id.to_string();
         let events = vec![event];
-        let index = TraceIndex::build(&events).expect("index");
 
         let anchor = resolve_file_anchor(&events, "src/explain.rs");
         assert_eq!(anchor.resolved_events, vec![event_id.clone()]);
-        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
+        let chain = explain_from_events(&events, anchor, DEFAULT_EXPLAIN_DEPTH);
 
         assert_eq!(chain.steps.len(), 1);
         assert_eq!(chain.steps[0].event_id, event_id);
@@ -1019,152 +815,45 @@ mod tests {
         );
     }
 
+    /// The timeline lists every event the anchor resolved to, newest first.
     #[test]
-    fn linear_chain_walks_back_with_rationale_and_relation() {
+    fn timeline_lists_resolved_events_newest_first() {
         let session = SessionId::new();
-        let e2 = diff_event(&session, "auth.rs");
-        let e4 = diff_event(&session, "test_auth.rs");
-        let e2_id = e2.event_id;
-        let e4_id = e4.event_id;
+        let mut older = diff_event(&session, "auth.rs");
+        older.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let newer = diff_event(&session, "auth.rs");
+        let (older_id, newer_id) = (older.event_id.to_string(), newer.event_id.to_string());
+        let events = vec![older, newer];
 
-        let rationale = causal(
-            e2_id,
-            vec![],
-            CausalRelation::Rationale,
-            "token refresh race",
-            ConfidenceLevel::Observed,
-        );
-        let derived = causal(
-            e4_id,
-            vec![e2_id],
-            CausalRelation::DerivedFrom,
-            "covers the race fix",
-            ConfidenceLevel::Explicit,
-        );
-        let events = vec![e2, e4, rationale, derived];
-        let index = TraceIndex::build(&events).expect("index");
+        let anchor = resolve_file_anchor(&events, "auth.rs");
+        let chain = explain_from_events(&events, anchor, DEFAULT_EXPLAIN_DEPTH);
 
-        let anchor = resolve_direct_anchor(&events, &e4_id.to_string());
-        assert_eq!(anchor.kind, AnchorKind::Event);
-        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
-
-        // root e4 (relation None) then e2 (derived_from).
+        // newest first (depth 0), older next.
         assert_eq!(chain.steps.len(), 2);
-        assert_eq!(chain.steps[0].event_id, e4_id.to_string());
+        assert_eq!(chain.steps[0].event_id, newer_id);
+        assert_eq!(chain.steps[0].depth, 0);
+        assert_eq!(chain.steps[1].event_id, older_id);
+        assert_eq!(chain.steps[1].depth, 1);
         assert_eq!(chain.steps[0].relation, None);
-        assert_eq!(chain.steps[1].event_id, e2_id.to_string());
-        assert_eq!(chain.steps[1].relation.as_deref(), Some("derived_from"));
-        assert_eq!(chain.steps[1].note.as_deref(), Some("token refresh race"));
-        assert_eq!(chain.steps[1].confidence, "observed");
-        assert_eq!(chain.steps[1].title.as_deref(), Some("changed auth.rs"));
+        assert_eq!(chain.steps[0].title.as_deref(), Some("changed auth.rs"));
         assert!(!chain.truncated);
-    }
-
-    #[test]
-    fn forward_effects_surface_downstream_derivations() {
-        let session = SessionId::new();
-        let e2 = diff_event(&session, "auth.rs");
-        let e4 = diff_event(&session, "test_auth.rs");
-        let e2_id = e2.event_id;
-        let e4_id = e4.event_id;
-        let derived = causal(
-            e4_id,
-            vec![e2_id],
-            CausalRelation::DerivedFrom,
-            "covers fix",
-            ConfidenceLevel::Explicit,
-        );
-        let events = vec![e2, e4, derived];
-        let index = TraceIndex::build(&events).expect("index");
-
-        let anchor = resolve_direct_anchor(&events, &e2_id.to_string());
-        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
-        assert_eq!(chain.forward.len(), 1);
-        assert_eq!(chain.forward[0].event_id, e4_id.to_string());
-        assert_eq!(
-            chain.forward[0].relation_to_anchor.as_deref(),
-            Some("derived_from")
-        );
-    }
-
-    #[test]
-    fn cycle_does_not_loop_forever() {
-        let session = SessionId::new();
-        let a = diff_event(&session, "a.rs");
-        let b = diff_event(&session, "b.rs");
-        let a_id = a.event_id;
-        let b_id = b.event_id;
-        // a caused by b, and b caused by a (degenerate cycle).
-        let ab = causal(
-            a_id,
-            vec![b_id],
-            CausalRelation::TriggeredBy,
-            "x",
-            ConfidenceLevel::Explicit,
-        );
-        let ba = causal(
-            b_id,
-            vec![a_id],
-            CausalRelation::TriggeredBy,
-            "y",
-            ConfidenceLevel::Explicit,
-        );
-        let events = vec![a, b, ab, ba];
-        let index = TraceIndex::build(&events).expect("index");
-
-        let anchor = resolve_direct_anchor(&events, &a_id.to_string());
-        let chain = explain_from_events(&index, &events, anchor, MAX_EXPLAIN_DEPTH);
-        // Visited set bounds it: exactly the two distinct events.
-        assert_eq!(chain.steps.len(), 2);
     }
 
     #[test]
     fn depth_cap_truncates() {
         let session = SessionId::new();
-        let a = diff_event(&session, "a.rs");
-        let b = diff_event(&session, "b.rs");
-        let c = diff_event(&session, "c.rs");
-        let (a_id, b_id, c_id) = (a.event_id, b.event_id, c.event_id);
-        let ab = causal(
-            a_id,
-            vec![b_id],
-            CausalRelation::DerivedFrom,
-            "x",
-            ConfidenceLevel::Explicit,
-        );
-        let bc = causal(
-            b_id,
-            vec![c_id],
-            CausalRelation::DerivedFrom,
-            "y",
-            ConfidenceLevel::Explicit,
-        );
-        let events = vec![a, b, c, ab, bc];
-        let index = TraceIndex::build(&events).expect("index");
+        let mut a = diff_event(&session, "auth.rs");
+        let mut b = diff_event(&session, "auth.rs");
+        let c = diff_event(&session, "auth.rs");
+        a.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        b.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let events = vec![a, b, c];
 
-        let anchor = resolve_direct_anchor(&events, &a_id.to_string());
-        let chain = explain_from_events(&index, &events, anchor, 1);
-        // depth 1: anchor a (depth 0) + b (depth 1); c is beyond the cap.
+        let anchor = resolve_file_anchor(&events, "auth.rs");
+        let chain = explain_from_events(&events, anchor, 1);
+        // depth 1: newest (depth 0) + one older (depth 1); the third is truncated.
         assert_eq!(chain.steps.len(), 2);
         assert!(chain.truncated);
-    }
-
-    #[test]
-    fn no_edges_falls_back_to_inferred_timeline() {
-        let session = SessionId::new();
-        let mut e1 = diff_event(&session, "early.rs");
-        e1.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let e2 = diff_event(&session, "anchor.rs");
-        let e2_id = e2.event_id;
-        // No causal edges at all.
-        let events = vec![e1, e2];
-        let index = TraceIndex::build(&events).expect("index");
-
-        let anchor = resolve_direct_anchor(&events, &e2_id.to_string());
-        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
-        // anchor + one inferred prior step, clearly labelled.
-        assert!(chain.steps.len() >= 2);
-        assert!(chain.steps.iter().any(|step| step.confidence == "inferred"));
     }
 
     #[test]
@@ -1200,8 +889,7 @@ mod tests {
         );
 
         // And it walks into a populated chain rather than an empty one.
-        let index = TraceIndex::build(&events).expect("index");
-        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
+        let chain = explain_from_events(&events, anchor, DEFAULT_EXPLAIN_DEPTH);
         assert!(!chain.steps.is_empty(), "whole-file anchor yields a chain");
         assert_eq!(chain.steps[0].actor_id.as_deref(), Some("claude"));
     }
@@ -1256,9 +944,8 @@ mod tests {
         let diff_id = diff.event_id.to_string();
 
         let events = vec![mission, diff];
-        let index = TraceIndex::build(&events).expect("index");
         let anchor = resolve_direct_anchor(&events, &diff_id);
-        let chain = explain_from_events(&index, &events, anchor, DEFAULT_EXPLAIN_DEPTH);
+        let chain = explain_from_events(&events, anchor, DEFAULT_EXPLAIN_DEPTH);
 
         let step = chain
             .steps

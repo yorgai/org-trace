@@ -8,8 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use brick_protocol::{
-    ActorType, ArtifactKind, CausalRelation, DiffFileChangeKind, DiffTarget, EventType,
-    EvidenceAvailability, MissionStatus, SessionLogFormat, TraceEvent,
+    ActorType, ArtifactKind, DiffFileChangeKind, DiffTarget, EventType, EvidenceAvailability,
+    MissionStatus, SessionLogFormat, TraceEvent,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -598,33 +598,6 @@ fn insert_index(connection: &Connection, index: &TraceIndex) -> Result<()> {
     for repo_context in index.repo_contexts.values() {
         insert_repo_context(connection, repo_context)?;
     }
-    insert_causal_edges(connection, index)?;
-    Ok(())
-}
-
-/// Projects the causal adjacency tables into `causal_edges`. The `causes` map is
-/// authoritative (it holds the relation/note/confidence for every edge including
-/// standalone rationales); `effects` is recoverable from it, so we only persist
-/// `causes` and rebuild `effects` on load.
-fn insert_causal_edges(connection: &Connection, index: &TraceIndex) -> Result<()> {
-    for (effect_event, edges) in &index.causes {
-        for edge in edges {
-            connection.execute(
-                "INSERT OR IGNORE INTO causal_edges \
-                 (source_event_id, effect_event, cause_event, relation, note, confidence, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    edge.source_event_id,
-                    effect_event,
-                    edge.cause_event,
-                    causal_relation_name(edge.relation),
-                    edge.note,
-                    edge.confidence,
-                    edge.recorded_at.to_rfc3339(),
-                ],
-            )?;
-        }
-    }
     Ok(())
 }
 
@@ -1081,16 +1054,5 @@ fn event_type_name(event_type: EventType) -> &'static str {
         EventType::DiffCaptured => "diff.captured",
         EventType::ExternalRefLinked => "external_ref.linked",
         EventType::SourceSessionObserved => "source.session_observed",
-        EventType::CausalLinked => "causal.linked",
-    }
-}
-
-fn causal_relation_name(relation: CausalRelation) -> &'static str {
-    match relation {
-        CausalRelation::TriggeredBy => "triggered_by",
-        CausalRelation::DerivedFrom => "derived_from",
-        CausalRelation::Supersedes => "supersedes",
-        CausalRelation::RespondsTo => "responds_to",
-        CausalRelation::Rationale => "rationale",
     }
 }

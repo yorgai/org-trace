@@ -28,7 +28,7 @@ use crate::skill;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 9;
+const TEMPLATE_VERSION: u32 = 10;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -46,7 +46,9 @@ const BLOCK_BODY: &str = "\
 ## Brick — causal memory of this codebase
 
 Brick answers WHY code looks the way it does, across every AI tool that has
-touched this repo. It is the causal layer git does not have.
+touched this repo. It is the history layer git does not have: for any file it
+returns the timeline of AI sessions that changed it, newest first, each with a
+transcript pointer.
 
 ### When you investigate WHY — a bug, an issue, any \"how did this happen\"
 
@@ -59,19 +61,20 @@ reviewing code before you touch it — your FIRST move is `explain`, BEFORE grep
 
 Do NOT spend your opening moves on code_search / read_file / web search and only
 reach for `explain` if reminded — for a \"why\"/\"how was this caused\" question,
-`explain` is the first tool, not the last. It returns a `causal_chain`: who
-changed that code, WHEN, the `mission_title` they did it under, what was derived
-from or triggered by it, and whether another session is editing the file right
-now. To understand a whole block at once, pass a line range:
+`explain` is the first tool, not the last. It returns a `causal_chain`: a
+newest-first timeline of the sessions that touched the anchor — who changed it,
+WHEN, the `mission_title` they did it under, and whether another session is
+editing the file right now. depth 0 is the most recent change; higher depth is
+older. To understand a whole block at once, pass a line range:
 `brick explain <path>:<start>-<end>` (e.g. `src/auth.rs:10-20`). The anchor can
 also be a whole file, an artifact, mission, or event id.
 
-**What counts as a real Brick record.** A chain step carrying an `actor_id`, a
+**What counts as a real Brick record.** A timeline step carrying an `actor_id`, a
 `mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY
 even when its `note` is null (not every change has a one-line rationale, but the
 mission it belonged to and who did it are still the reason). Only fall back to
 git/grep when `explain` returns an empty `causal_chain` or an explicit
-\"No Brick record\" note. Do NOT dismiss a populated chain as \"no record\"
+\"No Brick record\" note. Do NOT dismiss a populated timeline as \"no record\"
 just because `note` is null.
 
 **Go deeper than the `note` — read the full session.** A step's `note` is only
@@ -84,17 +87,9 @@ the one-line note.
 
 **Prefer `explain` over `grep` and `git log` for understanding existing code.**
 git log / git blame / grep are a FALLBACK, used only when `explain` truly has no
-record for that code.
-
-### After you change code
-
-You usually do NOT need to record anything: `explain` recovers the WHY of
-ordinary edits from the session transcript automatically. Only call the `link`
-MCP tool for a causal edge Brick cannot infer on its own — a cross-repo /
-cross-session cause (`relation=derived_from`/`triggered_by`), a change that
-supersedes an earlier one (`relation=supersedes`), or a high-stakes rationale you
-want recorded at `explicit` confidence. `explain` (read) and `link` (the rare
-explicit write) are the MCP surface.";
+record for that code. `explain` is read-only — there is nothing to record after
+you change code; the next agent recovers your WHY from the session transcript
+automatically.";
 
 /// One memory file to act on, resolved from a target + scope.
 #[derive(Debug, Clone)]

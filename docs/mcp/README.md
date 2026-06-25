@@ -27,13 +27,13 @@ reliably reach for on its own is pushed via hooks or kept off the agent surface.
 
 | Surface | How to start | Tools |
 | --- | --- | --- |
-| **Main (coding agent)** | `brick mcp-serve` | `explain`, `link` |
+| **Main (coding agent)** | `brick mcp-serve` | `explain` |
 | **Planning agent** | `brick mcp-serve --planning` | `mission`, `mission_list`, `show_mission`, `artifact_add`, `artifact_attach` |
 
 The planning surface is for a *dedicated planning custom agent* (a Claude
 subagent, a Codex/Cursor mode, or an ORGII custom agent). When a user asks to
 plan, the main agent spawns the planning agent; the coding agent's own tool list
-stays at two.
+stays at a single tool.
 
 ## Main surface
 
@@ -57,7 +57,7 @@ locate the repo regardless of its own working directory (see
 [Working directory](#working-directory-and-anchors)). The tool schema steers
 agents toward absolute anchors for exactly this reason, so the default agent
 behavior succeeds even when the client spawned the server with `cwd=/`. `depth`
-is the causal hops to walk back (default 3, max 8).
+is how many sessions back along the file's timeline to walk (default 3, max 8).
 
 Output (abridged):
 
@@ -65,28 +65,25 @@ Output (abridged):
 {
   "anchor": { "kind": "file_line", "input": "…:42",
               "resolved_events": ["<event-id>"], "blame_confidence": "commit" },
-  "causal_chain": [
+  "timeline": [
     { "event_id": "…", "event_type": "diff.captured",
       "title": "changed auth.rs", "actor_id": "claude",
       "session_id": "session_…", "mission_id": "mission_…",
-      "occurred_at": "…", "relation": null,
+      "occurred_at": "…",
       "note": "token refresh had a concurrency race; serialized it",
       "confidence": "observed", "depth": 0,
       "transcript": { "source": null, "session_id": "session_…" } }
-  ],
-  "forward": [
-    { "event_id": "…", "title": "added test_auth.rs",
-      "relation_to_anchor": "derived_from" }
   ],
   "truncated": false,
   "live": { "…": "another session is editing this file" }
 }
 ```
 
-- `causal_chain` walks **backward** from the anchor (newest first). Each step
-  carries WHO (`actor_id` / `session_id` / `mission_id`), WHY (`note` +
-  `relation`), and a `confidence` of `explicit` > `observed` > `inferred`.
-- `forward` is what was derived from / triggered by the anchor.
+- `timeline` lists the sessions that touched the anchor in **reverse-chronological
+  order** (newest first = depth 0, older = higher depth). Each step carries WHO
+  (`actor_id` / `session_id` / `mission_id`), WHEN (`occurred_at`), a recovered
+  WHY (`note`), a `confidence` of `observed` > `inferred`, and a `transcript`
+  pointer to read the full session.
 - `live` appears only when another running session is touching the anchored file
   (Tier 1) or working in the same project (Tier 2) — this replaces the old
   standalone `sessions` / `claims` tools. **Liveness is never stored** — a
@@ -99,64 +96,22 @@ Output (abridged):
   2. **Turn boundaries** — within the window, a finished turn is still `Idle`
      (Codex `task_complete` after the last `task_started`; Claude an `assistant`
      record with `stop_reason` set). Only an open turn counts as live.
-- When the anchor has no causal record, `resolved_events` is empty, `causal_chain`
+- When the anchor has no provenance record, `resolved_events` is empty, `timeline`
   is empty (never guessed), and a `note` says so — fall back to git there.
-- The `causal_chain` is **not limited to explicit `link` edges**. For a whole-file
-  anchor, `explain` merges any runtime causal edges with the **indexed source
-  sessions** — the real Cursor / Claude Code / Codex / Gemini / OpenCode / ORGII
-  history Brick already reads — deduped by session and ordered by time. Each
-  source-session step recovers its `note` (WHY) from the session's turn-final
-  assistant message and a session-specific `what` ("&lt;session title&gt; — touched
-  &lt;file&gt;"). So `explain` is useful immediately, before any `link` has been
-  recorded; explicit edges then upgrade steps from `inferred`/`observed` toward
-  `explicit`. (File:line anchors resolve through blame to the specific change
-  events and do not fold in file-level source sessions.)
+- The `timeline` is built from the **indexed source sessions** — the real Cursor /
+  Claude Code / Codex / Gemini / OpenCode / ORGII history Brick already reads —
+  deduped by session and ordered by time, newest first. Each source-session step
+  recovers its `note` (WHY) from the session's turn-final assistant message and a
+  session-specific `what` ("&lt;session title&gt; — touched &lt;file&gt;"). So
+  `explain` is useful immediately from the history Brick already indexes.
+  (File:line anchors resolve through blame to the specific change events and do
+  not fold in file-level source sessions.)
 - This indexed view is refreshed automatically per call — incrementally (only
   sessions newer than a per-source watermark are re-scanned) and throttled across
   processes — so it stays near-real-time on large histories without a manual
   `brick history refresh`.
 
 `explain` subsumes line-level **blame** (WHO) into the WHY answer.
-
-### `link`
-
-Record WHY after a non-trivial change so the next agent can recover your
-reasoning with `explain`. Two forms:
-
-```json
-{ "note": "token refresh had a concurrency race; serialized it" }
-```
-
-```json
-{ "effect": "src/test_auth.rs:2", "cause": "src/auth.rs:2",
-  "relation": "derived_from", "note": "covers the race fix" }
-```
-
-- `effect` is the change you just made (`path:line` or event id); omit it to bind
-  to your most recent captured diff.
-- `cause` is the anchor that prompted the change; omit it for a standalone
-  rationale.
-- `relation` is one of `triggered_by`, `derived_from`, `supersedes`,
-  `responds_to`, `rationale` (defaults to `derived_from` with a cause, else
-  `rationale`).
-- **Invariant:** at least one of `cause` or `note` must be present.
-- **Effect = an existing change, or omit it.** A `link` edge always binds to one
-  real change event. Two ways to get there:
-  - **Omit `effect`** (the common case): call `link` *before* you commit and
-    Brick captures your uncommitted diff, binding the reason to exactly those
-    files. This is the recommended shape for a rationale.
-  - **Pass `effect`** only to point at a change Brick has *already* recorded — an
-    event id, or a `path`/`path:line` that resolves through blame to an existing
-    change event.
-
-  An `effect` that resolves to nothing is a **hard error**, not a free-floating
-  note and not a silent redirect into a broad working capture (which could bind
-  the reason to unrelated files). The error tells you to omit `effect` and let
-  Brick capture the diff. Likewise, omitting `effect` on a **clean tree** (already
-  committed — nothing to capture) is an error: there is no change to attach a
-  reason to. Fix either by calling `link` while your edits are still uncommitted.
-
-Edges recorded via `link` carry `confidence: explicit`.
 
 ## Planning surface (`--planning`)
 
@@ -182,11 +137,10 @@ for one release rather than a bare error:
 
 ## Storage
 
-Writes (`link`, and the planning tools) append `TraceEvent`s to the local JSONL
+Writes (the planning tools) append `TraceEvent`s to the local JSONL
 log under `<BRICK_HOME>/repos/<repo_id>/provenance/`; reads project that log into
-the rebuildable index. Deleting the derived index or the SQLite `causal_edges`
-table and rebuilding from JSONL reproduces every causal edge exactly — JSONL is
-the source of truth.
+the rebuildable index. The provenance ledger is the source of truth — deleting
+the derived index and rebuilding from JSONL reproduces every record exactly.
 
 ## Working directory and anchors
 
@@ -201,11 +155,11 @@ resolves that path in one of two ways, in order:
 
 This matters because **MCP clients routinely spawn the stdio server with
 `cwd=/`** — the agent's workspace is *not* inherited as the server's working
-directory. Two ways to make `explain`/`link` resolve the right repo:
+directory. Two ways to make `explain` resolve the right repo:
 
 - **Pass absolute path anchors** (recommended for agents): always works,
-  independent of how the client launched the server. The `explain`/`link` tool
-  schemas already steer agents to do this, so it is the default path — no client
+  independent of how the client launched the server. The `explain` tool
+  schema already steers agents to do this, so it is the default path — no client
   config needed.
 - **Set the server's `cwd` to the workspace** in the MCP client config, e.g.
 
@@ -238,14 +192,13 @@ is nothing to resolve and `live` is simply absent (never a crash).
 ## Verifying
 
 `crates/cli/tests/mcp_smoke.rs` spawns the real `brick mcp-serve` binary and
-drives it over stdio: it asserts the main surface is exactly `explain` + `link`,
+drives it over stdio: it asserts the main surface is exactly `explain`,
 the planning surface exposes the five planning tools, retired names return a
 migration hint, `explain` resolves a `path:line` through blame and walks the
-causal chain (including across commit + line drift), `link` records both a
-standalone rationale and a cross-event edge, `explain` surfaces a live session
-on the anchor file while excluding a finished (Idle) session from the `live`
-field (and still firing for a live session via an absolute anchor when the
-server's cwd is unrelated), and — spawning the server with an unrelated working
-directory — an absolute anchor still recovers the WHO/WHY while a relative
+session timeline (including across commit + line drift), `explain` surfaces a
+live session on the anchor file while excluding a finished (Idle) session from
+the `live` field (and still firing for a live session via an absolute anchor when
+the server's cwd is unrelated), and — spawning the server with an unrelated
+working directory — an absolute anchor still recovers the WHO/WHY while a relative
 anchor degrades to the actionable note, and the planning surface still creates
 and lists a mission via its `BRICK_HOME` fallback.

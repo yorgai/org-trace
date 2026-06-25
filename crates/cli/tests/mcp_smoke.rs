@@ -156,17 +156,24 @@ impl Drop for Mcp {
 }
 
 #[test]
-fn main_surface_is_explain_and_link_only() {
+fn main_surface_is_explain_only() {
     let (root, home, repo) = setup_repo("surface");
     let mut m = Mcp::spawn(&home, &repo);
 
     let mut tools = m.tool_names();
     tools.sort();
-    assert_eq!(tools, vec!["explain".to_string(), "link".to_string()]);
+    assert_eq!(tools, vec!["explain".to_string()]);
 
     let retired = m.call("search", json!({}));
     assert_eq!(
         retired.get("error").and_then(Value::as_str),
+        Some("tool_retired")
+    );
+
+    // `link` is now retired too — it must report a migration hint, not run.
+    let retired_link = m.call("link", json!({}));
+    assert_eq!(
+        retired_link.get("error").and_then(Value::as_str),
         Some("tool_retired")
     );
 
@@ -195,7 +202,6 @@ fn planning_surface_exposes_planning_tools() {
         ]
     );
     assert!(!tools.contains(&"explain".to_string()));
-    assert!(!tools.contains(&"link".to_string()));
 
     drop(m);
     let _ = std::fs::remove_dir_all(root);
@@ -217,20 +223,14 @@ fn cli_explain_returns_no_record_json() {
 }
 
 #[test]
-fn cli_link_requires_note_or_cause() {
+fn cli_link_command_is_removed() {
     let (root, home, repo) = setup_repo("cli-link");
-    std::fs::write(
-        repo.join("src/main.rs"),
-        "fn main() { println!(\"hi\"); }\n",
-    )
-    .unwrap();
+    // `brick link` no longer exists — clap should reject it as an unknown
+    // subcommand (Brick is now a read-only file-history timeline).
     let out = brick(&home, &repo, &["link", "--note", "record why"]);
     assert!(
-        out.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
+        !out.status.success(),
+        "`brick link` must no longer be a valid command"
     );
-    let value: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(value["linked"].as_bool(), Some(true));
     let _ = std::fs::remove_dir_all(root);
 }

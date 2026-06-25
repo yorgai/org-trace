@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use brick_protocol::{
-    ActorRef, ActorType, ArtifactKind, CausalRelation, DiffFileChangeKind, DiffHunk, DiffTarget,
+    ActorRef, ActorType, ArtifactKind, DiffFileChangeKind, DiffHunk, DiffTarget,
     EvidenceAvailability, MissionStatus, SessionLogFormat, SessionSource,
 };
 use chrono::{DateTime, Utc};
@@ -34,31 +34,6 @@ pub struct TraceIndex {
     pub session_logs: BTreeMap<String, IndexedSessionLog>,
     pub files: BTreeMap<String, IndexedFile>,
     pub repo_contexts: BTreeMap<String, IndexedRepoContext>,
-    /// Causal adjacency: effect event-id → its direct cause edges (for backward
-    /// `explain` traversal). The edges are built at index time; the *chains* are
-    /// traversed at query time (chains are relative to an anchor + depth, so
-    /// materializing them here would combinatorially explode).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub causes: BTreeMap<String, Vec<CausalEdge>>,
-    /// Causal adjacency: cause event-id → effect event-ids it influenced (for
-    /// forward traversal, e.g. "this fix has a test derived from it").
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub effects: BTreeMap<String, Vec<String>>,
-}
-
-/// One causal edge from an effect event back to a single cause, carrying the
-/// relation, optional rationale note, and the confidence of the attribution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CausalEdge {
-    /// The upstream cause event-id, or `None` for a standalone `Rationale`.
-    pub cause_event: Option<String>,
-    pub relation: CausalRelation,
-    pub note: Option<String>,
-    /// Source event-id of the `causal.linked` event that recorded this edge.
-    pub source_event_id: String,
-    /// `explicit` (asserted), `observed` (hook-captured), or `inferred` (heuristic).
-    pub confidence: String,
-    pub recorded_at: DateTime<Utc>,
 }
 
 /// Indexed Org view with child Projects and repo contexts.

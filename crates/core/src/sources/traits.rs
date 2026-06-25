@@ -282,9 +282,9 @@ pub struct CauseRef {
     pub relation: InferredRelation,
 }
 
-/// The causal relation a transcript phrase implies. Mirrors the subset of
-/// `brick_protocol::CausalRelation` that is safely inferable from prose; the
-/// `cli` layer maps these onto the protocol enum.
+/// The causal relation a transcript phrase implies, inferred from prose. The
+/// `cli` layer maps these onto its wire strings (`derived_from` / `supersedes` /
+/// `triggered_by`) when enriching an `explain` step's observed rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferredRelation {
     DerivedFrom,
