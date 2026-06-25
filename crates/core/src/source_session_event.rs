@@ -17,8 +17,7 @@ use brick_protocol::{ActorRef, SessionId, SourceSessionObservedPayload, TraceEve
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::{repo_id_for_root, SourceSessionRecord};
-use std::path::Path;
+use crate::SourceSessionRecord;
 
 /// Deterministic UUIDv5 id for the observation of one indexed source session.
 /// Kept stable across re-indexing so the remote dedupes by event id.
@@ -97,15 +96,6 @@ pub fn build_source_session_event(
     event.session_id = Some(session_id_for_record(record));
     event.repo_id = Some(repo_id.to_string());
     Ok(event)
-}
-
-/// Convenience: derive the `repo_id` for a record's repo_path (falling back to
-/// the given default root when the record has no repo_path).
-pub fn repo_id_for_record(record: &SourceSessionRecord, default_root: &Path) -> String {
-    match record.repo_path.as_deref() {
-        Some(path) => repo_id_for_root(path),
-        None => repo_id_for_root(default_root),
-    }
 }
 
 #[cfg(test)]

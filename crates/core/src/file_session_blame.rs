@@ -14,7 +14,6 @@ use serde_json::Value;
 pub enum FileSessionBlameEvidenceKind {
     RuntimeEvent,
     SourceMetadata,
-    ChunkPointer,
 }
 
 impl FileSessionBlameEvidenceKind {
@@ -22,7 +21,6 @@ impl FileSessionBlameEvidenceKind {
         match self {
             Self::RuntimeEvent => "runtime_event",
             Self::SourceMetadata => "source_metadata",
-            Self::ChunkPointer => "chunk_pointer",
         }
     }
 }

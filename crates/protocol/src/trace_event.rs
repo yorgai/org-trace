@@ -336,36 +336,6 @@ impl TraceEvent {
     }
 }
 
-/// Error returned when a `causal.linked` event cannot be constructed.
-#[derive(Debug)]
-pub enum CausalLinkError {
-    /// Both `cause_events` and `note` were empty — an information-free edge.
-    Empty,
-    /// The payload failed to serialize.
-    Serialize(serde_json::Error),
-}
-
-impl std::fmt::Display for CausalLinkError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CausalLinkError::Empty => formatter
-                .write_str("causal edge requires at least one cause_event or a non-empty note"),
-            CausalLinkError::Serialize(err) => {
-                write!(formatter, "failed to serialize payload: {err}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CausalLinkError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            CausalLinkError::Empty => None,
-            CausalLinkError::Serialize(err) => Some(err),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{

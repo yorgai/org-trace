@@ -83,8 +83,11 @@ pub struct CausalStep {
     /// the WHY ("Harden token refresh") instead of an opaque id it discards.
     pub mission_title: Option<String>,
     pub occurred_at: String,
-    /// Unused in the timeline model (kept for response-shape stability); always
-    /// `None`.
+    /// Left `None` by the core timeline builder. The CLI/MCP enrichment layer
+    /// may later fill it with a transcript-inferred relation when the session's
+    /// turn-final narration named a cause entity that actually exists in the
+    /// ledger (see `infer_session_rationale`); an unresolvable reference is
+    /// dropped rather than fabricated.
     pub relation: Option<String>,
     /// The WHY: a turn-final rationale recovered from the session transcript by
     /// the CLI/MCP layer, when present.
