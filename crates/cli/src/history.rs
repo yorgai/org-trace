@@ -1,22 +1,18 @@
-//! Internal history helpers used by explain/link and MCP.
+//! Internal history helpers used by `explain` and MCP.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use anyhow::Result;
 use brick_core::{
     list_source_plans, list_source_sessions, ActivityChunk, DiscoveredPathKind, DiscoveredSource,
     LocalStore, MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore,
-    SourceScanStatus, SourceSessionChunksUpsert, SourceSessionListQuery, SourceSessionRecord,
-    SourceSessionUpsert,
+    SourceScanStatus, SourceSessionChunksUpsert, SourceSessionUpsert,
 };
-use brick_protocol::{ActorRef, ActorType, SessionId, SourceSessionObservedPayload, TraceEvent};
+use brick_protocol::ActorType;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 use crate::args::HistoryFormatArg;
 
@@ -177,27 +173,18 @@ impl RefreshStats {
 }
 
 fn refresh_profiles_to_metadata(
-    store: &LocalStore,
     metadata_db: &mut MetadataDb,
     profiles: &[SourceProfile],
     limit: Option<usize>,
 ) -> Result<RefreshStats> {
     let mut totals = RefreshStats::default();
-    let mut known_event_ids = store.known_event_ids()?;
     for profile in profiles {
         let scan_id = metadata_db.begin_source_scan(&profile.name)?;
         let watermark = metadata_db.get_source_watermark(&profile.name)?;
         let since = watermark
             .as_ref()
             .and_then(|(high_water, _)| high_water.as_deref());
-        let profile_stats = match refresh_single_profile(
-            store,
-            metadata_db,
-            profile,
-            limit,
-            since,
-            &mut known_event_ids,
-        ) {
+        let profile_stats = match refresh_single_profile(metadata_db, profile, limit, since) {
             Ok((stats, max_updated_at)) => {
                 metadata_db.finish_source_scan(
                     scan_id,
@@ -269,26 +256,17 @@ fn refresh_repo_sources(store: &LocalStore) -> Result<()> {
         )
         .collect();
     if due.is_empty() {
-        backfill_source_session_events_from_metadata(store, &mut metadata_db)?;
         return Ok(());
     }
-    refresh_profiles_to_metadata(
-        store,
-        &mut metadata_db,
-        &due,
-        Some(SOURCE_INDEX_REFRESH_LIMIT),
-    )?;
-    backfill_source_session_events_from_metadata(store, &mut metadata_db)?;
+    refresh_profiles_to_metadata(&mut metadata_db, &due, Some(SOURCE_INDEX_REFRESH_LIMIT))?;
     Ok(())
 }
 
 fn refresh_single_profile(
-    store: &LocalStore,
     metadata_db: &mut MetadataDb,
     profile: &SourceProfile,
     limit: Option<usize>,
     since: Option<&str>,
-    known_event_ids: &mut BTreeSet<Uuid>,
 ) -> Result<(RefreshStats, Option<String>)> {
     let mut stats = RefreshStats::default();
     let mut max_updated_at: Option<String> = None;
@@ -338,9 +316,6 @@ fn refresh_single_profile(
             })?;
             stats.reindexed += 1;
         }
-        if source_session_belongs_to_repo(&upsert, store.repo_root()) {
-            append_source_session_event(store, Some(profile), &upsert, known_event_ids)?;
-        }
         link_session_repo(
             metadata_db,
             &upsert.source_id,
@@ -352,40 +327,6 @@ fn refresh_single_profile(
         metadata_db.upsert_source_plan_with_edges(&plan)?;
     }
     Ok((stats, max_updated_at))
-}
-
-fn source_session_belongs_to_repo(session: &SourceSessionUpsert, repo_root: &Path) -> bool {
-    let Some(repo_path) = session.repo_path.as_ref() else {
-        return false;
-    };
-    let want = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let have = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.clone());
-    have == want
-}
-
-fn backfill_source_session_events_from_metadata(
-    store: &LocalStore,
-    metadata_db: &mut MetadataDb,
-) -> Result<()> {
-    let mut known_event_ids = store.known_event_ids()?;
-    let mut offset = 0;
-    loop {
-        let records = metadata_db.list_source_sessions(&SourceSessionListQuery {
-            source_id: None,
-            limit: 500,
-            offset,
-        })?;
-        if records.is_empty() {
-            return Ok(());
-        }
-        for record in &records {
-            let session = source_session_record_to_upsert(record);
-            if source_session_belongs_to_repo(&session, store.repo_root()) {
-                append_source_session_event(store, None, &session, &mut known_event_ids)?;
-            }
-        }
-        offset += records.len();
-    }
 }
 
 fn source_session_chunks_or_backfill(
@@ -414,122 +355,6 @@ fn source_session_chunks_or_backfill(
         })?;
     }
     Ok(chunks)
-}
-
-fn source_session_record_to_upsert(record: &SourceSessionRecord) -> SourceSessionUpsert {
-    SourceSessionUpsert {
-        source_id: record.source_id.clone(),
-        external_session_id: record.external_session_id.clone(),
-        title: record.title.clone(),
-        name: record.name.clone(),
-        source_path: record.source_path.clone(),
-        source_uri: record.source_uri.clone(),
-        source_mtime: record.source_mtime,
-        source_size: record.source_size,
-        source_fingerprint: record.source_fingerprint.clone(),
-        parser_version: record.parser_version.clone(),
-        session_created_at: record.session_created_at,
-        session_updated_at: record.session_updated_at,
-        model: record.model.clone(),
-        input_tokens: record.input_tokens,
-        output_tokens: record.output_tokens,
-        repo_path: record.repo_path.clone(),
-        branch: record.branch.clone(),
-        files_changed: record.files_changed,
-        lines_added: record.lines_added,
-        lines_removed: record.lines_removed,
-        touched_files_json: record.touched_files_json.clone(),
-        listable: record.listable,
-        discovered_at: record.discovered_at,
-        last_seen_at: record.last_seen_at,
-        metadata_json: record.metadata_json.clone(),
-    }
-}
-
-fn append_source_session_event(
-    store: &LocalStore,
-    profile: Option<&SourceProfile>,
-    session: &SourceSessionUpsert,
-    known_event_ids: &mut BTreeSet<Uuid>,
-) -> Result<()> {
-    let actor = ActorRef {
-        actor_type: profile
-            .and_then(|profile| profile.actor_type)
-            .unwrap_or(ActorType::Agent),
-        actor_id: profile
-            .and_then(|profile| profile.actor_id.clone())
-            .unwrap_or_else(|| session.source_id.clone()),
-        display_name: None,
-    };
-    let source_path = session
-        .source_path
-        .as_ref()
-        .map(|path| path.display().to_string());
-    let source_uri = session.source_uri.clone();
-    let payload = SourceSessionObservedPayload {
-        source_id: session.source_id.clone(),
-        external_session_id: session.external_session_id.clone(),
-        title: session.title.clone(),
-        source_path,
-        source_uri,
-        source_mtime: session.source_mtime.map(|time| time.to_rfc3339()),
-        source_size: session.source_size,
-        source_fingerprint: session.source_fingerprint.clone(),
-        parser_version: session.parser_version.clone(),
-        session_created_at: session.session_created_at.map(|time| time.to_rfc3339()),
-        session_updated_at: session.session_updated_at.map(|time| time.to_rfc3339()),
-        model: session.model.clone(),
-        input_tokens: session.input_tokens,
-        output_tokens: session.output_tokens,
-        repo_path: session
-            .repo_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        branch: session.branch.clone(),
-        files_changed: session.files_changed,
-        lines_added: session.lines_added,
-        lines_removed: session.lines_removed,
-        touched_files: session
-            .touched_files_json
-            .as_ref()
-            .and_then(|value| value.as_array())
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(|file| file.as_str().map(ToOwned::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        metadata_json: session.metadata_json.clone(),
-        normalized_chunks: Vec::new(),
-    };
-    let event_id = source_session_event_id(session);
-    let mut event = TraceEvent::source_session_observed(actor, payload)?;
-    event.event_id = event_id;
-    event.session_id = Some(session_id_for_source_session(session));
-    event.repo_id = Some(brick_core::repo_id_for_root(store.repo_root()));
-    if known_event_ids.insert(event.event_id) {
-        store.append_event(&event)?;
-    }
-    Ok(())
-}
-
-fn session_id_for_source_session(session: &SourceSessionUpsert) -> SessionId {
-    SessionId::from_str(&session.external_session_id).unwrap_or_else(|_| SessionId::new())
-}
-
-fn source_session_event_id(session: &SourceSessionUpsert) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!(
-            "brick:source-session-observed-v2:{}:{}:{}:{}",
-            session.source_id,
-            session.external_session_id,
-            session.source_fingerprint.as_deref().unwrap_or_default(),
-            session.parser_version.as_deref().unwrap_or_default(),
-        )
-        .as_bytes(),
-    )
 }
 
 fn record_source_roots(metadata_db: &mut MetadataDb, profile: &SourceProfile) -> Result<()> {
@@ -713,86 +538,9 @@ fn format_actor_type(actor_type: ActorType) -> &'static str {
 mod tests {
     use std::fs;
 
-    use brick_core::StorageOptions;
+    use uuid::Uuid;
 
     use super::*;
-
-    #[test]
-    fn source_session_event_id_is_stable_for_same_session_and_versions_fingerprint() {
-        let session = test_source_session("session-1");
-        assert_eq!(
-            source_session_event_id(&session),
-            source_session_event_id(&session)
-        );
-        assert_ne!(
-            source_session_event_id(&session),
-            source_session_event_id(&test_source_session("session-2"))
-        );
-        let mut reindexed = test_source_session("session-1");
-        reindexed.source_fingerprint = Some("fingerprint-changed".to_string());
-        assert_ne!(
-            source_session_event_id(&session),
-            source_session_event_id(&reindexed)
-        );
-    }
-
-    #[test]
-    fn append_source_session_event_dedupes_existing_event_ids() {
-        let base = std::env::temp_dir().join(format!("source-session-dedupe-{}", Uuid::new_v4()));
-        let repo = base.join("repo");
-        let store_root = base.join("store");
-        fs::create_dir_all(&repo).expect("repo dir");
-        let store = LocalStore::with_options(
-            &repo,
-            StorageOptions::new().with_explicit_store_root(Some(store_root)),
-        )
-        .expect("store");
-        let profile = test_profile();
-        let mut session = test_source_session("session-1");
-        session.repo_path = Some(repo);
-        let mut known = store.known_event_ids().expect("known ids");
-
-        append_source_session_event(&store, Some(&profile), &session, &mut known)
-            .expect("append once");
-        append_source_session_event(&store, Some(&profile), &session, &mut known)
-            .expect("append twice");
-
-        let events = store.read_queued_events().expect("events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_id, source_session_event_id(&session));
-        assert_eq!(
-            events[0].event_type,
-            brick_protocol::EventType::SourceSessionObserved
-        );
-    }
-
-    #[test]
-    fn append_source_session_event_never_carries_normalized_chunks() {
-        let base = std::env::temp_dir().join(format!("source-session-log-{}", Uuid::new_v4()));
-        let repo = base.join("repo");
-        let store_root = base.join("store");
-        fs::create_dir_all(&repo).expect("repo dir");
-        let store = LocalStore::with_options(
-            &repo,
-            StorageOptions::new().with_explicit_store_root(Some(store_root)),
-        )
-        .expect("store");
-        let profile = test_profile();
-        let mut session = test_source_session("session-1");
-        session.repo_path = Some(repo);
-        let mut known = store.known_event_ids().expect("known ids");
-
-        append_source_session_event(&store, Some(&profile), &session, &mut known)
-            .expect("append source session");
-
-        let events = store.read_queued_events().expect("events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].event_type,
-            brick_protocol::EventType::SourceSessionObserved
-        );
-        assert!(events[0].payload.get("normalized_chunks").is_none());
-    }
 
     #[test]
     fn source_session_chunks_or_backfill_persists_missing_chunks_from_source_path() {
@@ -831,22 +579,6 @@ mod tests {
     #[test]
     fn live_broadcast_none_when_no_sessions() {
         assert!(build_live_broadcast(&[], "src/lib.rs", None).is_none());
-    }
-
-    fn test_profile() -> SourceProfile {
-        SourceProfile {
-            name: "orgii".to_string(),
-            app_id: Some("orgii".to_string()),
-            actor_id: Some("agent-1".to_string()),
-            actor_type: Some(ActorType::Agent),
-            store_root: None,
-            session_db_path: None,
-            session_log_path: None,
-            evidence_root: None,
-            cursor_state_db_path: None,
-            default_full_evidence_upload: None,
-            notes: None,
-        }
     }
 
     fn test_source_session(external_session_id: &str) -> SourceSessionUpsert {

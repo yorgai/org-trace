@@ -70,12 +70,24 @@ fn main() -> Result<()> {
         Command::HookExplain => metadata::run_explain_hook(&store)?,
         #[cfg(feature = "sync")]
         Command::Sync { command } => match command {
-            SyncCommand::Run(args) => {
-                handle_sync(&store, args.dry_run, args.remote, args.repo_id, args.org_id)?
-            }
-            SyncCommand::Push(args) => {
-                handle_push(&store, args.dry_run, args.remote, args.repo_id, args.org_id)?
-            }
+            SyncCommand::Run(args) => handle_sync(
+                &store,
+                args.dry_run,
+                args.remote,
+                args.repo_id,
+                args.org_id,
+                args.full,
+                args.all_repos,
+            )?,
+            SyncCommand::Push(args) => handle_push(
+                &store,
+                args.dry_run,
+                args.remote,
+                args.repo_id,
+                args.org_id,
+                args.full,
+                args.all_repos,
+            )?,
             SyncCommand::Pull(args) => {
                 handle_pull(&store, args.dry_run, args.remote, args.repo_id)?
             }

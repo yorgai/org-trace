@@ -160,6 +160,13 @@ pub struct SyncArgs {
     pub repo_id: Option<String>,
     #[arg(long, env = "BRICK_SYNC_ORG_ID")]
     pub org_id: Option<String>,
+    /// Ignore the per-repo sync watermark and push every indexed source-session
+    /// (a full re-push; remote dedupes by event id).
+    #[arg(long)]
+    pub full: bool,
+    /// Push source-sessions for every indexed repo, not just the current one.
+    #[arg(long)]
+    pub all_repos: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

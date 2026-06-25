@@ -661,6 +661,76 @@ impl MetadataDb {
         read_source_session(&self.connection, source_id, external_session_id)
     }
 
+    /// Lists source-session rows for outbound sync: filtered to one `repo_path`
+    /// (exact string; the caller canonicalizes before calling) and to rows newer
+    /// than the `since` high-water mark, ordered `last_seen_at ASC` so a caller
+    /// can advance the watermark monotonically. `since=None` means "all rows for
+    /// this repo" (a full push); `repo_path=None` lifts the repo filter (all
+    /// repos). Correctness never depends on `since`: it is an optimization, and a
+    /// missing/stale watermark only causes a harmless re-push (events are deduped
+    /// remotely by their idempotent `event_id`).
+    pub fn list_source_sessions_for_sync(
+        &self,
+        repo_path: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<SourceSessionRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, external_session_id, title, name, source_path, source_uri,
+                    source_mtime, source_size, source_fingerprint, parser_version,
+                    session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                    files_changed, lines_added, lines_removed, touched_files_json, listable,
+                    discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             FROM source_sessions
+             WHERE (?1 IS NULL OR repo_path = ?1)
+               AND (?2 IS NULL OR last_seen_at > ?2)
+               AND listable = 1
+             ORDER BY last_seen_at ASC, source_id ASC, external_session_id ASC",
+        )?;
+        let rows = statement.query_map(params![repo_path, since], source_session_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.context("failed to read source-session sync row")?);
+        }
+        Ok(records)
+    }
+
+    /// Lists the distinct non-null `repo_path` values across all indexed
+    /// source-sessions, so a full cross-repo push can iterate one repo at a time.
+    pub fn list_distinct_repo_paths(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT repo_path FROM source_sessions
+             WHERE repo_path IS NOT NULL AND repo_path <> '' AND listable = 1
+             ORDER BY repo_path ASC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row.context("failed to read distinct repo_path")?);
+        }
+        Ok(paths)
+    }
+
+    /// Reads the outbound-sync high-water mark for a repo: the greatest
+    /// `last_seen_at` already pushed. `None` means nothing has been pushed yet.
+    /// Stored in the `metadata` KV table under `sync_watermark:<repo_id>`.
+    pub fn get_sync_watermark(&self, repo_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![sync_watermark_key(repo_id)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to read sync watermark")
+    }
+
+    /// Persists the outbound-sync high-water mark for a repo (the greatest
+    /// `last_seen_at` pushed this pass). A wrong/lost value only causes a
+    /// harmless re-push, never data loss, so this is best-effort optimization.
+    pub fn set_sync_watermark(&mut self, repo_id: &str, last_seen_at: &str) -> Result<()> {
+        upsert_metadata(&self.connection, &sync_watermark_key(repo_id), last_seen_at)
+    }
+
     /// Updates only the last-seen/updated timestamps for an existing source session.
     pub fn touch_source_session_last_seen(
         &mut self,
@@ -1487,6 +1557,10 @@ fn metadata_value(connection: &Connection, key: &str) -> Result<Option<String>> 
         )
         .optional()
         .with_context(|| format!("failed to read metadata DB key {key}"))
+}
+
+fn sync_watermark_key(repo_id: &str) -> String {
+    format!("sync_watermark:{repo_id}")
 }
 
 fn upsert_metadata(connection: &Connection, key: &str, value: &str) -> Result<()> {
@@ -2958,5 +3032,87 @@ mod tests {
             .list_brick_sessions_for_source_session(session_id)
             .expect("list by source session");
         assert_eq!(bricks, vec!["brick-sess-1".to_string()]);
+    }
+
+    fn upsert_in_repo(external_id: &str, repo_path: &str, offset: i64) -> SourceSessionUpsert {
+        let mut upsert = sample_upsert(external_id, offset);
+        upsert.external_session_id = external_id.to_string();
+        upsert.repo_path = Some(PathBuf::from(repo_path));
+        upsert
+    }
+
+    #[test]
+    fn list_source_sessions_for_sync_filters_by_repo_and_since() {
+        let path = temp_home("sync-list").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        // Two repos, distinct last_seen offsets.
+        db.upsert_source_session(&upsert_in_repo("s-a1", "/tmp/repo-a", 1))
+            .expect("a1");
+        db.upsert_source_session(&upsert_in_repo("s-a2", "/tmp/repo-a", 5))
+            .expect("a2");
+        db.upsert_source_session(&upsert_in_repo("s-b1", "/tmp/repo-b", 3))
+            .expect("b1");
+
+        // Repo filter excludes the other repo entirely.
+        let repo_a = db
+            .list_source_sessions_for_sync(Some("/tmp/repo-a"), None)
+            .expect("list repo-a");
+        assert_eq!(repo_a.len(), 2);
+        assert!(repo_a
+            .iter()
+            .all(|r| r.repo_path.as_deref() == Some(Path::new("/tmp/repo-a"))));
+        // Ascending by last_seen_at so a caller can advance the watermark.
+        assert!(repo_a[0].last_seen_at <= repo_a[1].last_seen_at);
+
+        // `since` excludes rows at or before the watermark.
+        let watermark = repo_a[0].last_seen_at.to_rfc3339();
+        let after = db
+            .list_source_sessions_for_sync(Some("/tmp/repo-a"), Some(&watermark))
+            .expect("list since");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].external_session_id, "s-a2");
+
+        // No repo filter returns all repos.
+        let all = db
+            .list_source_sessions_for_sync(None, None)
+            .expect("list all");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn list_distinct_repo_paths_dedupes() {
+        let path = temp_home("sync-distinct").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&upsert_in_repo("s-a1", "/tmp/repo-a", 1))
+            .expect("a1");
+        db.upsert_source_session(&upsert_in_repo("s-a2", "/tmp/repo-a", 2))
+            .expect("a2");
+        db.upsert_source_session(&upsert_in_repo("s-b1", "/tmp/repo-b", 3))
+            .expect("b1");
+
+        let repos = db.list_distinct_repo_paths().expect("distinct repos");
+        assert_eq!(repos, vec!["/tmp/repo-a", "/tmp/repo-b"]);
+    }
+
+    #[test]
+    fn sync_watermark_round_trips_per_repo() {
+        let path = temp_home("sync-watermark").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        assert_eq!(db.get_sync_watermark("repo-1").expect("none yet"), None);
+        db.set_sync_watermark("repo-1", "2026-06-25T00:00:00+00:00")
+            .expect("set");
+        db.set_sync_watermark("repo-2", "2026-06-26T00:00:00+00:00")
+            .expect("set other");
+        assert_eq!(
+            db.get_sync_watermark("repo-1").expect("get"),
+            Some("2026-06-25T00:00:00+00:00".to_string())
+        );
+        // Overwrite advances it.
+        db.set_sync_watermark("repo-1", "2026-06-27T00:00:00+00:00")
+            .expect("advance");
+        assert_eq!(
+            db.get_sync_watermark("repo-1").expect("get advanced"),
+            Some("2026-06-27T00:00:00+00:00".to_string())
+        );
     }
 }

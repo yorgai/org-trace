@@ -23,6 +23,7 @@ mod repo_context;
 mod session_query;
 mod source_discovery;
 mod source_profile;
+mod source_session_event;
 mod sources;
 mod sqlite_index;
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub use repo_context::*;
 pub use session_query::*;
 pub use source_discovery::*;
 pub use source_profile::*;
+pub use source_session_event::*;
 pub use sources::*;
 pub use sqlite_index::*;
 pub use store::*;

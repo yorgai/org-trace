@@ -17,10 +17,10 @@ pub mod wire;
 
 use anyhow::{Context, Result};
 use brick_core::{
-    repo_id_for_root, ActivityChunk, LocalStore, MetadataDb, SourceSessionChunksUpsert,
-    SourceSessionUpsert,
+    build_source_session_event, repo_id_for_root, ActivityChunk, LocalStore, MetadataDb,
+    SourceSessionChunksUpsert, SourceSessionRecord, SourceSessionUpsert,
 };
-use brick_protocol::{OrgId, SourceSessionObservedPayload, TraceEvent};
+use brick_protocol::{ActorRef, ActorType, OrgId, SourceSessionObservedPayload, TraceEvent};
 use chrono::Utc;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -62,14 +62,24 @@ fn auto_pull(store: &LocalStore) -> Result<()> {
 }
 
 fn auto_push(store: &LocalStore) -> Result<()> {
-    let events = store.read_queued_events()?;
-    if events.is_empty() {
+    let repo_id = repo_id_for_root(store.repo_root());
+    let repo_path = canonical_repo_path(store);
+    let metadata_db = MetadataDb::open_global().ok();
+    let since = metadata_db
+        .as_ref()
+        .and_then(|db| db.get_sync_watermark(&repo_id).ok().flatten());
+    let collected = collect_push_events(
+        store,
+        metadata_db.as_ref(),
+        repo_path.as_deref(),
+        since.as_deref(),
+    )?;
+    if collected.events.is_empty() {
         return Ok(());
     }
-    let events = hydrate_source_session_chunks(events)?;
+    let events = hydrate_source_session_chunks(collected.events)?;
     let identity = identity::refresh_if_needed()?;
     let remote = auto_sync_remote();
-    let repo_id = repo_id_for_root(store.repo_root());
     let org_id = std::env::var("BRICK_SYNC_ORG_ID").ok();
     let request = PushEventsRequest {
         events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
@@ -88,7 +98,95 @@ fn auto_push(store: &LocalStore) -> Result<()> {
             Some(&identity.access_token),
         )?;
     };
+    advance_watermark(&repo_id, collected.max_last_seen_at);
     Ok(())
+}
+
+/// The events collected for one push pass plus the high-water `last_seen_at` of
+/// the source-sessions included, so the caller can advance the sync watermark.
+struct CollectedPushEvents {
+    events: Vec<TraceEvent>,
+    max_last_seen_at: Option<String>,
+}
+
+/// Gathers everything to push for one repo from BOTH stores:
+/// (a) the JSONL queue — Brick's own append-only records (mission / artifact),
+/// (b) source-sessions synthesized from `metadata.sqlite` (the authoritative
+///     home for externally-observed AI sessions), filtered to this repo and to
+///     rows newer than `since`.
+///
+/// Synthesizing (b) here — rather than reading source-session events from the
+/// JSONL queue — is what fixes the historical data-loss bug: source-sessions for
+/// repos other than the current one never reached the JSONL queue, so they were
+/// never pushed. `metadata.sqlite` has them all.
+fn collect_push_events(
+    store: &LocalStore,
+    metadata_db: Option<&MetadataDb>,
+    repo_path: Option<&str>,
+    since: Option<&str>,
+) -> Result<CollectedPushEvents> {
+    let mut events = store.read_queued_events()?;
+    let mut max_last_seen_at: Option<String> = None;
+
+    if let Some(db) = metadata_db {
+        let records = db.list_source_sessions_for_sync(repo_path, since)?;
+        for record in &records {
+            let repo_id = record_repo_id(record, store);
+            let actor = actor_for_record(record);
+            let event = build_source_session_event(actor, record, &repo_id)
+                .context("failed to synthesize source-session event")?;
+            events.push(event);
+            let seen = record.last_seen_at.to_rfc3339();
+            if max_last_seen_at
+                .as_deref()
+                .is_none_or(|cur| seen.as_str() > cur)
+            {
+                max_last_seen_at = Some(seen);
+            }
+        }
+    }
+
+    Ok(CollectedPushEvents {
+        events,
+        max_last_seen_at,
+    })
+}
+
+/// Default actor for a synthesized source-session event: the provider acting as
+/// an agent, identified by its `source_id` (mirrors the historical writer).
+fn actor_for_record(record: &SourceSessionRecord) -> ActorRef {
+    ActorRef {
+        actor_type: ActorType::Agent,
+        actor_id: record.source_id.clone(),
+        display_name: None,
+    }
+}
+
+/// `repo_id` for a record's own repo_path, falling back to the store's repo when
+/// the record carries no repo_path.
+fn record_repo_id(record: &SourceSessionRecord, store: &LocalStore) -> String {
+    match record.repo_path.as_deref() {
+        Some(path) => repo_id_for_root(path),
+        None => repo_id_for_root(store.repo_root()),
+    }
+}
+
+/// Canonicalized repo root path string, matched against `source_sessions.repo_path`.
+fn canonical_repo_path(store: &LocalStore) -> Option<String> {
+    let root = store.repo_root();
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    Some(canonical.display().to_string())
+}
+
+/// Best-effort: persist the new outbound-sync high-water mark. A failure here
+/// only means the next push re-sends already-uploaded (idempotent) events.
+fn advance_watermark(repo_id: &str, max_last_seen_at: Option<String>) {
+    let Some(max) = max_last_seen_at else {
+        return;
+    };
+    if let Ok(mut db) = MetadataDb::open_global() {
+        let _ = db.set_sync_watermark(repo_id, &max);
+    }
 }
 
 fn auto_sync_remote() -> String {
@@ -115,16 +213,43 @@ pub fn handle_push(
     remote: Option<String>,
     repo_id: Option<String>,
     org_id: Option<String>,
+    full: bool,
+    all_repos: bool,
 ) -> Result<()> {
-    let events = store.read_queued_events()?;
     let remote = normalized_remote(remote);
     let repo_id = repo_id.unwrap_or_else(|| repo_id_for_root(store.repo_root()));
+    let metadata_db = MetadataDb::open_global().ok();
+
+    // Per-repo target list. Default: just the current repo. `--all-repos` fans
+    // out to every repo_path metadata has indexed (each pushed under its own
+    // repo_id), which is how source-sessions from OTHER repos get uploaded.
+    let targets = push_targets(store, metadata_db.as_ref(), &repo_id, all_repos);
+
     if dry_run {
+        let mut total = 0usize;
+        for target in &targets {
+            let since = if full {
+                None
+            } else {
+                metadata_db
+                    .as_ref()
+                    .and_then(|db| db.get_sync_watermark(&target.repo_id).ok().flatten())
+            };
+            let collected = collect_push_events(
+                store,
+                metadata_db.as_ref(),
+                target.repo_path.as_deref(),
+                since.as_deref(),
+            )?;
+            total += collected.events.len();
+        }
         println!("push_dry_run=true");
         println!("remote={remote}");
         println!("repo_id={repo_id}");
         println!("org_id={}", org_id.as_deref().unwrap_or(""));
-        println!("queued_event_count={}", events.len());
+        println!("all_repos={all_repos}");
+        println!("full={full}");
+        println!("collected_event_count={total}");
         return Ok(());
     }
 
@@ -134,26 +259,88 @@ pub fn handle_push(
     let identity = identity::refresh_if_needed()
         .context("upload requires a Brick account. Run `brick login` first")?;
 
-    let events = hydrate_source_session_chunks(events)?;
-    let request = PushEventsRequest {
-        events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
-    };
-    let response = if supabase::is_supabase_remote(&remote) {
-        supabase::SupabaseRemote::from_env()?.push_events(
-            Some(&repo_id),
-            &request,
-            &identity.access_token,
-        )?
-    } else {
-        push_events_to_remote(
-            &remote,
-            Some(&repo_id),
-            &request,
-            Some(&identity.access_token),
-        )?
-    };
-    print_push_result(&response, request.events.len());
+    let mut total_pushed = 0usize;
+    for target in &targets {
+        let since = if full {
+            None
+        } else {
+            metadata_db
+                .as_ref()
+                .and_then(|db| db.get_sync_watermark(&target.repo_id).ok().flatten())
+        };
+        let collected = collect_push_events(
+            store,
+            metadata_db.as_ref(),
+            target.repo_path.as_deref(),
+            since.as_deref(),
+        )?;
+        if collected.events.is_empty() {
+            continue;
+        }
+        let events = hydrate_source_session_chunks(collected.events)?;
+        let request = PushEventsRequest {
+            events: scoped_events(events, Some(&target.repo_id), org_id.as_deref())?,
+        };
+        let response = if supabase::is_supabase_remote(&remote) {
+            supabase::SupabaseRemote::from_env()?.push_events(
+                Some(&target.repo_id),
+                &request,
+                &identity.access_token,
+            )?
+        } else {
+            push_events_to_remote(
+                &remote,
+                Some(&target.repo_id),
+                &request,
+                Some(&identity.access_token),
+            )?
+        };
+        total_pushed += request.events.len();
+        print_push_result(&response, request.events.len());
+        advance_watermark(&target.repo_id, collected.max_last_seen_at);
+    }
+    if total_pushed == 0 {
+        println!("pushed_event_count=0");
+    }
     Ok(())
+}
+
+/// One repo to push: its `repo_id` (for scoping/watermark) and the canonical
+/// `repo_path` string used to filter `source_sessions` (None = current repo's
+/// queue only, no repo_path filter).
+struct PushTarget {
+    repo_id: String,
+    repo_path: Option<String>,
+}
+
+/// Builds the list of repos to push. Default is the single current repo;
+/// `--all-repos` adds one target per distinct indexed `repo_path`.
+fn push_targets(
+    store: &LocalStore,
+    metadata_db: Option<&MetadataDb>,
+    current_repo_id: &str,
+    all_repos: bool,
+) -> Vec<PushTarget> {
+    if !all_repos {
+        return vec![PushTarget {
+            repo_id: current_repo_id.to_string(),
+            repo_path: canonical_repo_path(store),
+        }];
+    }
+    let Some(db) = metadata_db else {
+        return vec![PushTarget {
+            repo_id: current_repo_id.to_string(),
+            repo_path: canonical_repo_path(store),
+        }];
+    };
+    db.list_distinct_repo_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| PushTarget {
+            repo_id: repo_id_for_root(std::path::Path::new(&path)),
+            repo_path: Some(path),
+        })
+        .collect()
 }
 
 /// Handles `pull` by storing previously unknown remote events in inbound logs.
@@ -190,10 +377,20 @@ pub fn handle_sync(
     remote: Option<String>,
     repo_id: Option<String>,
     org_id: Option<String>,
+    full: bool,
+    all_repos: bool,
 ) -> Result<()> {
     let remote = normalized_remote(remote);
     handle_pull(store, dry_run, Some(remote.clone()), repo_id.clone())?;
-    handle_push(store, dry_run, Some(remote), repo_id, org_id)?;
+    handle_push(
+        store,
+        dry_run,
+        Some(remote),
+        repo_id,
+        org_id,
+        full,
+        all_repos,
+    )?;
     Ok(())
 }
 
@@ -792,6 +989,73 @@ mod tests {
     }
 
     #[test]
+    fn collect_push_events_unions_queue_and_metadata_source_sessions() {
+        use brick_core::{MetadataDb, SourceSessionUpsert};
+        use chrono::Utc;
+
+        let repo_root = temp_repo_root("collect-union");
+        let store = LocalStore::new(&repo_root);
+        // (a) one Brick-native JSONL event (a mission).
+        store
+            .append_event(&event("native mission"))
+            .expect("append");
+
+        // (b) one indexed source-session in a fresh metadata db.
+        let meta_path = repo_root.join("metadata.sqlite");
+        let mut db = MetadataDb::open_path(&meta_path).expect("open metadata");
+        let now = Utc::now();
+        let canonical_root =
+            std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
+        let session = SourceSessionUpsert {
+            source_id: "orgii".to_string(),
+            external_session_id: "ext-1".to_string(),
+            title: Some("indexed session".to_string()),
+            name: None,
+            source_path: None,
+            source_uri: None,
+            source_mtime: None,
+            source_size: None,
+            source_fingerprint: Some("fp-1".to_string()),
+            parser_version: Some("v1".to_string()),
+            session_created_at: None,
+            session_updated_at: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            repo_path: Some(canonical_root),
+            branch: None,
+            files_changed: None,
+            lines_added: None,
+            lines_removed: None,
+            touched_files_json: None,
+            listable: true,
+            discovered_at: now,
+            last_seen_at: now,
+            metadata_json: None,
+        };
+        db.upsert_source_session(&session).expect("upsert session");
+
+        let repo_path = canonical_repo_path(&store);
+        let collected =
+            collect_push_events(&store, Some(&db), repo_path.as_deref(), None).expect("collect");
+
+        // Union: the JSONL mission + the synthesized source-session.
+        assert_eq!(collected.events.len(), 2);
+        let kinds: Vec<_> = collected.events.iter().map(|e| e.event_type).collect();
+        assert!(kinds.contains(&brick_protocol::EventType::MissionCreated));
+        assert!(kinds.contains(&brick_protocol::EventType::SourceSessionObserved));
+        assert!(collected.max_last_seen_at.is_some());
+
+        // With no metadata db, only the JSONL events come back.
+        let queue_only =
+            collect_push_events(&store, None, repo_path.as_deref(), None).expect("queue only");
+        assert_eq!(queue_only.events.len(), 1);
+        assert!(queue_only.max_last_seen_at.is_none());
+
+        let _ = fs::remove_dir_all(&repo_root);
+    }
+
+    #[test]
     fn push_dry_run_does_not_require_login() {
         // A dry-run push must work for anyone (it makes no network call and sends
         // no token), so it returns Ok even with no identity on disk.
@@ -804,6 +1068,8 @@ mod tests {
             Some("http://127.0.0.1:7821".to_string()),
             None,
             None,
+            false,
+            false,
         );
         assert!(
             result.is_ok(),
