@@ -13,7 +13,9 @@ clap.workspace = true
 brick-core = { path = "../core" }
 brick-protocol = { path = "../protocol" }
 brick-sync = { path = "../sync" }
-jsonwebtoken = "9.3"
+# jsonwebtoken 10 split crypto backends into features; HS256 (Supabase) needs
+# `rust_crypto` explicitly (v9 bundled it). Pin >=10.3 for GHSA-h395-gr6q-cpjc.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
