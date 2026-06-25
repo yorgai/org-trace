@@ -131,12 +131,7 @@ impl SupabaseRemote {
             .header("content-type", "application/json")
             .header("prefer", "resolution=ignore-duplicates,return=minimal")
             .send_json(chunk)
-            .with_context(|| {
-                format!(
-                    "failed to insert Brick event chunks for event {} into Supabase",
-                    event.event_id
-                )
-            })?;
+            .map_err(|error| chunk_insert_error(error, event.event_id))?;
         }
         Ok(())
     }
@@ -342,6 +337,26 @@ fn first_str<'a>(value: &'a serde_json::Value, paths: &[&[&str]]) -> Option<&'a 
         }
         current.as_str()
     })
+}
+
+/// Turns a chunk-insert transport error into an actionable one. A `403` here is
+/// almost always the known production drift where `brick_event_chunks` lacks its
+/// INSERT RLS policy (the `brick_can_insert_event_chunk` helper was never
+/// deployed), so point the operator straight at the idempotent patch instead of
+/// surfacing a bare `http status: 403`.
+fn chunk_insert_error(error: ureq::Error, event_id: uuid::Uuid) -> anyhow::Error {
+    if matches!(error, ureq::Error::StatusCode(403)) {
+        return anyhow::anyhow!(
+            "failed to insert Brick event chunks for event {event_id}: Supabase returned 403 \
+             (row-level security). The brick_event_chunks INSERT policy is missing on this \
+             project. Apply docs/self-hosting/patches/2026-06-25-event-chunks-insert-rls.sql \
+             in the Supabase SQL editor (or re-run docs/self-hosting/supabase.sql), then push \
+             again."
+        );
+    }
+    anyhow::Error::new(error).context(format!(
+        "failed to insert Brick event chunks for event {event_id} into Supabase"
+    ))
 }
 
 fn event_without_chunks(event: &TraceEvent) -> TraceEvent {
