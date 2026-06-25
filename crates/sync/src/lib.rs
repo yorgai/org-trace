@@ -73,6 +73,7 @@ fn auto_push(store: &LocalStore) -> Result<()> {
         metadata_db.as_ref(),
         repo_path.as_deref(),
         since.as_deref(),
+        true,
     )?;
     if collected.events.is_empty() {
         return Ok(());
@@ -110,7 +111,10 @@ struct CollectedPushEvents {
 }
 
 /// Gathers everything to push for one repo from BOTH stores:
-/// (a) the JSONL queue — Brick's own append-only records (mission / artifact),
+/// (a) the JSONL queue — Brick's own append-only records (mission / artifact) —
+///     ONLY when `include_queue` is set. The queue belongs to the current repo,
+///     so an `--all-repos` fan-out includes it exactly once (for the current
+///     repo target) instead of re-pushing it under every repo_id.
 /// (b) source-sessions synthesized from `metadata.sqlite` (the authoritative
 ///     home for externally-observed AI sessions), filtered to this repo and to
 ///     rows newer than `since`.
@@ -124,8 +128,13 @@ fn collect_push_events(
     metadata_db: Option<&MetadataDb>,
     repo_path: Option<&str>,
     since: Option<&str>,
+    include_queue: bool,
 ) -> Result<CollectedPushEvents> {
-    let mut events = store.read_queued_events()?;
+    let mut events = if include_queue {
+        store.read_queued_events()?
+    } else {
+        Vec::new()
+    };
     let mut max_last_seen_at: Option<String> = None;
 
     if let Some(db) = metadata_db {
@@ -240,6 +249,7 @@ pub fn handle_push(
                 metadata_db.as_ref(),
                 target.repo_path.as_deref(),
                 since.as_deref(),
+                target.is_current,
             )?;
             total += collected.events.len();
         }
@@ -273,6 +283,7 @@ pub fn handle_push(
             metadata_db.as_ref(),
             target.repo_path.as_deref(),
             since.as_deref(),
+            target.is_current,
         )?;
         if collected.events.is_empty() {
             continue;
@@ -305,42 +316,51 @@ pub fn handle_push(
     Ok(())
 }
 
-/// One repo to push: its `repo_id` (for scoping/watermark) and the canonical
-/// `repo_path` string used to filter `source_sessions` (None = current repo's
-/// queue only, no repo_path filter).
+/// One repo to push: its `repo_id` (for scoping/watermark), the canonical
+/// `repo_path` string used to filter `source_sessions` (None = no repo_path
+/// filter), and whether this target owns the local JSONL queue (the current
+/// repo). Only the current-repo target pushes the queue, so an `--all-repos`
+/// fan-out sends the queue exactly once.
 struct PushTarget {
     repo_id: String,
     repo_path: Option<String>,
+    is_current: bool,
 }
 
-/// Builds the list of repos to push. Default is the single current repo;
-/// `--all-repos` adds one target per distinct indexed `repo_path`.
+/// Builds the list of repos to push. The current repo always comes first and is
+/// the sole owner of the JSONL queue. `--all-repos` appends one target per
+/// distinct indexed `repo_path` whose repo_id differs from the current repo, so
+/// source-sessions from OTHER repos get uploaded without re-sending the queue or
+/// double-pushing the current repo's source-sessions.
 fn push_targets(
     store: &LocalStore,
     metadata_db: Option<&MetadataDb>,
     current_repo_id: &str,
     all_repos: bool,
 ) -> Vec<PushTarget> {
+    let mut targets = vec![PushTarget {
+        repo_id: current_repo_id.to_string(),
+        repo_path: canonical_repo_path(store),
+        is_current: true,
+    }];
     if !all_repos {
-        return vec![PushTarget {
-            repo_id: current_repo_id.to_string(),
-            repo_path: canonical_repo_path(store),
-        }];
+        return targets;
     }
     let Some(db) = metadata_db else {
-        return vec![PushTarget {
-            repo_id: current_repo_id.to_string(),
-            repo_path: canonical_repo_path(store),
-        }];
+        return targets;
     };
-    db.list_distinct_repo_paths()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|path| PushTarget {
-            repo_id: repo_id_for_root(std::path::Path::new(&path)),
+    for path in db.list_distinct_repo_paths().unwrap_or_default() {
+        let repo_id = repo_id_for_root(std::path::Path::new(&path));
+        if repo_id == current_repo_id {
+            continue;
+        }
+        targets.push(PushTarget {
+            repo_id,
             repo_path: Some(path),
-        })
-        .collect()
+            is_current: false,
+        });
+    }
+    targets
 }
 
 /// Handles `pull` by storing previously unknown remote events in inbound logs.
@@ -1036,8 +1056,8 @@ mod tests {
         db.upsert_source_session(&session).expect("upsert session");
 
         let repo_path = canonical_repo_path(&store);
-        let collected =
-            collect_push_events(&store, Some(&db), repo_path.as_deref(), None).expect("collect");
+        let collected = collect_push_events(&store, Some(&db), repo_path.as_deref(), None, true)
+            .expect("collect");
 
         // Union: the JSONL mission + the synthesized source-session.
         assert_eq!(collected.events.len(), 2);
@@ -1046,9 +1066,19 @@ mod tests {
         assert!(kinds.contains(&brick_protocol::EventType::SourceSessionObserved));
         assert!(collected.max_last_seen_at.is_some());
 
+        // include_queue=false drops the JSONL queue (used by non-current repos
+        // in an --all-repos fan-out) — only the synthesized source-session.
+        let no_queue = collect_push_events(&store, Some(&db), repo_path.as_deref(), None, false)
+            .expect("no queue");
+        assert_eq!(no_queue.events.len(), 1);
+        assert_eq!(
+            no_queue.events[0].event_type,
+            brick_protocol::EventType::SourceSessionObserved
+        );
+
         // With no metadata db, only the JSONL events come back.
-        let queue_only =
-            collect_push_events(&store, None, repo_path.as_deref(), None).expect("queue only");
+        let queue_only = collect_push_events(&store, None, repo_path.as_deref(), None, true)
+            .expect("queue only");
         assert_eq!(queue_only.events.len(), 1);
         assert!(queue_only.max_last_seen_at.is_none());
 
