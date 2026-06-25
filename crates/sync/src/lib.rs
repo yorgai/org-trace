@@ -673,7 +673,9 @@ fn source_session_upsert_from_payload(
         source_id: payload.source_id.clone(),
         external_session_id: payload.external_session_id.clone(),
         title: payload.title.clone(),
-        name: payload.title.clone(),
+        // Prefer the carried `name`; fall back to `title` for events pushed
+        // before the payload carried `name` separately.
+        name: payload.name.clone().or_else(|| payload.title.clone()),
         source_path: payload.source_path.as_ref().map(PathBuf::from),
         source_uri: payload.source_uri.clone(),
         source_mtime: parse_rfc3339(payload.source_mtime.as_deref()),
@@ -939,11 +941,30 @@ mod tests {
         assert_eq!(normalized[0]["result"]["content"], "done");
     }
 
+    #[test]
+    fn name_survives_payload_round_trip_distinct_from_title() {
+        // A session whose name differs from its title must keep both across a
+        // push→pull reconstruction (the upsert builds the metadata row read by
+        // FTS intent ranking).
+        let mut payload = source_session_payload();
+        payload.title = Some("Refactor the auth layer".to_string());
+        payload.name = Some("chat-2026-06-25-auth".to_string());
+        let upsert = source_session_upsert_from_payload(&payload).expect("upsert");
+        assert_eq!(upsert.title.as_deref(), Some("Refactor the auth layer"));
+        assert_eq!(upsert.name.as_deref(), Some("chat-2026-06-25-auth"));
+
+        // Legacy events without a carried name fall back to title.
+        payload.name = None;
+        let legacy = source_session_upsert_from_payload(&payload).expect("legacy upsert");
+        assert_eq!(legacy.name.as_deref(), Some("Refactor the auth layer"));
+    }
+
     fn source_session_payload() -> SourceSessionObservedPayload {
         SourceSessionObservedPayload {
             source_id: "codex".to_string(),
             external_session_id: "session-1".to_string(),
             title: Some("Investigate".to_string()),
+            name: None,
             source_path: Some("/local/blob".to_string()),
             source_uri: Some("file:///local/blob".to_string()),
             source_mtime: None,

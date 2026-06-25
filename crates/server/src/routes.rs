@@ -799,10 +799,17 @@ pub async fn serve(
 
 fn route_error(error: anyhow::Error) -> (StatusCode, String) {
     let message = error.to_string();
+    // Validation errors are safe and useful to echo back. Everything else may
+    // carry internal detail (filesystem paths, sqlite errors) in the anyhow
+    // chain, so log it server-side and return a generic body to the client.
     if message.contains("repo_id") || message.contains("cursor") {
         (StatusCode::BAD_REQUEST, message)
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, message)
+        eprintln!("internal route error: {error:#}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal server error".to_string(),
+        )
     }
 }
 

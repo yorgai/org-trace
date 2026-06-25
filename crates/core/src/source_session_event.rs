@@ -55,6 +55,7 @@ pub fn build_source_session_event(
         source_id: record.source_id.clone(),
         external_session_id: record.external_session_id.clone(),
         title: record.title.clone(),
+        name: record.name.clone(),
         source_path: record
             .source_path
             .as_ref()

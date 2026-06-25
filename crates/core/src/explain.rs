@@ -804,6 +804,7 @@ mod tests {
                 source_id: "orgii".to_string(),
                 external_session_id: "session-1".to_string(),
                 title: Some("Investigate sync design".to_string()),
+                name: None,
                 source_path: Some("/Users/me/.orgii/sessions.db".to_string()),
                 source_uri: Some("file:///Users/me/.orgii/sessions.db".to_string()),
                 source_mtime: None,

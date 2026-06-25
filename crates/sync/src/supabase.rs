@@ -439,6 +439,7 @@ mod tests {
                 source_id: "orgii".to_string(),
                 external_session_id: "session-a".to_string(),
                 title: None,
+                name: None,
                 source_path: None,
                 source_uri: None,
                 source_mtime: None,

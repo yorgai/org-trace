@@ -250,6 +250,11 @@ pub struct SourceSessionObservedPayload {
     pub source_id: String,
     pub external_session_id: String,
     pub title: Option<String>,
+    /// The provider's own session "name" when it differs from `title` (some
+    /// tools carry both). Carried separately so a push→pull round-trip preserves
+    /// it for FTS intent ranking instead of collapsing it into `title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub source_path: Option<String>,
     pub source_uri: Option<String>,
     pub source_mtime: Option<String>,
