@@ -19,6 +19,47 @@ const SOURCE_WINDSURF: &str = "windsurf";
 const SOURCE_ORGII: &str = "orgii";
 const SOURCE_GEMINI: &str = "gemini";
 
+/// The set of first-class AI-tool sources Brick has a dedicated parser for.
+///
+/// This enum is the single registry of known sources. Every per-source dispatch
+/// (`list_source_sessions_since`, `format_source_session_chunks`,
+/// `list_source_plans`, liveness) matches on it **exhaustively** — so adding a
+/// new tool is a compile error at every site that must handle it, instead of a
+/// silent fall-through to the generic parser / empty chunks / wrong liveness.
+///
+/// A source string that doesn't map to a variant is an *unknown* source and is
+/// handled by the explicit `None` arm of `KnownSource::from_name` (the generic
+/// file provider), which is a supported feature — custom user sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownSource {
+    ClaudeCode,
+    CodexApp,
+    CursorIde,
+    CursorAgent,
+    OpenCode,
+    Windsurf,
+    Orgii,
+    Gemini,
+}
+
+impl KnownSource {
+    /// Maps a source/profile name to its variant, or `None` for an unknown
+    /// (custom) source that should use the generic file provider.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            SOURCE_CLAUDE_CODE => Some(Self::ClaudeCode),
+            SOURCE_CODEX_APP => Some(Self::CodexApp),
+            SOURCE_CURSOR_IDE => Some(Self::CursorIde),
+            SOURCE_CURSOR_AGENT => Some(Self::CursorAgent),
+            SOURCE_OPENCODE => Some(Self::OpenCode),
+            SOURCE_WINDSURF => Some(Self::Windsurf),
+            SOURCE_ORGII => Some(Self::Orgii),
+            SOURCE_GEMINI => Some(Self::Gemini),
+            _ => None,
+        }
+    }
+}
+
 /// Lists native sessions through the app-specific provider for a source profile.
 ///
 /// This is the single funnel through which every provider's results pass, so it
@@ -41,16 +82,16 @@ pub fn list_source_sessions_since(
     limit: Option<usize>,
     since: Option<&str>,
 ) -> Result<Vec<NativeSourceSession>> {
-    let mut sessions = match profile.name.as_str() {
-        SOURCE_CLAUDE_CODE => claude_code::list_sessions(profile, limit, since),
-        SOURCE_CODEX_APP => codex_app::list_sessions(profile, limit, since),
-        SOURCE_CURSOR_IDE => cursor_ide::list_sessions(profile, limit, since),
-        SOURCE_CURSOR_AGENT => cursor_agent::list_sessions(profile, limit, since),
-        SOURCE_OPENCODE => opencode::list_sessions(profile, limit, since),
-        SOURCE_WINDSURF => windsurf::list_sessions(profile, limit, since),
-        SOURCE_ORGII => orgii::list_sessions(profile, limit, since),
-        SOURCE_GEMINI => gemini::list_sessions(profile, limit, since),
-        _ => list_native_source_sessions(profile, limit),
+    let mut sessions = match KnownSource::from_name(profile.name.as_str()) {
+        Some(KnownSource::ClaudeCode) => claude_code::list_sessions(profile, limit, since),
+        Some(KnownSource::CodexApp) => codex_app::list_sessions(profile, limit, since),
+        Some(KnownSource::CursorIde) => cursor_ide::list_sessions(profile, limit, since),
+        Some(KnownSource::CursorAgent) => cursor_agent::list_sessions(profile, limit, since),
+        Some(KnownSource::OpenCode) => opencode::list_sessions(profile, limit, since),
+        Some(KnownSource::Windsurf) => windsurf::list_sessions(profile, limit, since),
+        Some(KnownSource::Orgii) => orgii::list_sessions(profile, limit, since),
+        Some(KnownSource::Gemini) => gemini::list_sessions(profile, limit, since),
+        None => list_native_source_sessions(profile, limit),
     }?;
     fill_liveness(&mut sessions);
     Ok(sessions)
@@ -113,10 +154,23 @@ pub fn is_active(session: &NativeSourceSession) -> bool {
 }
 
 /// Lists source plans and recovered plan-session edges through supported providers.
+///
+/// Only Cursor IDE exposes a plan store today; every other known source has no
+/// plan concept and returns empty. The match is exhaustive so a newly-added
+/// source must explicitly declare whether it has plans.
 pub fn list_source_plans(profile: &SourceProfile) -> Result<Vec<SourcePlanWithEdgesUpsert>> {
-    match profile.name.as_str() {
-        SOURCE_CURSOR_IDE => cursor_ide::list_plans(profile),
-        _ => Ok(Vec::new()),
+    match KnownSource::from_name(profile.name.as_str()) {
+        Some(KnownSource::CursorIde) => cursor_ide::list_plans(profile),
+        Some(
+            KnownSource::ClaudeCode
+            | KnownSource::CodexApp
+            | KnownSource::CursorAgent
+            | KnownSource::OpenCode
+            | KnownSource::Windsurf
+            | KnownSource::Orgii
+            | KnownSource::Gemini,
+        )
+        | None => Ok(Vec::new()),
     }
 }
 
@@ -146,16 +200,20 @@ pub fn format_source_session_chunks(
     external_session_id: &str,
     source_path: Option<&Path>,
 ) -> Result<Vec<ActivityChunk>> {
-    match source_id {
-        SOURCE_CLAUDE_CODE => claude_code::format_chunks(external_session_id, source_path),
-        SOURCE_CODEX_APP => codex_app::format_chunks(external_session_id, source_path),
-        SOURCE_CURSOR_IDE => cursor_ide::format_chunks(external_session_id, source_path),
-        SOURCE_CURSOR_AGENT => cursor_agent::format_chunks(external_session_id, source_path),
-        SOURCE_OPENCODE => opencode::format_chunks(external_session_id, source_path),
-        SOURCE_WINDSURF => windsurf::format_chunks(external_session_id, source_path),
-        SOURCE_ORGII => orgii::format_chunks(external_session_id, source_path),
-        SOURCE_GEMINI => gemini::format_chunks(external_session_id, source_path),
-        _ => Ok(Vec::new()),
+    match KnownSource::from_name(source_id) {
+        Some(KnownSource::ClaudeCode) => {
+            claude_code::format_chunks(external_session_id, source_path)
+        }
+        Some(KnownSource::CodexApp) => codex_app::format_chunks(external_session_id, source_path),
+        Some(KnownSource::CursorIde) => cursor_ide::format_chunks(external_session_id, source_path),
+        Some(KnownSource::CursorAgent) => {
+            cursor_agent::format_chunks(external_session_id, source_path)
+        }
+        Some(KnownSource::OpenCode) => opencode::format_chunks(external_session_id, source_path),
+        Some(KnownSource::Windsurf) => windsurf::format_chunks(external_session_id, source_path),
+        Some(KnownSource::Orgii) => orgii::format_chunks(external_session_id, source_path),
+        Some(KnownSource::Gemini) => gemini::format_chunks(external_session_id, source_path),
+        None => Ok(Vec::new()),
     }
 }
 

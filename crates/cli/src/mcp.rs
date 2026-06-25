@@ -697,7 +697,9 @@ fn dispatch_planning(store: &LocalStore, name: &str, args: &Value) -> Result<Val
                 mission_id,
                 session_id,
                 ArtifactCreatedPayload {
-                    artifact_kind: artifact_kind_from_str(args.get("kind").and_then(Value::as_str)),
+                    artifact_kind: artifact_kind_from_str(
+                        args.get("kind").and_then(Value::as_str),
+                    )?,
                     title,
                     body: opt_str_arg(args, "body"),
                     repo_context_id: None,
@@ -1189,16 +1191,21 @@ fn mission_status_from_str(raw: Option<&str>) -> Result<MissionStatus> {
     }
 }
 
-/// Maps an artifact kind wire string to the enum, defaulting to Note.
-fn artifact_kind_from_str(raw: Option<&str>) -> ArtifactKind {
+/// Maps an artifact kind wire string to the enum. An absent kind defaults to
+/// `Note`; a present-but-unrecognized kind is an error (mirrors
+/// `parse_mission_status`) rather than being silently coerced to `Note`.
+fn artifact_kind_from_str(raw: Option<&str>) -> Result<ArtifactKind> {
     match raw.map(|value| value.trim().to_lowercase()).as_deref() {
-        Some("decision") => ArtifactKind::Decision,
-        Some("file_ref") => ArtifactKind::FileRef,
-        Some("patch") => ArtifactKind::Patch,
-        Some("review") => ArtifactKind::Review,
-        Some("test_result") => ArtifactKind::TestResult,
-        Some("acceptance") => ArtifactKind::Acceptance,
-        _ => ArtifactKind::Note,
+        None | Some("") | Some("note") => Ok(ArtifactKind::Note),
+        Some("decision") => Ok(ArtifactKind::Decision),
+        Some("file_ref") => Ok(ArtifactKind::FileRef),
+        Some("patch") => Ok(ArtifactKind::Patch),
+        Some("review") => Ok(ArtifactKind::Review),
+        Some("test_result") => Ok(ArtifactKind::TestResult),
+        Some("acceptance") => Ok(ArtifactKind::Acceptance),
+        Some(other) => Err(anyhow::anyhow!(
+            "unknown artifact kind: {other} (note|decision|file_ref|patch|review|test_result|acceptance)"
+        )),
     }
 }
 
@@ -1225,6 +1232,42 @@ fn method_not_found(id: Value, method: &str) -> Value {
         "id": id,
         "error": { "code": -32601, "message": format!("method not found: {method}") }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_kind_absent_defaults_to_note() {
+        assert_eq!(artifact_kind_from_str(None).unwrap(), ArtifactKind::Note);
+        assert_eq!(
+            artifact_kind_from_str(Some("")).unwrap(),
+            ArtifactKind::Note
+        );
+        assert_eq!(
+            artifact_kind_from_str(Some("note")).unwrap(),
+            ArtifactKind::Note
+        );
+    }
+
+    #[test]
+    fn artifact_kind_known_values_map() {
+        assert_eq!(
+            artifact_kind_from_str(Some("decision")).unwrap(),
+            ArtifactKind::Decision
+        );
+        assert_eq!(
+            artifact_kind_from_str(Some(" Patch ")).unwrap(),
+            ArtifactKind::Patch
+        );
+    }
+
+    #[test]
+    fn artifact_kind_unknown_errors_not_silently_note() {
+        let err = artifact_kind_from_str(Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("unknown artifact kind"));
+    }
 }
 
 fn parse_error() -> Value {

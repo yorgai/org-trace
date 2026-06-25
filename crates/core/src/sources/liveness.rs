@@ -24,6 +24,8 @@ use serde_json::Value;
 
 use crate::Liveness;
 
+use super::traits::KnownSource;
+
 /// How recently a transcript must have changed to be considered possibly active.
 /// Generous on purpose: an agent that is thinking, calling a slow tool, or
 /// waiting for user approval does not write to its transcript, and we must not
@@ -70,12 +72,22 @@ pub fn probe_liveness(
 
     // Within the window: consult turn signals for JSONL tools, else trust the
     // per-session activity time we already gated on.
-    match source_app_id {
-        "codex_app" => probe_codex(path).unwrap_or(Liveness::Active),
-        "claude_code" => probe_claude(path).unwrap_or(Liveness::Active),
-        // SQLite / unknown sources have no per-turn markers; a recent per-session
-        // activity time is the only evidence, and we already know it is in-window.
-        _ => Liveness::Active,
+    match KnownSource::from_name(source_app_id) {
+        Some(KnownSource::CodexApp) => probe_codex(path).unwrap_or(Liveness::Active),
+        Some(KnownSource::ClaudeCode) => probe_claude(path).unwrap_or(Liveness::Active),
+        // SQLite-backed and unknown sources have no per-turn markers; a recent
+        // per-session activity time is the only evidence, and we already know it
+        // is in-window. Listed explicitly so a newly-added JSONL tool that needs
+        // tail-probing is a compile error here rather than a silent "Active".
+        Some(
+            KnownSource::CursorIde
+            | KnownSource::CursorAgent
+            | KnownSource::OpenCode
+            | KnownSource::Windsurf
+            | KnownSource::Orgii
+            | KnownSource::Gemini,
+        )
+        | None => Liveness::Active,
     }
 }
 
