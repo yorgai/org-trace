@@ -108,7 +108,7 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Borrows the root object's server map (creating it), keyed per format.
-fn ensure_servers<'a>(root: &'a mut Value, format: Format) -> Result<&'a mut Map<String, Value>> {
+fn ensure_servers(root: &mut Value, format: Format) -> Result<&mut Map<String, Value>> {
     if !root.is_object() {
         anyhow::bail!("MCP config root is not a JSON object");
     }

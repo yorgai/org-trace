@@ -173,7 +173,7 @@ fn explain_tool() -> Value {
                 },
                 "depth": {
                     "type": "integer",
-                    "description": "How many causal hops to walk back (default 3, max 8)."
+                    "description": "How many timeline steps to walk back (default 3, max 8)."
                 }
             },
             "required": ["anchor"]
@@ -474,7 +474,6 @@ fn explain_tool_call(
         return Ok(json!({
             "anchor": { "input": anchor_input, "kind": "unknown", "resolved_events": [] },
             "causal_chain": [],
-            "forward": [],
             "truncated": false,
             "note": "No Brick repo resolved for this anchor (the MCP server was \
         likely started outside a git repo, e.g. cwd=/). Pass an absolute path anchor, \
@@ -903,9 +902,7 @@ fn store_for_anchor(default: &LocalStore, anchor: &str) -> Option<LocalStore> {
         } else {
             candidate.parent().unwrap_or(candidate).to_path_buf()
         };
-        return discover_repo_root(&start)
-            .ok()
-            .map(|repo_root| LocalStore::new(repo_root));
+        return discover_repo_root(&start).ok().map(LocalStore::new);
     }
     if discover_repo_root(default.repo_root()).is_ok() {
         Some(default.clone())
@@ -1234,6 +1231,14 @@ fn method_not_found(id: Value, method: &str) -> Value {
     })
 }
 
+fn parse_error() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": { "code": -32700, "message": "parse error" }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,12 +1273,4 @@ mod tests {
         let err = artifact_kind_from_str(Some("bogus")).unwrap_err();
         assert!(err.to_string().contains("unknown artifact kind"));
     }
-}
-
-fn parse_error() -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": null,
-        "error": { "code": -32700, "message": "parse error" }
-    })
 }

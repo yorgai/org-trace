@@ -15,18 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::{BRICK_CONFIG_FILE, BRICK_DIR, CURRENT_SOURCE_FILE, SOURCE_PROFILES_DIR};
 
 /// Repository-level Brick behavior that must be known before source selection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrickConfig {
     #[serde(default)]
     pub evidence: EvidenceConfig,
-}
-
-impl Default for BrickConfig {
-    fn default() -> Self {
-        Self {
-            evidence: EvidenceConfig::default(),
-        }
-    }
 }
 
 /// Evidence defaults for local capture and upload behavior.

@@ -622,7 +622,7 @@ mod tests {
             .append_event(&local_event)
             .expect("append local event");
         let inbound_path = store
-            .append_inbound_events(&[inbound_event.clone()])
+            .append_inbound_events(std::slice::from_ref(&inbound_event))
             .expect("append inbound event");
 
         assert!(inbound_path.starts_with(store.inbound_events_dir()));
@@ -643,7 +643,7 @@ mod tests {
             .append_event(&local_event)
             .expect("append local event");
         store
-            .append_inbound_events(&[inbound_event.clone()])
+            .append_inbound_events(std::slice::from_ref(&inbound_event))
             .expect("append inbound event");
         let deduped = store
             .dedupe_remote_events(vec![

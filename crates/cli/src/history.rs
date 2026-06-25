@@ -27,7 +27,7 @@ pub fn print_version(format: HistoryFormatArg) -> Result<()> {
     print_json(&json!({
         "name": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
-        "surface": "explain_link_planning",
+        "surface": "explain_planning",
     }))
 }
 

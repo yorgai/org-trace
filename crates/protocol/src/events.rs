@@ -73,20 +73,15 @@ pub enum ContextMode {
 }
 
 /// Lifecycle state for a Mission accountability container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionStatus {
+    #[default]
     Planned,
     Active,
     Blocked,
     Completed,
     Archived,
-}
-
-impl Default for MissionStatus {
-    fn default() -> Self {
-        Self::Planned
-    }
 }
 
 /// Reviewable output category produced by a session.

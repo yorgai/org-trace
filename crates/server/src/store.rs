@@ -569,7 +569,7 @@ mod tests {
         let store = ServerStore::new(temp_data_dir("dedupe"));
         let event = event("one", None);
         let first = store
-            .append_events(&[event.clone()])
+            .append_events(std::slice::from_ref(&event))
             .expect("append first event");
         let second = store
             .append_events(&[event])

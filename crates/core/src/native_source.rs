@@ -160,7 +160,7 @@ pub(crate) fn list_file_source_sessions_with_filter(
         }
     }
 
-    sessions.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_at));
     sessions.dedup_by(|left, right| left.path == right.path);
     if let Some(limit) = limit {
         sessions.truncate(limit);

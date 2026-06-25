@@ -1,5 +1,11 @@
 //! Local login session for the proprietary sync surface.
 //!
+//! NOTE ON NAMING: this `identity` is the user's **account login** (Supabase
+//! access/refresh tokens). It is unrelated to `brick_core::identity`, which
+//! resolves the **authorship identity** of a change (actor/agent/runtime via
+//! `ResolvedIdentity`/`CurrentContext`). The two never co-occur in one module;
+//! if you import this one, you want login/account, not change-authorship.
+//!
 //! Holds the user's Supabase identity (access + refresh tokens) on disk under the
 //! global Brick home, and the `brick login` / `logout` / `whoami` flows that
 //! populate it. This lives in `brick-sync` (the proprietary, feature-gated crate)

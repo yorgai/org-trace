@@ -108,7 +108,7 @@ pub fn resolve_identity_with_profile(
         .session_id
         .or(env_id::<SessionId>("BRICK_SESSION_ID")?)
         .or_else(|| current.and_then(|context| context.session_id.clone()))
-        .unwrap_or_else(SessionId::new);
+        .unwrap_or_default();
     let mission_id = overrides
         .mission_id
         .or(env_id::<MissionId>("BRICK_MISSION_ID")?)
