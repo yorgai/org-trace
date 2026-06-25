@@ -325,8 +325,28 @@ pub fn resolve_file_anchor(events: &[TraceEvent], path: &str) -> ExplainAnchor {
     }
 }
 
-/// Whether a `diff.captured` event's `file_changes` touch `rel` (suffix match,
-/// tolerant of repo-relative vs absolute differences).
+/// Whether a recorded `path` refers to the same file as the anchor `rel`,
+/// tolerant of repo-relative-vs-absolute differences but WITHOUT the
+/// false-positive bare-suffix trap.
+///
+/// Matching is path-component aware: `rel` matches `path` when they are equal,
+/// or when one is a trailing *component* sequence of the other (i.e. the
+/// boundary is a `/`). So anchor `lib.rs` matches recorded `src/lib.rs` and
+/// `core/src/lib.rs`, but `auth.rs` does NOT match `oauth.rs`, and `lib.rs`
+/// does not spuriously collide via a raw `ends_with`. Both sides are compared
+/// after trimming a leading `./`.
+fn path_matches_rel(path: &str, rel: &str) -> bool {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let rel = rel.strip_prefix("./").unwrap_or(rel);
+    if path == rel {
+        return true;
+    }
+    // `rel` is a trailing component-suffix of `path` (anchor shorter), or vice
+    // versa (recorded path shorter) — always anchored at a `/` boundary.
+    path.ends_with(&format!("/{rel}")) || rel.ends_with(&format!("/{path}"))
+}
+
+/// Whether a `diff.captured` event's `file_changes` touch `rel`.
 fn diff_event_touches(event: &TraceEvent, rel: &str) -> bool {
     event
         .payload
@@ -337,7 +357,7 @@ fn diff_event_touches(event: &TraceEvent, rel: &str) -> bool {
                 change
                     .get("path")
                     .and_then(|p| p.as_str())
-                    .map(|path| path == rel || path.ends_with(rel) || rel.ends_with(path))
+                    .map(|path| path_matches_rel(path, rel))
                     .unwrap_or(false)
             })
         })
@@ -352,7 +372,7 @@ fn source_session_event_touches(event: &TraceEvent, rel: &str) -> bool {
     payload
         .touched_files
         .iter()
-        .any(|path| path == rel || path.ends_with(&format!("/{rel}")) || rel.ends_with(path))
+        .any(|path| path_matches_rel(path, rel))
 }
 
 /// Resolves a `file:line` anchor to the event that produced that line, reusing
@@ -729,6 +749,23 @@ mod tests {
             actor_id: "claude".to_string(),
             display_name: None,
         }
+    }
+
+    #[test]
+    fn path_matches_rel_is_component_aware_no_false_positives() {
+        // Equal and ./-normalized.
+        assert!(path_matches_rel("src/lib.rs", "src/lib.rs"));
+        assert!(path_matches_rel("./src/lib.rs", "src/lib.rs"));
+        // Anchor is a trailing component-suffix of the recorded path.
+        assert!(path_matches_rel("crates/core/src/lib.rs", "lib.rs"));
+        assert!(path_matches_rel("crates/core/src/lib.rs", "src/lib.rs"));
+        // Recorded path is the shorter side (absolute-vs-relative tolerance).
+        assert!(path_matches_rel("lib.rs", "crates/core/src/lib.rs"));
+        // NOT a bare-suffix false positive: oauth.rs must not match auth.rs.
+        assert!(!path_matches_rel("src/oauth.rs", "auth.rs"));
+        // Different dirs, same basename, neither a component-suffix of the
+        // other → no collision.
+        assert!(!path_matches_rel("tests/lib.rs", "src/lib.rs"));
     }
 
     fn diff_event(session: &SessionId, path: &str) -> TraceEvent {

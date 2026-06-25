@@ -199,7 +199,7 @@ fn advance_watermark(repo_id: &str, max_last_seen_at: Option<String>) {
 }
 
 fn auto_sync_remote() -> String {
-    normalized_remote(std::env::var(AUTO_SYNC_REMOTE_ENV).ok())
+    normalized_remote(None)
 }
 
 fn auto_sync_disabled() -> bool {
@@ -226,6 +226,19 @@ pub fn handle_push(
     all_repos: bool,
 ) -> Result<()> {
     let remote = normalized_remote(remote);
+    // Supabase requires an org to scope every row (RLS); fail fast with guidance
+    // here rather than deep inside per-event serialization after work is done.
+    if supabase::is_supabase_remote(&remote)
+        && org_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        anyhow::bail!(
+            "Supabase upload requires an org. Pass --org-id <org> or set BRICK_SYNC_ORG_ID."
+        );
+    }
     let repo_id = repo_id.unwrap_or_else(|| repo_id_for_root(store.repo_root()));
     let metadata_db = MetadataDb::open_global().ok();
 
@@ -451,8 +464,17 @@ pub fn handle_accept_invites() -> Result<()> {
     Ok(())
 }
 
+/// Resolves the remote endpoint with a single symmetric priority chain used by
+/// BOTH the manual (`push`/`pull`/`sync`) and auto-sync paths: explicit
+/// `--remote` arg → `BRICK_AUTO_SYNC_REMOTE` env → compiled `DEFAULT_REMOTE`.
+///
+/// Honoring the env here (not just in auto-sync) fixes the asymmetry where a
+/// user who set `BRICK_AUTO_SYNC_REMOTE=supabase` for background sync would have
+/// an explicit `brick sync push` silently fall back to the legacy local server.
 fn normalized_remote(remote: Option<String>) -> String {
     remote
+        .or_else(|| std::env::var(AUTO_SYNC_REMOTE_ENV).ok())
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_REMOTE.to_string())
         .trim_end_matches('/')
         .to_string()
