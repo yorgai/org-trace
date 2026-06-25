@@ -13,9 +13,12 @@ clap.workspace = true
 brick-core = { path = "../core" }
 brick-protocol = { path = "../protocol" }
 brick-sync = { path = "../sync" }
-# jsonwebtoken 10 split crypto backends into features; HS256 (Supabase) needs
-# `rust_crypto` explicitly (v9 bundled it). Pin >=10.3 for GHSA-h395-gr6q-cpjc.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
+# jsonwebtoken 10 split crypto backends into features; pin >=10.3 for
+# GHSA-h395-gr6q-cpjc. We only verify HS256 (HMAC, symmetric), so we use the
+# aws_lc_rs backend rather than rust_crypto: rust_crypto pulls the pure-Rust
+# `rsa` crate, which carries the unfixable Marvin timing sidechannel
+# (RUSTSEC-2023-0071) even though we never do any RSA.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
