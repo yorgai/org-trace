@@ -19,7 +19,24 @@ one remaining server-side action.
 So the **event-level sync pipeline (login → push → pull → dedup) is proven
 working.**
 
-## ❌ One blocker: chunk subtable RLS drift (server-side, fix ready)
+## ✅ RESOLVED (2026-06-25): chunk subtable RLS patch applied + verified
+
+The blocker below was fixed live. Applied
+`docs/self-hosting/patches/2026-06-25-event-chunks-insert-rls.sql` directly to
+the production DB (direct Postgres connection, owner `postgres`):
+- `brick_can_insert_event_chunk(...)` created; `brick_event_chunks` INSERT
+  policy "members can insert brick event chunks" now present.
+- `brick sync push --remote supabase --org-id VinceTest` → no 403;
+  `accepted_count=35`, chunk rows 26193 → **42538** (this repo's 101 events all
+  have chunks, written via the normal user bearer + new RLS, not service-role).
+- Pull dry-run: remote_event_count=101, pulled=35, dedup correct.
+- Re-push is fully idempotent (accepted=0, all duplicate, chunk on-conflict
+  no-op, no 403).
+
+**The full sync pipeline — events AND chunks — is now proven working
+end-to-end for an ordinary org member.**
+
+## ❌ (HISTORICAL) chunk subtable RLS drift — now fixed, see above
 
 `brick sync push` fails ONLY on the chunk insert:
 `42501 new row violates row-level security policy for table "brick_event_chunks"`.
