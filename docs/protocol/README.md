@@ -16,7 +16,7 @@ Each `TraceEvent` has these stable fields:
 - `confidence`: `explicit`, `observed`, `imported`, `inferred`, or `unknown`.
 - `payload`: typed JSON payload for the event family.
 
-Local append-only logs are the source of truth. Derived indexes may denormalize fields, but protocol consumers should treat events as immutable.
+Local event stores are the source of truth. Derived indexes may denormalize fields, but protocol consumers should treat events as immutable.
 
 ## Event families
 

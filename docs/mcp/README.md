@@ -137,10 +137,10 @@ for one release rather than a bare error:
 
 ## Storage
 
-Writes (the planning tools) append `TraceEvent`s to the local JSONL
-log under `<BRICK_HOME>/repos/<repo_id>/provenance/`; reads project that log into
-the rebuildable index. The provenance ledger is the source of truth — deleting
-the derived index and rebuilding from JSONL reproduces every record exactly.
+Writes (the planning tools) append `TraceEvent`s to the unified local event DB at
+`<BRICK_HOME>/brick.sqlite`; reads project those events into rebuildable indexes.
+The event/chunk DB is the source of truth — deleting derived indexes and
+rebuilding from local events reproduces every record exactly.
 
 ## Working directory and anchors
 

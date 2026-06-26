@@ -1,11 +1,11 @@
 //! Synthesizes a `source.session_observed` `TraceEvent` from an indexed
 //! `SourceSessionRecord`.
 //!
-//! This is the single source of truth for the source-session event id and
-//! payload mapping. Source-sessions live authoritatively in `metadata.sqlite`
-//! (they are a rebuildable index of each provider's own session log); when we
-//! need to upload them we synthesize the wire event here rather than keeping a
-//! redundant copy in the JSONL queue.
+//! This is the single mapping point for source-session event ids and payloads.
+//! Source profiles and scan watermarks live in `metadata.sqlite`, but the durable
+//! local event truth is `brick_events` / `brick_event_chunks` in `brick.sqlite`.
+//! History refresh uses this builder, then `LocalEventStore` compacts the event
+//! JSON and stores chunks separately.
 //!
 //! The event id is a deterministic UUIDv5 over
 //! `source_id + external_session_id + source_fingerprint + parser_version`, so
@@ -17,7 +17,7 @@ use brick_protocol::{ActorRef, SessionId, SourceSessionObservedPayload, TraceEve
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::SourceSessionRecord;
+use crate::{ActivityChunk, SourceSessionRecord};
 
 /// Deterministic UUIDv5 id for the observation of one indexed source session.
 /// Kept stable across re-indexing so the remote dedupes by event id.
@@ -44,14 +44,37 @@ fn session_id_for_record(record: &SourceSessionRecord) -> SessionId {
 /// Builds the canonical `source.session_observed` event for one indexed
 /// source-session row, tagged with `repo_id` so the push path can scope it.
 ///
-/// `normalized_chunks` is left empty here — the transcript snapshot is hydrated
-/// separately from `metadata.sqlite` at push time (see `hydrate_source_session_chunks`).
+/// This variant carries no chunks; callers that have provider transcript chunks
+/// should use `build_source_session_event_with_chunks` before appending to the
+/// local event store.
 pub fn build_source_session_event(
     actor: ActorRef,
     record: &SourceSessionRecord,
     repo_id: &str,
 ) -> serde_json::Result<TraceEvent> {
-    let payload = SourceSessionObservedPayload {
+    build_source_session_event_with_chunks(actor, record, repo_id, &[])
+}
+
+pub fn build_source_session_event_with_chunks(
+    actor: ActorRef,
+    record: &SourceSessionRecord,
+    repo_id: &str,
+    chunks: &[ActivityChunk],
+) -> serde_json::Result<TraceEvent> {
+    let mut payload = source_session_payload(record);
+    payload.normalized_chunks = chunks
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let mut event = TraceEvent::source_session_observed(actor, payload)?;
+    event.event_id = source_session_event_id(record);
+    event.session_id = Some(session_id_for_record(record));
+    event.repo_id = Some(repo_id.to_string());
+    Ok(event)
+}
+
+fn source_session_payload(record: &SourceSessionRecord) -> SourceSessionObservedPayload {
+    SourceSessionObservedPayload {
         source_id: record.source_id.clone(),
         external_session_id: record.external_session_id.clone(),
         title: record.title.clone(),
@@ -91,12 +114,7 @@ pub fn build_source_session_event(
             .unwrap_or_default(),
         metadata_json: record.metadata_json.clone(),
         normalized_chunks: Vec::new(),
-    };
-    let mut event = TraceEvent::source_session_observed(actor, payload)?;
-    event.event_id = source_session_event_id(record);
-    event.session_id = Some(session_id_for_record(record));
-    event.repo_id = Some(repo_id.to_string());
-    Ok(event)
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 //! Local-first storage, indexing, identity, and repository helpers.
 //!
-//! This crate owns local behavior only: JSONL queue writes, rebuildable cache
-//! indexes, Git context capture, and identity resolution. Server sync and auth
-//! should remain outside this crate until the local recorder is stable.
+//! This crate owns local behavior only: unified event/chunk storage, rebuildable
+//! cache indexes, Git context capture, and identity resolution. Server sync and
+//! auth should remain outside this crate until the local recorder is stable.
 
 mod activity;
 mod attachment_store;
@@ -14,6 +14,7 @@ mod global_home;
 mod identity;
 mod index;
 mod index_types;
+mod local_event_store;
 mod log_store;
 mod metadata_db;
 mod native_source;
@@ -41,6 +42,7 @@ pub use file_session_blame::*;
 pub use global_home::*;
 pub use identity::*;
 pub use index_types::*;
+pub use local_event_store::*;
 pub use log_store::*;
 pub use metadata_db::*;
 pub use native_source::*;

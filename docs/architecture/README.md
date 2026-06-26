@@ -72,7 +72,7 @@ The same CLI binary also runs as a Model Context Protocol server over stdio, exp
 
 ### `brick-core`
 
-`brick-core` owns local storage, source profile files, repo context capture, diff summarization, blob stores, source metadata indexing, JSON index rebuilds, SQLite rebuilds, and sync-oriented deduplication. The append-only event stream remains authoritative; `index.json` and `brick.sqlite` are disposable derived indexes. `<BRICK_HOME>/metadata.sqlite` is the source metadata index for external history; it is not a transcript store or a second cache layer.
+`brick-core` owns local storage, source profile files, repo context capture, diff summarization, blob stores, source metadata indexing, JSON index rebuilds, SQLite query-cache rebuilds, and sync-oriented deduplication. `<BRICK_HOME>/brick.sqlite` is the authoritative local event/chunk store; `index.json` and `query-cache.sqlite` are disposable derived indexes. `<BRICK_HOME>/metadata.sqlite` is the source metadata/projection DB for external history; it is not a push-time event/chunk truth store.
 
 Storage root resolution order:
 
@@ -98,11 +98,11 @@ The server is an append-only HTTP remote backed by `events.jsonl` under `--data-
 
 1. A CLI write command resolves identity from flags, current context, and source profile defaults.
 2. The CLI captures Git repo context when applicable.
-3. The command appends one or more typed `TraceEvent` JSONL records to the effective local store.
+3. The command appends one or more typed `TraceEvent` records to `<BRICK_HOME>/brick.sqlite`.
 4. Attachments and logs are copied to content-addressed blob paths while events store metadata and URIs.
-5. Local indexes are rebuilt from queued local events plus inbound remote events.
-6. `push` sends queued local events to the server without draining them.
-7. `pull` pages server events and stores previously unseen records in inbound logs.
+5. Local indexes are rebuilt from repo-scoped local events.
+6. `push` sends local events to the server without draining them.
+7. `pull` pages server events and stores previously unseen records in the same local event store.
 8. Server query endpoints rebuild views from the server append log when requested.
 
 ## Verification

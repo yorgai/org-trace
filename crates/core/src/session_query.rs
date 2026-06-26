@@ -1,8 +1,8 @@
 //! Read-only query helpers for indexed Brick sessions.
 //!
-//! These helpers operate only on the rebuildable JSON index. The durable JSONL
-//! queue remains the source of truth and callers decide when to load or rebuild
-//! the index before querying.
+//! These helpers operate only on the rebuildable JSON index. The durable local
+//! event/chunk DB remains the source of truth and callers decide when to load or
+//! rebuild the index before querying.
 
 use crate::{IndexedSession, TraceIndex};
 

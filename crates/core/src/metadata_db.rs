@@ -1,7 +1,7 @@
 //! Unified metadata database skeleton for global Brick state.
 //!
 //! The database lives at `<BRICK_HOME>/metadata.sqlite` and is independent from
-//! the repo-local JSONL provenance queue. Version mismatches reset the first-stage
+//! the unified local event/chunk database. Version mismatches reset the first-stage
 //! schema because these tables are source metadata index scaffolding, not the durable
 //! provenance source of truth.
 
@@ -627,9 +627,20 @@ impl MetadataDb {
                     (&preferred_repo, &repo_path),
                     (Some(want), Some(have)) if want == have
                 );
+                let source_id = record.source_id.clone();
+                let external_session_id = record.external_session_id.clone();
                 matched.push((
                     same_repo,
-                    source_session_blame_row(&query.file_path, record),
+                    source_session_blame_row(
+                        &query.file_path,
+                        record,
+                        self.source_session_file_touch_time(
+                            &source_id,
+                            &external_session_id,
+                            &query.file_path,
+                            repo_path.as_deref(),
+                        )?,
+                    ),
                 ));
             }
         }
@@ -640,6 +651,41 @@ impl MetadataDb {
             matched.into_iter().map(|(_, row)| row).collect();
         records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(records)
+    }
+
+    fn source_session_file_touch_time(
+        &self,
+        source_id: &str,
+        external_session_id: &str,
+        file_path: &str,
+        repo_path: Option<&str>,
+    ) -> Result<Option<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT c.created_at, c.raw_json
+             FROM source_session_chunks c
+             JOIN source_sessions s ON s.source_session_id = c.source_session_id
+             WHERE s.source_id = ?1
+               AND s.external_session_id = ?2
+               AND c.action_type = 'tool_call'
+               AND c.raw_json LIKE ?3
+             ORDER BY c.chunk_index DESC",
+        )?;
+        let needle = file_path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(file_path);
+        let rows = statement.query_map(
+            params![source_id, external_session_id, format!("%{needle}%")],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for row in rows {
+            let (created_at, raw_json) = row.context("failed to read source-session chunk")?;
+            if chunk_mentions_file(&raw_json, file_path, repo_path) {
+                return Ok(Some(created_at));
+            }
+        }
+        Ok(None)
     }
 
     /// Counts source-session rows matching an optional source filter.
@@ -1742,7 +1788,11 @@ fn read_source_session_id(
         .context("failed to read metadata source-session id")
 }
 
-fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> FileSessionBlameRow {
+fn source_session_blame_row(
+    file_path: &str,
+    record: SourceSessionRecord,
+    occurred_at: Option<String>,
+) -> FileSessionBlameRow {
     let app_id = record
         .metadata_json
         .as_ref()
@@ -1764,7 +1814,8 @@ fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> Fil
         .and_then(Value::as_object)
         .and_then(|metadata| metadata.get("actor_type"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+        .map(ToOwned::to_owned)
+        .or_else(|| Some("agent".to_string()));
     FileSessionBlameRow {
         file_path: file_path.to_string(),
         session_id: None,
@@ -1775,6 +1826,7 @@ fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> Fil
         actor_type,
         evidence_kind: FileSessionBlameEvidenceKind::SourceMetadata,
         last_seen_at: record.last_seen_at.to_rfc3339(),
+        occurred_at,
         title: record.title.clone().or_else(|| record.name.clone()),
         lines_added: record.lines_added,
         lines_removed: record.lines_removed,
@@ -1796,6 +1848,48 @@ fn source_session_blame_row(file_path: &str, record: SourceSessionRecord) -> Fil
             "branch": record.branch,
             "source_fingerprint": record.source_fingerprint,
         })),
+    }
+}
+
+fn chunk_mentions_file(raw_json: &str, file_path: &str, repo_path: Option<&str>) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(raw_json) else {
+        return false;
+    };
+    if !value
+        .get("function")
+        .and_then(Value::as_str)
+        .is_some_and(is_file_mutation_tool)
+    {
+        return false;
+    }
+    let mut strings = Vec::new();
+    collect_json_strings(&value, &mut strings);
+    strings
+        .iter()
+        .any(|candidate| blame_path_matches(file_path, candidate, repo_path))
+}
+
+fn is_file_mutation_tool(function: &str) -> bool {
+    matches!(
+        function,
+        "edit_file" | "write_file" | "delete_file" | "run_shell" | "create_file"
+    )
+}
+
+fn collect_json_strings<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => strings.push(text),
+        Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, strings);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_json_strings(value, strings);
+            }
+        }
+        _ => {}
     }
 }
 

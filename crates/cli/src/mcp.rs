@@ -392,10 +392,9 @@ fn handle_tool_call(
 /// see `merge_source_steps_into`.
 ///
 /// Shared by the MCP `explain` tool and the CLI `explain` command so both behave
-/// identically. Returns `Some(n)` for a file:line anchor: `n` indexed sessions
-/// touched the file, so the caller surfaces a hint to retry with a whole-file
-/// anchor (file:line never pulls file-level index data into the chain, which
-/// would fake line precision).
+/// identically. Returns `Some(n)` for a file:line anchor whose chain includes
+/// file-level indexed sessions, so the caller can label those steps honestly as
+/// a file-level fallback rather than exact line blame.
 pub(crate) fn merge_index_sessions_into_chain(
     chain: &mut CausalChain,
     repo_root: &std::path::Path,
@@ -438,22 +437,15 @@ pub(crate) fn merge_index_sessions_into_chain(
                 .unwrap_or(false)
         })
         .collect();
-    // file:line never merges: source_sessions are file-level, so folding them into
-    // a line anchor would fake line precision. Report the count so the caller can
-    // hint "re-run with a whole-file anchor", but leave the chain untouched.
-    if is_file_line {
-        return (!same_repo.is_empty()).then_some(same_repo.len());
-    }
-    // Whole-file anchor: merge the indexed source sessions WITH whatever JSONL
-    // steps the chain already has, into one deduped, time-ordered timeline. This
-    // is the fix for interleaved history (link, no-link, link, …) where the old
-    // fill-if-empty fallback silently dropped the un-linked changes.
+    let fallback_count = is_file_line
+        .then_some(same_repo.len())
+        .filter(|count| *count > 0);
     let source_steps = source_sessions_to_steps(&same_repo, 0);
     if !source_steps.is_empty() {
         merge_source_steps_into(&mut chain.steps, source_steps);
         chain.anchor.resolved_events = chain.steps.iter().map(|s| s.event_id.clone()).collect();
     }
-    None
+    fallback_count
 }
 
 /// `explain` dispatch: resolve the anchor (file:line via blame, or a direct id),
@@ -562,6 +554,9 @@ pub(crate) fn finalize_explain_chain(
     // `live` profile resolution below.
     let anchor_profiles = SourceProfileStore::new(store.repo_root().to_path_buf());
     enrich_transcripts(&anchor_profiles, cwd_profiles, &mut chain);
+    if let Some(path) = anchored_path {
+        refine_source_session_times(&mut chain, store.repo_root(), path);
+    }
     // For steps that have a resolved transcript but no asserted (`explicit`) note,
     // recover the turn's final assistant message as an `observed` rationale, so
     // ingested history isn't left with WHO/WHEN but zero WHY. Never overrides an
@@ -599,9 +594,7 @@ pub(crate) fn finalize_explain_chain(
         if let Value::Object(map) = &mut value {
             let note = match index_session_hint {
                 Some(count) => format!(
-                    "No line-level record for this anchor. But {count} indexed session(s) \
-touched this file — re-run `explain` with a whole-file anchor (drop the `:line`) \
-to see who changed it and why."
+                    "No line-level record for this anchor. But {count} indexed session(s) touched this file."
                 ),
                 None => "No Brick record for this anchor yet. Brick only records causal \
 edges for changes made while it was installed; fall back to git/grep here. As \
@@ -609,6 +602,15 @@ more changes flow through Brick, explain gets richer."
                     .to_string(),
             };
             map.insert("note".to_string(), json!(note));
+        }
+    } else if let Some(count) = index_session_hint {
+        if let Value::Object(map) = &mut value {
+            map.insert(
+                "note".to_string(),
+                json!(format!(
+                    "No exact line-level record for this anchor; showing {count} file-level indexed session(s) that touched this file."
+                )),
+            );
         }
     }
 
@@ -980,11 +982,8 @@ fn enrich_transcripts(
                         pointer.session_ref = Some(session_ref.clone());
                     }
                 }
-                if let (Some(source), Some(session_ref)) =
-                    (pointer.source.clone(), pointer.session_ref.clone())
-                {
-                    pointer.read_session =
-                        Some(read_session_command(&source, &session_ref, &session_id));
+                if let Some(source) = pointer.source.clone() {
+                    pointer.read_session = Some(read_session_command(&source, &session_id));
                 }
             }
         }
@@ -992,18 +991,18 @@ fn enrich_transcripts(
 }
 
 /// Builds a ready-to-run command that dumps one session's FULL trajectory, so an
-/// agent can deep-dive past the turn-final `note` (a closing summary, often not
-/// the root cause) into the normalized fused transcript stored in Brick's metadata DB.
-fn read_session_command(source: &str, _session_ref: &str, session_id: &str) -> String {
-    match brick_core::metadata_db_path() {
+/// agent can deep-dive past the turn-final `note` into the normalized chunks in
+/// Brick's unified local event/chunk database.
+fn read_session_command(source: &str, session_id: &str) -> String {
+    match brick_core::local_event_db_path() {
         Ok(path) => format!(
-            "sqlite3 -json \"{}\" \"SELECT c.chunk_index, c.created_at, c.action_type, c.function, c.raw_json FROM source_session_chunks c JOIN source_sessions s ON s.source_session_id=c.source_session_id WHERE s.source_id='{}' AND s.external_session_id='{}' ORDER BY c.chunk_index;\"",
+            "sqlite3 -json \"{}\" \"SELECT chunk_index, occurred_at AS created_at, chunk_kind AS action_type, json_extract(raw_json, '$.function') AS function, raw_json FROM brick_event_chunks WHERE source_id='{}' AND external_session_id='{}' ORDER BY chunk_index;\"",
             path.display(),
             source.replace('\'', "''"),
             session_id.replace('\'', "''")
         ),
         Err(_) => format!(
-            "# fused metadata DB unavailable; session source={source} external_session_id={session_id}"
+            "# local event/chunk DB unavailable; session source={source} external_session_id={session_id}"
         ),
     }
 }
@@ -1040,6 +1039,44 @@ fn build_transcript_index(
         }
     }
     index
+}
+
+fn refine_source_session_times(
+    chain: &mut CausalChain,
+    repo_root: &std::path::Path,
+    anchored_path: &str,
+) {
+    let Ok(db) = MetadataDb::open_global() else {
+        return;
+    };
+    let rows = db
+        .query_source_file_session_blame(&SourceFileSessionBlameQuery {
+            file_path: anchored_path.to_string(),
+            source_id: None,
+            repo_path: Some(repo_root.to_path_buf()),
+            limit: MAX_EXPLAIN_DEPTH + 1,
+        })
+        .unwrap_or_default();
+    for step in &mut chain.steps {
+        let Some(transcript) = step.transcript.as_ref() else {
+            continue;
+        };
+        let (Some(source), Some(session_id)) = (
+            transcript.source.as_deref(),
+            transcript.session_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let Some(row) = rows.iter().find(|row| {
+            row.source_id.as_deref() == Some(source)
+                && row.external_session_id.as_deref() == Some(session_id)
+        }) else {
+            continue;
+        };
+        if let Some(occurred_at) = row.occurred_at.as_ref() {
+            step.occurred_at = occurred_at.clone();
+        }
+    }
 }
 
 /// Recovers an `observed` rationale for steps that have a resolved transcript but
@@ -1272,5 +1309,15 @@ mod tests {
     fn artifact_kind_unknown_errors_not_silently_note() {
         let err = artifact_kind_from_str(Some("bogus")).unwrap_err();
         assert!(err.to_string().contains("unknown artifact kind"));
+    }
+
+    #[test]
+    fn read_session_command_queries_unified_event_chunks() {
+        let command = read_session_command("orgii", "session-1");
+        assert!(command.contains("brick_event_chunks"));
+        assert!(command.contains("source_id='orgii'"));
+        assert!(command.contains("external_session_id='session-1'"));
+        assert!(!command.contains("source_session_chunks"));
+        assert!(!command.contains("metadata.sqlite"));
     }
 }

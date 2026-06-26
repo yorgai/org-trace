@@ -7,9 +7,8 @@
 //! sync types. Keeping all of this here lets the directory be excised from the
 //! public repository without touching the open build.
 //!
-//! Push is intentionally non-draining: local JSONL queue files remain the source
-//! of truth after a successful remote append. Pull stores remote events in a
-//! separate inbound log and deduplicates by event ID before writing.
+//! Push reads from the unified local event/chunk database. Pull writes remote
+//! events into the same local database and deduplicates by event ID.
 
 pub mod identity;
 pub mod supabase;
@@ -17,10 +16,10 @@ pub mod wire;
 
 use anyhow::{Context, Result};
 use brick_core::{
-    build_source_session_event, repo_id_for_root, ActivityChunk, LocalStore, MetadataDb,
-    SourceSessionChunksUpsert, SourceSessionRecord, SourceSessionUpsert,
+    repo_id_for_root, ActivityChunk, LocalStore, MetadataDb, SourceSessionChunksUpsert,
+    SourceSessionUpsert,
 };
-use brick_protocol::{ActorRef, ActorType, OrgId, SourceSessionObservedPayload, TraceEvent};
+use brick_protocol::{OrgId, SourceSessionObservedPayload, TraceEvent};
 use chrono::Utc;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -78,12 +77,11 @@ fn auto_push(store: &LocalStore) -> Result<()> {
     if collected.events.is_empty() {
         return Ok(());
     }
-    let events = hydrate_source_session_chunks(collected.events)?;
     let identity = identity::refresh_if_needed()?;
     let remote = auto_sync_remote();
     let org_id = std::env::var("BRICK_SYNC_ORG_ID").ok();
     let request = PushEventsRequest {
-        events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
+        events: scoped_events(collected.events, Some(&repo_id), org_id.as_deref())?,
     };
     if supabase::is_supabase_remote(&remote) {
         supabase::SupabaseRemote::from_env()?.push_events(
@@ -110,74 +108,25 @@ struct CollectedPushEvents {
     max_last_seen_at: Option<String>,
 }
 
-/// Gathers everything to push for one repo from BOTH stores:
-/// (a) the JSONL queue — Brick's own append-only records (mission / artifact) —
-///     ONLY when `include_queue` is set. The queue belongs to the current repo,
-///     so an `--all-repos` fan-out includes it exactly once (for the current
-///     repo target) instead of re-pushing it under every repo_id.
-/// (b) source-sessions synthesized from `metadata.sqlite` (the authoritative
-///     home for externally-observed AI sessions), filtered to this repo and to
-///     rows newer than `since`.
-///
-/// Synthesizing (b) here — rather than reading source-session events from the
-/// JSONL queue — is what fixes the historical data-loss bug: source-sessions for
-/// repos other than the current one never reached the JSONL queue, so they were
-/// never pushed. `metadata.sqlite` has them all.
+/// Gathers events to push for one repo from the unified local event/chunk DB.
+/// Source sessions are imported into that DB by the normal refresh path, so sync
+/// no longer re-synthesizes source events from metadata or hydrates chunks here.
 fn collect_push_events(
     store: &LocalStore,
-    metadata_db: Option<&MetadataDb>,
-    repo_path: Option<&str>,
-    since: Option<&str>,
-    include_queue: bool,
+    _metadata_db: Option<&MetadataDb>,
+    _repo_path: Option<&str>,
+    _since: Option<&str>,
+    include_local_events: bool,
 ) -> Result<CollectedPushEvents> {
-    let mut events = if include_queue {
-        store.read_queued_events()?
+    let events = if include_local_events {
+        store.read_local_events()?
     } else {
         Vec::new()
     };
-    let mut max_last_seen_at: Option<String> = None;
-
-    if let Some(db) = metadata_db {
-        let records = db.list_source_sessions_for_sync(repo_path, since)?;
-        for record in &records {
-            let repo_id = record_repo_id(record, store);
-            let actor = actor_for_record(record);
-            let event = build_source_session_event(actor, record, &repo_id)
-                .context("failed to synthesize source-session event")?;
-            events.push(event);
-            let seen = record.last_seen_at.to_rfc3339();
-            if max_last_seen_at
-                .as_deref()
-                .is_none_or(|cur| seen.as_str() > cur)
-            {
-                max_last_seen_at = Some(seen);
-            }
-        }
-    }
-
     Ok(CollectedPushEvents {
         events,
-        max_last_seen_at,
+        max_last_seen_at: None,
     })
-}
-
-/// Default actor for a synthesized source-session event: the provider acting as
-/// an agent, identified by its `source_id` (mirrors the historical writer).
-fn actor_for_record(record: &SourceSessionRecord) -> ActorRef {
-    ActorRef {
-        actor_type: ActorType::Agent,
-        actor_id: record.source_id.clone(),
-        display_name: None,
-    }
-}
-
-/// `repo_id` for a record's own repo_path, falling back to the store's repo when
-/// the record carries no repo_path.
-fn record_repo_id(record: &SourceSessionRecord, store: &LocalStore) -> String {
-    match record.repo_path.as_deref() {
-        Some(path) => repo_id_for_root(path),
-        None => repo_id_for_root(store.repo_root()),
-    }
 }
 
 /// Canonicalized repo root path string, matched against `source_sessions.repo_path`.
@@ -209,9 +158,9 @@ fn auto_sync_disabled() -> bool {
     )
 }
 
-/// Handles `push` by posting queued events without draining the local queue.
+/// Handles `push` by posting local events without draining the local store.
 ///
-/// Upload is account-scoped: the queued events are sent with the logged-in
+/// Upload is account-scoped: local events are sent with the logged-in
 /// user's Supabase bearer token so the server can attribute them to the account
 /// (and its org) for org-scope blame. Refuses to push when not logged in —
 /// uploading is the registered-tier feature, distinct from the always-free local
@@ -262,7 +211,7 @@ pub fn handle_push(
                 metadata_db.as_ref(),
                 target.repo_path.as_deref(),
                 since.as_deref(),
-                target.is_current,
+                target.include_local_events,
             )?;
             total += collected.events.len();
         }
@@ -296,14 +245,13 @@ pub fn handle_push(
             metadata_db.as_ref(),
             target.repo_path.as_deref(),
             since.as_deref(),
-            target.is_current,
+            target.include_local_events,
         )?;
         if collected.events.is_empty() {
             continue;
         }
-        let events = hydrate_source_session_chunks(collected.events)?;
         let request = PushEventsRequest {
-            events: scoped_events(events, Some(&target.repo_id), org_id.as_deref())?,
+            events: scoped_events(collected.events, Some(&target.repo_id), org_id.as_deref())?,
         };
         let response = if supabase::is_supabase_remote(&remote) {
             supabase::SupabaseRemote::from_env()?.push_events(
@@ -330,21 +278,17 @@ pub fn handle_push(
 }
 
 /// One repo to push: its `repo_id` (for scoping/watermark), the canonical
-/// `repo_path` string used to filter `source_sessions` (None = no repo_path
-/// filter), and whether this target owns the local JSONL queue (the current
-/// repo). Only the current-repo target pushes the queue, so an `--all-repos`
-/// fan-out sends the queue exactly once.
+/// `repo_path` string used to filter indexed source metadata, and whether this
+/// target should include local events from the unified event store.
 struct PushTarget {
     repo_id: String,
     repo_path: Option<String>,
-    is_current: bool,
+    include_local_events: bool,
 }
 
 /// Builds the list of repos to push. The current repo always comes first and is
-/// the sole owner of the JSONL queue. `--all-repos` appends one target per
-/// distinct indexed `repo_path` whose repo_id differs from the current repo, so
-/// source-sessions from OTHER repos get uploaded without re-sending the queue or
-/// double-pushing the current repo's source-sessions.
+/// the only target that includes local events. `--all-repos` appends one target
+/// per distinct indexed `repo_path` whose repo_id differs from the current repo.
 fn push_targets(
     store: &LocalStore,
     metadata_db: Option<&MetadataDb>,
@@ -354,7 +298,7 @@ fn push_targets(
     let mut targets = vec![PushTarget {
         repo_id: current_repo_id.to_string(),
         repo_path: canonical_repo_path(store),
-        is_current: true,
+        include_local_events: true,
     }];
     if !all_repos {
         return targets;
@@ -370,13 +314,13 @@ fn push_targets(
         targets.push(PushTarget {
             repo_id,
             repo_path: Some(path),
-            is_current: false,
+            include_local_events: false,
         });
     }
     targets
 }
 
-/// Handles `pull` by storing previously unknown remote events in inbound logs.
+/// Handles `pull` by storing previously unknown remote events in the local event store.
 pub fn handle_pull(
     store: &LocalStore,
     dry_run: bool,
@@ -556,7 +500,7 @@ fn pull_events(
     } else {
         Some(
             store
-                .append_inbound_events(&pulled_events)?
+                .append_remote_events(&pulled_events)?
                 .display()
                 .to_string(),
         )
@@ -574,65 +518,6 @@ fn ingest_pulled_source_sessions(mut events: Vec<TraceEvent>) -> Result<Vec<Trac
     let mut metadata_db = MetadataDb::open_global()?;
     ingest_source_sessions_into_metadata(&mut metadata_db, &mut events)?;
     Ok(events)
-}
-
-/// Refills `normalized_chunks` on outbound `source.session_observed` events from
-/// the local metadata index before upload.
-///
-/// Canonical events in the JSONL queue deliberately carry no chunks — the
-/// session-content snapshot is a derivative of the provider's own log, indexed
-/// into `metadata.sqlite`, not part of the append-only causal record. Push is
-/// the one place that needs the chunks inline (so the remote can split them into
-/// `brick_event_chunks`), so we hydrate them here keyed by
-/// `(source_id, external_session_id)`. Best-effort: a session whose chunks are no
-/// longer indexed simply uploads without them.
-fn hydrate_source_session_chunks(events: Vec<TraceEvent>) -> Result<Vec<TraceEvent>> {
-    if !events
-        .iter()
-        .any(|event| event.event_type == brick_protocol::EventType::SourceSessionObserved)
-    {
-        return Ok(events);
-    }
-    let metadata_db = MetadataDb::open_global()?;
-    hydrate_source_session_chunks_with(&metadata_db, events)
-}
-
-fn hydrate_source_session_chunks_with(
-    metadata_db: &MetadataDb,
-    events: Vec<TraceEvent>,
-) -> Result<Vec<TraceEvent>> {
-    events
-        .into_iter()
-        .map(|mut event| {
-            if event.event_type != brick_protocol::EventType::SourceSessionObserved {
-                return Ok(event);
-            }
-            let source_id = event
-                .payload
-                .get("source_id")
-                .and_then(serde_json::Value::as_str);
-            let external_session_id = event
-                .payload
-                .get("external_session_id")
-                .and_then(serde_json::Value::as_str);
-            let (Some(source_id), Some(external_session_id)) = (source_id, external_session_id)
-            else {
-                return Ok(event);
-            };
-            let chunks: Vec<serde_json::Value> = metadata_db
-                .list_source_session_chunks(source_id, external_session_id)?
-                .into_iter()
-                .map(|row| row.raw_json)
-                .collect();
-            if let Some(payload) = event.payload.as_object_mut() {
-                payload.insert(
-                    "normalized_chunks".to_string(),
-                    serde_json::Value::Array(chunks),
-                );
-            }
-            Ok(event)
-        })
-        .collect()
 }
 
 fn ingest_source_sessions_into_metadata(
@@ -706,10 +591,10 @@ fn parse_rfc3339(value: Option<&str>) -> Option<chrono::DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-fn print_push_result(response: &PushEventsResponse, queued_event_count: usize) {
+fn print_push_result(response: &PushEventsResponse, event_count: usize) {
     println!("accepted_count={}", response.accepted_count());
     println!("duplicate_count={}", response.duplicate_count());
-    println!("queued_event_count={queued_event_count}");
+    println!("event_count={event_count}");
 }
 
 fn print_pull_result(remote: &str, repo_id: Option<&str>, dry_run: bool, outcome: &PullOutcome) {
@@ -896,47 +781,27 @@ mod tests {
     }
 
     #[test]
-    fn push_hydrates_normalized_chunks_from_metadata() {
-        let path = temp_repo_root("push-hydrate").join("metadata.sqlite");
-        let mut metadata_db = MetadataDb::open_path(&path).expect("open metadata DB");
-        let payload = source_session_payload();
-        metadata_db
-            .upsert_source_session(&source_session_upsert_from_payload(&payload).expect("upsert"))
-            .expect("upsert session");
-        let chunks: Vec<ActivityChunk> = payload
-            .normalized_chunks
-            .iter()
-            .cloned()
-            .map(serde_json::from_value)
-            .collect::<serde_json::Result<Vec<_>>>()
-            .expect("decode chunks");
-        metadata_db
-            .upsert_source_session_chunks(&SourceSessionChunksUpsert {
-                source_id: payload.source_id.clone(),
-                external_session_id: payload.external_session_id.clone(),
-                chunks,
-            })
-            .expect("upsert chunks");
-
-        // Canonical event as stored in the local JSONL queue: no chunks inline.
-        let mut stripped = payload.clone();
-        stripped.normalized_chunks = Vec::new();
+    fn local_event_store_reattaches_chunks_for_push_collection() {
+        let repo_root = temp_repo_root("push-chunks");
+        let store = LocalStore::new(&repo_root);
         let event = TraceEvent::source_session_observed(
             ActorRef {
                 actor_type: ActorType::Agent,
                 actor_id: "codex".to_string(),
                 display_name: None,
             },
-            stripped,
+            source_session_payload(),
         )
         .expect("build event");
 
-        let hydrated =
-            hydrate_source_session_chunks_with(&metadata_db, vec![event]).expect("hydrate chunks");
+        store.append_event(&event).expect("append source event");
+        let repo_path = canonical_repo_path(&store);
+        let collected = collect_push_events(&store, None, repo_path.as_deref(), None, true)
+            .expect("collect local events");
 
-        let normalized = hydrated[0].payload["normalized_chunks"]
+        let normalized = collected.events[0].payload["normalized_chunks"]
             .as_array()
-            .expect("normalized chunks present after hydrate");
+            .expect("normalized chunks present from local event store");
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0]["result"]["content"], "done");
     }
@@ -1012,10 +877,6 @@ mod tests {
         assert_eq!(outcome.pulled_event_count, 1);
         assert_eq!(outcome.duplicate_count, 1);
         assert_eq!(outcome.inbound_path, None);
-        assert!(store
-            .read_inbound_events()
-            .expect("read inbound")
-            .is_empty());
     }
 
     #[test]
@@ -1052,78 +913,27 @@ mod tests {
     }
 
     #[test]
-    fn collect_push_events_unions_queue_and_metadata_source_sessions() {
-        use brick_core::{MetadataDb, SourceSessionUpsert};
-        use chrono::Utc;
-
-        let repo_root = temp_repo_root("collect-union");
+    fn collect_push_events_reads_unified_local_event_db() {
+        let repo_root = temp_repo_root("collect-unified");
         let store = LocalStore::new(&repo_root);
-        // (a) one Brick-native JSONL event (a mission).
         store
             .append_event(&event("native mission"))
             .expect("append");
 
-        // (b) one indexed source-session in a fresh metadata db.
-        let meta_path = repo_root.join("metadata.sqlite");
-        let mut db = MetadataDb::open_path(&meta_path).expect("open metadata");
-        let now = Utc::now();
-        let canonical_root =
-            std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
-        let session = SourceSessionUpsert {
-            source_id: "orgii".to_string(),
-            external_session_id: "ext-1".to_string(),
-            title: Some("indexed session".to_string()),
-            name: None,
-            source_path: None,
-            source_uri: None,
-            source_mtime: None,
-            source_size: None,
-            source_fingerprint: Some("fp-1".to_string()),
-            parser_version: Some("v1".to_string()),
-            session_created_at: None,
-            session_updated_at: None,
-            model: None,
-            input_tokens: None,
-            output_tokens: None,
-            repo_path: Some(canonical_root),
-            branch: None,
-            files_changed: None,
-            lines_added: None,
-            lines_removed: None,
-            touched_files_json: None,
-            listable: true,
-            discovered_at: now,
-            last_seen_at: now,
-            metadata_json: None,
-        };
-        db.upsert_source_session(&session).expect("upsert session");
-
         let repo_path = canonical_repo_path(&store);
-        let collected = collect_push_events(&store, Some(&db), repo_path.as_deref(), None, true)
-            .expect("collect");
+        let collected =
+            collect_push_events(&store, None, repo_path.as_deref(), None, true).expect("collect");
 
-        // Union: the JSONL mission + the synthesized source-session.
-        assert_eq!(collected.events.len(), 2);
-        let kinds: Vec<_> = collected.events.iter().map(|e| e.event_type).collect();
-        assert!(kinds.contains(&brick_protocol::EventType::MissionCreated));
-        assert!(kinds.contains(&brick_protocol::EventType::SourceSessionObserved));
-        assert!(collected.max_last_seen_at.is_some());
-
-        // include_queue=false drops the JSONL queue (used by non-current repos
-        // in an --all-repos fan-out) — only the synthesized source-session.
-        let no_queue = collect_push_events(&store, Some(&db), repo_path.as_deref(), None, false)
-            .expect("no queue");
-        assert_eq!(no_queue.events.len(), 1);
+        assert_eq!(collected.events.len(), 1);
         assert_eq!(
-            no_queue.events[0].event_type,
-            brick_protocol::EventType::SourceSessionObserved
+            collected.events[0].event_type,
+            brick_protocol::EventType::MissionCreated
         );
+        assert!(collected.max_last_seen_at.is_none());
 
-        // With no metadata db, only the JSONL events come back.
-        let queue_only = collect_push_events(&store, None, repo_path.as_deref(), None, true)
-            .expect("queue only");
-        assert_eq!(queue_only.events.len(), 1);
-        assert!(queue_only.max_last_seen_at.is_none());
+        let no_queue =
+            collect_push_events(&store, None, repo_path.as_deref(), None, false).expect("no queue");
+        assert!(no_queue.events.is_empty());
 
         let _ = fs::remove_dir_all(&repo_root);
     }

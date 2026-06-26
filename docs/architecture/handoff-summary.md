@@ -28,7 +28,7 @@ Key principles:
 - Local Brick records default to metadata-only pointers; copying evidence bytes is explicit.
 - Long term, `.brick` should become the unified local metadata/provenance root for external coding-app history and Brick's own org/project/mission/session ledger.
 - `.orgii` should be narrowed to ORGII-owned runtime sessions, CLI state, and app-private state. ORGII should eventually consume Brick metadata instead of maintaining a parallel external-history metadata store.
-- The local JSONL event log is the source of truth for provenance claims. SQLite and Markdown views are derived query/readability layers.
+- The unified local event/chunk DB is the source of truth for provenance claims. JSON, SQLite query-cache, and Markdown views are derived query/readability layers.
 - `.brick/` is local state and is automatically added to `.gitignore` by `brick init` when Brick is initialized inside a repo.
 
 ## Repository status

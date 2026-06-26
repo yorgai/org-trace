@@ -53,15 +53,15 @@ Phase 1 is local trace recording only:
 - typed events
 - identity resolution
 - Git repo context capture
-- JSONL local store
+- unified local event/chunk SQLite store
 - local CLI commands
 - local tests
 
-Phase 2 may add rebuildable local derived indexes and richer local inspection commands. The JSONL event log must remain the source of truth.
+Phase 2 may add rebuildable local derived indexes and richer local inspection commands. The unified local event/chunk DB must remain the source of truth.
 
-Phase 3 may add a minimal self-hosted append-only event endpoint and non-destructive CLI push dry-runs. Do not drain local queues, add auth, or implement conflict resolution until retry and authorization semantics are designed.
+Phase 3 may add a minimal self-hosted append-only event endpoint and non-destructive CLI push dry-runs. Do not drain local events, add auth, or implement conflict resolution until retry and authorization semantics are designed.
 
-Phase 4 may add configurable local storage roots and source profiles. Storage selection must keep the JSONL event log as the source of truth, preserve repo-local `.brick/provenance` defaults, and keep source profile bootstrap config readable before a profile-selected store root exists.
+Phase 4 may add configurable local storage roots and source profiles. Storage selection must keep the unified local event/chunk DB as the source of truth, preserve global Brick-home defaults, and keep source profile bootstrap config readable before a profile-selected store root exists.
 
 Phase 6 may add a rebuildable SQLite cache under the effective local store cache directory. The SQLite database must remain derived data, expose typed read-only query commands by default, and avoid arbitrary mutating SQL from the CLI.
 

@@ -1,11 +1,10 @@
-//! Filesystem-backed local store for Brick.
+//! Local store for Brick.
 //!
-//! The queue directory is the durable append-only write path. Cache files are
-//! derived from the queue and may be rebuilt at any time.
+//! The unified SQLite event/chunk database is the durable write path. Legacy JSONL
+//! helpers remain only for explicit import/export and are not the runtime source of truth.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -16,9 +15,9 @@ use uuid::Uuid;
 
 use crate::{
     rebuild_sqlite_index, resolve_storage_root, sqlite_index_status, AttachmentStore,
-    CurrentContext, IndexStatus, ResolvedStorageRoot, SqliteIndexStatus, StorageOptions,
-    TraceIndex, CACHE_DIR, CURRENT_CONTEXT_FILE, EVENTS_DIR, INDEX_CACHE_FILE, PROVENANCE_DIR,
-    QUEUE_DIR, REPO_CONFIG_FILE, SQLITE_INDEX_FILE, VIEWS_DIR,
+    CurrentContext, IndexStatus, LocalEventStore, ResolvedStorageRoot, SqliteIndexStatus,
+    StorageOptions, TraceIndex, CACHE_DIR, CURRENT_CONTEXT_FILE, INDEX_CACHE_FILE, PROVENANCE_DIR,
+    REPO_CONFIG_FILE, SQLITE_INDEX_FILE, VIEWS_DIR,
 };
 
 /// Repository-local provenance configuration written during initialization.
@@ -28,12 +27,12 @@ pub struct RepoConfig {
     pub created_at: String,
 }
 
-/// Queue health summary for status output and tests.
+/// Event-store health summary for status output and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueStatus {
+pub struct EventStoreStatus {
     pub initialized: bool,
-    pub queued_event_count: usize,
-    pub queue_files: usize,
+    pub event_count: usize,
+    pub store_files: usize,
 }
 
 /// Filesystem store for one Git repository and one effective storage root.
@@ -93,14 +92,14 @@ impl LocalStore {
         self.storage_root.clone()
     }
 
-    /// Returns the durable JSONL event queue directory.
-    pub fn queue_dir(&self) -> PathBuf {
-        self.provenance_dir().join(QUEUE_DIR)
+    /// Returns the unified local event/chunk store.
+    pub fn event_store(&self) -> Result<LocalEventStore> {
+        Ok(LocalEventStore::new(crate::local_event_db_path()?))
     }
 
-    /// Returns the directory containing inbound events pulled from remotes.
-    pub fn inbound_events_dir(&self) -> PathBuf {
-        self.provenance_dir().join(EVENTS_DIR).join("inbound")
+    /// Returns this repository's stable local repo id.
+    pub fn repo_id(&self) -> String {
+        crate::repo_id_for_root(&self.repo_root)
     }
 
     /// Returns the directory for rebuildable local cache files.
@@ -133,12 +132,9 @@ impl LocalStore {
         crate::LogStore::new(self.storage_root.clone())
     }
 
-    /// Creates local provenance directories and repo metadata if missing.
+    /// Creates local support directories and initializes the unified event/chunk DB.
     pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(self.queue_dir())
-            .context("failed to create provenance queue directory")?;
-        fs::create_dir_all(self.inbound_events_dir())
-            .context("failed to create provenance inbound events directory")?;
+        self.event_store()?.init()?;
         fs::create_dir_all(self.provenance_dir().join(CACHE_DIR))
             .context("failed to create provenance cache directory")?;
 
@@ -161,42 +157,24 @@ impl LocalStore {
         Ok(())
     }
 
-    /// Appends one event to today's JSONL queue file.
+    /// Appends one event to the unified local event/chunk database.
     pub fn append_event(&self, event: &TraceEvent) -> Result<PathBuf> {
         self.init()?;
-
-        let date = Utc::now().format("%Y-%m-%d");
-        let path = self.queue_dir().join(format!("{date}.jsonl"));
-        let serialized = serde_json::to_string(event).context("failed to serialize trace event")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open event queue at {}", path.display()))?;
-        writeln!(file, "{serialized}").context("failed to append trace event")?;
-        Ok(path)
+        let store = self.event_store()?;
+        store.append_event(&self.repo_id(), event)?;
+        Ok(store.path().to_path_buf())
     }
 
-    /// Reads all queued JSONL events in deterministic file order.
-    pub fn read_queued_events(&self) -> Result<Vec<TraceEvent>> {
-        read_jsonl_events(&self.queue_dir(), "queue")
+    /// Reads local events with source-session chunks reattached for transport boundaries.
+    pub fn read_local_events(&self) -> Result<Vec<TraceEvent>> {
+        self.event_store()?
+            .read_events_for_repo_with_chunks(Some(&self.repo_id()))
     }
 
-    /// Reads inbound remote JSONL events in deterministic file order.
-    pub fn read_inbound_events(&self) -> Result<Vec<TraceEvent>> {
-        read_jsonl_events(&self.inbound_events_dir(), "inbound events")
-    }
-
-    /// Reads local queued events and inbound remote events as a deduped stream.
+    /// Reads all local events from the unified event/chunk database.
     pub fn read_all_events(&self) -> Result<Vec<TraceEvent>> {
-        let mut events = self.read_queued_events()?;
-        let mut known_event_ids = event_id_set(&events);
-        for event in self.read_inbound_events()? {
-            if known_event_ids.insert(event.event_id) {
-                events.push(event);
-            }
-        }
-        Ok(events)
+        self.event_store()?
+            .read_events_for_repo(Some(&self.repo_id()))
     }
 
     /// Returns all locally known event IDs across queued and inbound events.
@@ -213,22 +191,12 @@ impl LocalStore {
             .collect())
     }
 
-    /// Appends inbound remote events to a separate JSONL log without touching the local queue.
-    pub fn append_inbound_events(&self, events: &[TraceEvent]) -> Result<PathBuf> {
+    /// Appends inbound remote events to the unified local event/chunk database.
+    pub fn append_remote_events(&self, events: &[TraceEvent]) -> Result<PathBuf> {
         self.init()?;
-        let date = Utc::now().format("%Y-%m-%d");
-        let path = self.inbound_events_dir().join(format!("{date}.jsonl"));
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open inbound event log at {}", path.display()))?;
-        for event in events {
-            let serialized =
-                serde_json::to_string(event).context("failed to serialize inbound trace event")?;
-            writeln!(file, "{serialized}").context("failed to append inbound trace event")?;
-        }
-        Ok(path)
+        let store = self.event_store()?;
+        store.append_events(&self.repo_id(), events)?;
+        Ok(store.path().to_path_buf())
     }
 
     /// Returns the newest known events after loading local and inbound event logs.
@@ -239,25 +207,16 @@ impl LocalStore {
         Ok(events.drain(start..).collect())
     }
 
-    /// Summarizes initialization and pending queue state.
-    pub fn queue_status(&self) -> Result<QueueStatus> {
-        let initialized = self.provenance_dir().exists();
-        if !initialized {
-            return Ok(QueueStatus {
-                initialized,
-                queued_event_count: 0,
-                queue_files: 0,
-            });
-        }
+    /// Summarizes unified local event storage state.
+    pub fn event_store_status(&self) -> Result<EventStoreStatus> {
+        let store = self.event_store()?;
+        let initialized = store.path().exists();
+        let event_count = store.event_count_for_repo(Some(&self.repo_id()))?;
 
-        let paths = jsonl_paths(&self.queue_dir(), "queue")?;
-        let queue_files = paths.len();
-        let queued_event_count = self.read_queued_events()?.len();
-
-        Ok(QueueStatus {
+        Ok(EventStoreStatus {
             initialized,
-            queued_event_count,
-            queue_files,
+            event_count,
+            store_files: usize::from(initialized),
         })
     }
 
@@ -319,7 +278,7 @@ impl LocalStore {
         fs::write(
             views_dir.join("README.md"),
             format!(
-                "# Brick Views\n\nSchema version: {}\nEvents: {}\nRebuilt at: {}\n\nThese files are derived from the JSONL event queue. Delete and rebuild them at any time.\n",
+                "# Brick Views\n\nSchema version: {}\nEvents: {}\nRebuilt at: {}\n\nThese files are derived from the unified local event/chunk database. Delete and rebuild them at any time.\n",
                 index.schema_version,
                 index.event_count,
                 index.rebuilt_at.to_rfc3339()
@@ -436,10 +395,7 @@ impl LocalStore {
 
     /// Loads the inspection index, rebuilding it when the cache is absent OR
     /// stale. Staleness is detected by comparing the cached `event_count` against
-    /// the live event count in the queue + inbound logs: if the queue has grown
-    /// (or shrunk) since the cache was written, the cache is rebuilt. Without this
-    /// check a present-but-outdated `index.json` would be returned silently,
-    /// hiding events that callers (e.g. MCP reads) just appended.
+    /// the live event count in the unified event/chunk database.
     pub fn load_or_rebuild_index(&self) -> Result<TraceIndex> {
         match self.read_index()? {
             Some(index) => {
@@ -470,7 +426,7 @@ impl LocalStore {
         })
     }
 
-    /// Rebuilds the SQLite query cache from local and inbound events.
+    /// Rebuilds the SQLite projection cache from local events.
     pub fn rebuild_sqlite_index(&self) -> Result<SqliteIndexStatus> {
         self.init()?;
         let events = self.read_all_events()?;
@@ -483,58 +439,6 @@ impl LocalStore {
     pub fn sqlite_index_status(&self) -> Result<SqliteIndexStatus> {
         sqlite_index_status(&self.sqlite_index_path())
     }
-}
-
-fn read_jsonl_events(root: &Path, label: &str) -> Result<Vec<TraceEvent>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut paths = jsonl_paths(root, label)?;
-    paths.sort();
-
-    let mut events = Vec::new();
-    for path in paths {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {label} file {}", path.display()))?;
-        for (line_index, line) in contents.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event = serde_json::from_str::<TraceEvent>(line).with_context(|| {
-                format!(
-                    "failed to parse event in {} at line {}",
-                    path.display(),
-                    line_index + 1
-                )
-            })?;
-            events.push(event);
-        }
-    }
-    Ok(events)
-}
-
-fn jsonl_paths(root: &Path, label: &str) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(root)
-        .with_context(|| format!("failed to read {label} directory {}", root.display()))?
-    {
-        let entry = entry.context("failed to read event directory entry")?;
-        let path = entry.path();
-        if path.is_dir() {
-            paths.extend(jsonl_paths(&path, label)?);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
-        {
-            paths.push(path);
-        }
-    }
-    Ok(paths)
 }
 
 fn join_set(values: &BTreeSet<String>) -> String {
@@ -606,49 +510,90 @@ mod tests {
         .expect("build event");
 
         store.append_event(&event).expect("append event");
-        let events = store.read_queued_events().expect("read events");
+        let events = store.read_local_events().expect("read events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, EventType::MissionCreated);
     }
 
     #[test]
-    fn inbound_events_are_stored_separately_and_read_with_queue() {
-        let repo_root = temp_repo_root("inbound-read");
+    fn repo_scoped_reads_do_not_mix_events_in_global_db() {
+        let repo_a = temp_repo_root("repo-scope-a");
+        let repo_b = temp_repo_root("repo-scope-b");
+        let store_a = LocalStore::new(&repo_a);
+        let store_b = LocalStore::new(&repo_b);
+        store_a
+            .append_event(&mission_event("Repo A mission"))
+            .expect("append repo a");
+        store_b
+            .append_event(&mission_event("Repo B mission"))
+            .expect("append repo b");
+
+        assert_eq!(store_a.read_all_events().expect("read repo a").len(), 1);
+        assert_eq!(store_b.read_all_events().expect("read repo b").len(), 1);
+        assert_eq!(
+            store_a
+                .event_store_status()
+                .expect("repo a status")
+                .event_count,
+            1
+        );
+        assert_eq!(
+            store_b
+                .event_store_status()
+                .expect("repo b status")
+                .event_count,
+            1
+        );
+        assert_eq!(
+            store_a.rebuild_index().expect("repo a index").event_count,
+            1
+        );
+        assert_eq!(
+            store_b.rebuild_index().expect("repo b index").event_count,
+            1
+        );
+    }
+
+    #[test]
+    fn remote_events_are_stored_in_unified_event_db() {
+        let repo_root = temp_repo_root("remote-read");
         let store = LocalStore::new(&repo_root);
         let local_event = mission_event("Local mission");
-        let inbound_event = mission_event("Inbound mission");
+        let remote_event = mission_event("Remote mission");
 
         store
             .append_event(&local_event)
             .expect("append local event");
-        let inbound_path = store
-            .append_inbound_events(std::slice::from_ref(&inbound_event))
-            .expect("append inbound event");
+        let event_store_path = store
+            .append_remote_events(std::slice::from_ref(&remote_event))
+            .expect("append remote event");
 
-        assert!(inbound_path.starts_with(store.inbound_events_dir()));
-        assert_eq!(store.read_queued_events().expect("read queue").len(), 1);
-        assert_eq!(store.read_inbound_events().expect("read inbound").len(), 1);
+        assert_eq!(
+            event_store_path,
+            store.event_store().expect("event store").path()
+        );
+        assert_eq!(store.read_local_events().expect("read events").len(), 2);
         assert_eq!(store.read_all_events().expect("read all").len(), 2);
     }
 
     #[test]
-    fn remote_dedupe_checks_local_and_inbound_events() {
+    fn remote_dedupe_checks_unified_local_events() {
         let repo_root = temp_repo_root("remote-dedupe");
         let store = LocalStore::new(&repo_root);
         let local_event = mission_event("Local mission");
-        let inbound_event = mission_event("Inbound mission");
+        let remote_event = mission_event("Remote mission");
         let new_event = mission_event("New mission");
 
         store
             .append_event(&local_event)
             .expect("append local event");
         store
-            .append_inbound_events(std::slice::from_ref(&inbound_event))
-            .expect("append inbound event");
+            .append_remote_events(std::slice::from_ref(&remote_event))
+            .expect("append remote event");
         let deduped = store
             .dedupe_remote_events(vec![
                 local_event,
-                inbound_event,
+                remote_event,
                 new_event.clone(),
                 new_event,
             ])

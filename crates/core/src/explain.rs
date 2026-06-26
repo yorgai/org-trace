@@ -172,7 +172,10 @@ pub fn source_sessions_to_steps(
             session_id: (!external.is_empty()).then(|| external.clone()),
             mission_id: None,
             mission_title: None,
-            occurred_at: row.last_seen_at.clone(),
+            occurred_at: row
+                .occurred_at
+                .clone()
+                .unwrap_or_else(|| row.last_seen_at.clone()),
             relation: None,
             note: None,
             confidence: "observed".to_string(),
@@ -227,9 +230,10 @@ pub fn merge_source_steps_into(chain_steps: &mut Vec<CausalStep>, source_steps: 
         }
         chain_steps.push(step);
     }
-    // One unified timeline: stable-sort by occurred_at, then renumber depth so it
-    // stays a contiguous 0..N distance-from-anchor sequence after the merge.
-    chain_steps.sort_by(|a, b| a.occurred_at.cmp(&b.occurred_at));
+    // One unified newest-first timeline: stable-sort by occurred_at descending,
+    // then renumber depth so it stays a contiguous 0..N distance-from-anchor
+    // sequence after the merge.
+    chain_steps.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at));
     for (depth, step) in chain_steps.iter_mut().enumerate() {
         step.depth = depth;
     }
@@ -483,19 +487,15 @@ pub fn explain_from_events(
     // truncation.
     let limit = depth.saturating_add(1);
     for event_id in &anchor.resolved_events {
-        if !seen.insert(event_id.clone()) {
+        let event = by_id.get(event_id).copied();
+        if !seen.insert(explain_step_identity(event, event_id)) {
             continue;
         }
         if steps.len() >= limit {
             truncated = true;
             break;
         }
-        let step = build_step(
-            by_id.get(event_id).copied(),
-            event_id,
-            steps.len(),
-            &mission_titles,
-        );
+        let step = build_step(event, event_id, steps.len(), &mission_titles);
         steps.push(step);
     }
 
@@ -504,6 +504,26 @@ pub fn explain_from_events(
         steps,
         truncated,
     }
+}
+
+fn explain_step_identity(event: Option<&TraceEvent>, event_id: &str) -> String {
+    let Some(event) = event else {
+        return event_id.to_string();
+    };
+    if event.event_type != EventType::SourceSessionObserved {
+        return event_id.to_string();
+    }
+    let Ok(payload) = serde_json::from_value::<SourceSessionObservedPayload>(event.payload.clone())
+    else {
+        return event_id.to_string();
+    };
+    if payload.source_id.is_empty() || payload.external_session_id.is_empty() {
+        return event_id.to_string();
+    }
+    format!(
+        "source-session:{}:{}",
+        payload.source_id, payload.external_session_id
+    )
 }
 
 fn build_step(
@@ -856,6 +876,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_session_events_dedupe_by_external_session() {
+        let mut older = source_session_event("crates/core/src/explain.rs");
+        older.occurred_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        older.event_id = uuid::Uuid::new_v4();
+        older.payload["source_fingerprint"] = serde_json::Value::String("older".to_string());
+        let mut newer = source_session_event("crates/core/src/explain.rs");
+        newer.event_id = uuid::Uuid::new_v4();
+        newer.payload["source_fingerprint"] = serde_json::Value::String("newer".to_string());
+        let newer_id = newer.event_id.to_string();
+        let events = vec![older, newer];
+
+        let anchor = resolve_file_anchor(&events, "src/explain.rs");
+        let chain = explain_from_events(&events, anchor, DEFAULT_EXPLAIN_DEPTH);
+
+        assert_eq!(chain.steps.len(), 1);
+        assert_eq!(chain.steps[0].event_id, newer_id);
+        assert_eq!(chain.steps[0].depth, 0);
+        assert!(!chain.truncated);
+    }
+
     /// The timeline lists every event the anchor resolved to, newest first.
     #[test]
     fn timeline_lists_resolved_events_newest_first() {
@@ -1011,6 +1052,7 @@ mod tests {
             actor_type: Some("agent".to_string()),
             evidence_kind: crate::FileSessionBlameEvidenceKind::SourceMetadata,
             last_seen_at: "2026-06-20T10:00:00+00:00".to_string(),
+            occurred_at: None,
             title: None,
             lines_added: Some(3),
             lines_removed: Some(1),
@@ -1062,6 +1104,17 @@ mod tests {
         assert_eq!(steps.len(), 2, "duplicate synthetic ids collapse");
         assert_eq!(steps[0].depth, 5);
         assert_eq!(steps[1].depth, 6);
+    }
+
+    #[test]
+    fn source_sessions_to_steps_prefers_file_touch_time() {
+        let mut row = blame_row("codex_app", "sess-1", "/repo/a.rs", "/repo");
+        row.last_seen_at = "2026-06-20T10:00:00+00:00".to_string();
+        row.occurred_at = Some("2026-06-20T09:00:00+00:00".to_string());
+
+        let steps = source_sessions_to_steps(&[row], 0);
+
+        assert_eq!(steps[0].occurred_at, "2026-06-20T09:00:00+00:00");
     }
 
     #[test]
@@ -1121,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_interleaves_linked_and_source_steps_by_time() {
+    fn merge_interleaves_linked_and_source_steps_newest_first() {
         // The exact bug the merge fixes: change 1 (source only) → change 2
         // (linked) → change 3 (source only). The old fill-if-empty fallback
         // dropped 1 and 3 because the chain already had the linked step 2.
@@ -1150,13 +1203,13 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "source-session:codex:s1",
+                "source-session:codex:s3",
                 "link-2",
-                "source-session:codex:s3"
+                "source-session:codex:s1"
             ],
-            "all three changes must appear, time-ordered"
+            "all three changes must appear newest-first"
         );
-        // depth renumbered contiguously 0..N.
+        // depth renumbered contiguously 0..N, with depth 0 being newest.
         assert_eq!(
             chain.iter().map(|s| s.depth).collect::<Vec<_>>(),
             vec![0, 1, 2]

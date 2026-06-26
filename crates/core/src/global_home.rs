@@ -1,8 +1,8 @@
 //! Global Brick home resolution.
 //!
-//! This module owns process-wide Brick state paths. It is intentionally separate
-//! from repo-local provenance storage so existing JSONL queue behavior remains
-//! unchanged while new shared metadata can live under one user home.
+//! This module owns process-wide Brick state paths. The unified local event DB
+//! lives directly under the Brick home; repo-specific derived caches and views
+//! live under per-repository provenance directories.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +15,10 @@ pub const BRICK_HOME_ENV: &str = "BRICK_HOME";
 /// Directory name used below the operating-system user home by default.
 pub const DEFAULT_BRICK_HOME_DIR: &str = ".brick";
 
-/// Filename of the unified Brick metadata database.
+/// Filename of the unified local Brick event/chunk database.
+pub const LOCAL_EVENT_DB_FILE: &str = "brick.sqlite";
+
+/// Filename of the legacy source metadata database, used as a migration/input store only.
 pub const METADATA_DB_FILE: &str = "metadata.sqlite";
 
 /// Directory under the Brick home holding per-repository provenance stores.
@@ -36,12 +39,22 @@ pub fn default_brick_home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("failed to resolve default Brick home; set {BRICK_HOME_ENV}"))
 }
 
-/// Returns the metadata database path for the resolved global Brick home.
+/// Returns the unified local event/chunk database path for the resolved global Brick home.
+pub fn local_event_db_path() -> Result<PathBuf> {
+    Ok(resolve_brick_home()?.join(LOCAL_EVENT_DB_FILE))
+}
+
+/// Returns the unified local event/chunk database path for an explicit Brick home.
+pub fn local_event_db_path_in_home(brick_home: impl AsRef<Path>) -> PathBuf {
+    brick_home.as_ref().join(LOCAL_EVENT_DB_FILE)
+}
+
+/// Returns the legacy metadata database path for the resolved global Brick home.
 pub fn metadata_db_path() -> Result<PathBuf> {
     Ok(resolve_brick_home()?.join(METADATA_DB_FILE))
 }
 
-/// Returns the metadata database path for an explicit Brick home.
+/// Returns the legacy metadata database path for an explicit Brick home.
 pub fn metadata_db_path_in_home(brick_home: impl AsRef<Path>) -> PathBuf {
     brick_home.as_ref().join(METADATA_DB_FILE)
 }

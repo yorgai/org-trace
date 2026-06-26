@@ -1,8 +1,8 @@
 //! Rebuildable SQLite cache for local provenance queries.
 //!
-//! The database is derived from the append-only JSONL queue and lives under the
-//! effective store cache directory. Callers may delete and rebuild it without
-//! losing provenance because JSONL remains authoritative.
+//! The database is derived from the unified local event/chunk store and lives
+//! under the effective store cache directory. Callers may delete and rebuild it
+//! without losing provenance because `brick.sqlite` remains authoritative.
 
 use std::path::Path;
 
@@ -26,7 +26,7 @@ use crate::{
 pub const SQLITE_INDEX_SCHEMA_VERSION: u16 = 2;
 
 /// Filename for the SQLite query cache under the effective cache directory.
-pub const SQLITE_INDEX_FILE: &str = "brick.sqlite";
+pub const SQLITE_INDEX_FILE: &str = "query-cache.sqlite";
 
 /// Metadata summary for the local SQLite cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +376,7 @@ fn runtime_diff_blame_rows(
         let file_count: i64 = row.get(8)?;
         let path_value: String = row.get(0)?;
         let old_path: Option<String> = row.get(18)?;
+        let last_seen_at: String = row.get(5)?;
         Ok(FileSessionBlameRow {
             file_path: if path_value == file_path
                 || path_matches_folder_query(&path_value, file_path)
@@ -391,7 +392,8 @@ fn runtime_diff_blame_rows(
             actor_id: row.get(3)?,
             actor_type: row.get(4)?,
             evidence_kind: FileSessionBlameEvidenceKind::RuntimeEvent,
-            last_seen_at: row.get(5)?,
+            last_seen_at: last_seen_at.clone(),
+            occurred_at: Some(last_seen_at),
             title: None,
             lines_added: additions.and_then(|value| u64::try_from(value).ok()),
             lines_removed: deletions.and_then(|value| u64::try_from(value).ok()),
@@ -434,6 +436,7 @@ fn runtime_file_ref_blame_rows(
     )?;
     let folder_pattern = folder_like_pattern(file_path);
     let rows = statement.query_map(params![file_path, folder_pattern, limit], |row| {
+        let last_seen_at: String = row.get(5)?;
         Ok(FileSessionBlameRow {
             file_path: row.get(0)?,
             session_id: row.get(1)?,
@@ -443,7 +446,8 @@ fn runtime_file_ref_blame_rows(
             actor_id: row.get(3)?,
             actor_type: row.get(4)?,
             evidence_kind: FileSessionBlameEvidenceKind::RuntimeEvent,
-            last_seen_at: row.get(5)?,
+            last_seen_at: last_seen_at.clone(),
+            occurred_at: Some(last_seen_at),
             title: None,
             lines_added: None,
             lines_removed: None,

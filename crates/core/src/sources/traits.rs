@@ -229,9 +229,12 @@ pub fn format_source_session_chunks(
 ///
 /// Selection: take the assistant messages in the turn whose bounds contain
 /// `occurred_at` (greatest user-message timestamp `<= occurred_at`, up to the next
-/// user message), and return the last one. If timestamps don't line up with any
-/// turn, fall back to the last assistant message at or before `occurred_at`, then
-/// to the last assistant message overall — a best-effort guess, never fabricated.
+/// user message), restricted to messages at or before `occurred_at`, and return
+/// the last one. If timestamps don't line up with any turn, fall back only to the
+/// last assistant message at or before `occurred_at`. Never use a future assistant
+/// message: active sessions keep appending chunks, and missing user-turn
+/// boundaries would otherwise attach the current conversation's latest reply to
+/// an older file change.
 pub fn turn_final_assistant_message(
     source_id: &str,
     external_session_id: &str,
@@ -299,6 +302,7 @@ pub fn select_turn_final_message(chunks: &[ActivityChunk], occurred_at: &str) ->
             .unwrap_or(chunks.len());
         let final_in_turn = chunks[start..turn_end]
             .iter()
+            .filter(|chunk| chunk.created_at.as_str() <= occurred_at)
             .filter_map(assistant_text)
             .next_back();
         if final_in_turn.is_some() {
@@ -306,13 +310,14 @@ pub fn select_turn_final_message(chunks: &[ActivityChunk], occurred_at: &str) ->
         }
     }
 
-    // Fallbacks: last assistant at/before the timestamp, then last overall.
+    // Fallback: last assistant at/before the timestamp. Do not use the last
+    // assistant overall; that can be a future/current-session message unrelated
+    // to the file change being explained.
     chunks
         .iter()
         .filter(|chunk| chunk.created_at.as_str() <= occurred_at)
         .filter_map(assistant_text)
         .next_back()
-        .or_else(|| chunks.iter().filter_map(assistant_text).next_back())
 }
 
 /// A weak (read-side, `observed`-confidence) rationale inferred from a session
@@ -585,6 +590,47 @@ mod tests {
             select_turn_final_message(&chunks, "2026-06-20T10:05:00Z"),
             None
         );
+    }
+
+    #[test]
+    fn turn_final_message_does_not_use_future_global_last_message() {
+        // Active sessions keep appending chunks. If the event timestamp is older
+        // than every assistant message, using "last assistant overall" attaches
+        // the current conversation's latest reply to an unrelated old change.
+        let chunks = vec![
+            user_message_chunk("s", "p", 0, "2026-06-20T10:00:00Z", "new work"),
+            assistant_message_chunk(
+                "s",
+                "p",
+                1,
+                "2026-06-20T10:05:00Z",
+                "this is future chatter, not the rationale",
+            ),
+        ];
+        assert_eq!(
+            select_turn_final_message(&chunks, "2026-06-20T09:00:00Z"),
+            None
+        );
+    }
+
+    #[test]
+    fn turn_final_message_ignores_future_assistant_inside_open_turn() {
+        // ORGII can have very long sessions with only one indexed user boundary.
+        // The open turn then spans the whole session; rationale recovery must not
+        // use later assistant messages from unrelated future work.
+        let chunks = vec![
+            user_message_chunk("s", "p", 0, "2026-06-20T10:00:00Z", "start"),
+            assistant_message_chunk("s", "p", 1, "2026-06-20T10:05:00Z", "old rationale"),
+            assistant_message_chunk(
+                "s",
+                "p",
+                2,
+                "2026-06-26T18:00:00Z",
+                "current unrelated reply",
+            ),
+        ];
+        let got = select_turn_final_message(&chunks, "2026-06-24T16:43:13+00:00");
+        assert_eq!(got.as_deref(), Some("old rationale"));
     }
 
     #[test]

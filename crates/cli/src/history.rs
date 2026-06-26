@@ -5,11 +5,12 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use brick_core::{
-    list_source_plans, list_source_sessions, ActivityChunk, DiscoveredPathKind, DiscoveredSource,
-    LocalStore, MetadataDb, NativeSourceSession, SourceProfile, SourceProfileStore,
-    SourceScanStatus, SourceSessionChunksUpsert, SourceSessionUpsert,
+    build_source_session_event_with_chunks, list_source_plans, list_source_sessions, ActivityChunk,
+    DiscoveredPathKind, DiscoveredSource, LocalEventStore, LocalStore, MetadataDb,
+    NativeSourceSession, SourceProfile, SourceProfileStore, SourceScanStatus,
+    SourceSessionChunksUpsert, SourceSessionUpsert,
 };
-use brick_protocol::ActorType;
+use brick_protocol::{ActorRef, ActorType};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -174,6 +175,8 @@ impl RefreshStats {
 
 fn refresh_profiles_to_metadata(
     metadata_db: &mut MetadataDb,
+    event_store: &LocalEventStore,
+    repo_id: &str,
     profiles: &[SourceProfile],
     limit: Option<usize>,
 ) -> Result<RefreshStats> {
@@ -184,7 +187,14 @@ fn refresh_profiles_to_metadata(
         let since = watermark
             .as_ref()
             .and_then(|(high_water, _)| high_water.as_deref());
-        let profile_stats = match refresh_single_profile(metadata_db, profile, limit, since) {
+        let profile_stats = match refresh_single_profile(
+            metadata_db,
+            event_store,
+            repo_id,
+            profile,
+            limit,
+            since,
+        ) {
             Ok((stats, max_updated_at)) => {
                 metadata_db.finish_source_scan(
                     scan_id,
@@ -237,6 +247,8 @@ fn refresh_repo_sources(store: &LocalStore) -> Result<()> {
         return Ok(());
     }
     let mut metadata_db = MetadataDb::open_global()?;
+    let event_store = LocalEventStore::new(brick_core::local_event_db_path()?);
+    let repo_id = brick_core::repo_id_for_root(repo_root);
     let now = Utc::now();
     let due: Vec<SourceProfile> = profiles
         .into_iter()
@@ -258,12 +270,20 @@ fn refresh_repo_sources(store: &LocalStore) -> Result<()> {
     if due.is_empty() {
         return Ok(());
     }
-    refresh_profiles_to_metadata(&mut metadata_db, &due, Some(SOURCE_INDEX_REFRESH_LIMIT))?;
+    refresh_profiles_to_metadata(
+        &mut metadata_db,
+        &event_store,
+        &repo_id,
+        &due,
+        Some(SOURCE_INDEX_REFRESH_LIMIT),
+    )?;
     Ok(())
 }
 
 fn refresh_single_profile(
     metadata_db: &mut MetadataDb,
+    event_store: &LocalEventStore,
+    repo_id: &str,
     profile: &SourceProfile,
     limit: Option<usize>,
     since: Option<&str>,
@@ -294,14 +314,14 @@ fn refresh_single_profile(
             (Some(record), Some(fingerprint))
                 if record.source_fingerprint.as_deref() == Some(fingerprint.as_str())
         );
-        if unchanged {
+        let chunks = if unchanged {
             metadata_db.touch_source_session_last_seen(
                 &upsert.source_id,
                 &upsert.external_session_id,
                 upsert.last_seen_at,
             )?;
             stats.skipped += 1;
-            source_session_chunks_or_backfill(metadata_db, &upsert)?;
+            source_session_chunks_or_backfill(metadata_db, &upsert)?
         } else {
             metadata_db.upsert_source_session(&upsert)?;
             let chunks = brick_core::format_source_session_chunks(
@@ -312,9 +332,21 @@ fn refresh_single_profile(
             metadata_db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
                 source_id: upsert.source_id.clone(),
                 external_session_id: upsert.external_session_id.clone(),
-                chunks,
+                chunks: chunks.clone(),
             })?;
             stats.reindexed += 1;
+            chunks
+        };
+        if let Some(record) =
+            metadata_db.get_source_session(&upsert.source_id, &upsert.external_session_id)?
+        {
+            let event = build_source_session_event_with_chunks(
+                source_actor(profile),
+                &record,
+                repo_id,
+                &chunks,
+            )?;
+            event_store.append_event(repo_id, &event)?;
         }
         link_session_repo(
             metadata_db,
@@ -462,6 +494,22 @@ fn source_session_metadata(
         }
     }
     Some(metadata)
+}
+
+fn source_actor(profile: &SourceProfile) -> ActorRef {
+    ActorRef {
+        actor_type: profile.actor_type.unwrap_or(ActorType::Agent),
+        actor_id: profile.actor_id.clone().unwrap_or_else(|| {
+            profile
+                .app_id
+                .clone()
+                .unwrap_or_else(|| profile.name.clone())
+        }),
+        display_name: profile
+            .app_id
+            .clone()
+            .or_else(|| Some(profile.name.clone())),
+    }
 }
 
 fn profile_from_discovered_source(source: &DiscoveredSource) -> SourceProfile {

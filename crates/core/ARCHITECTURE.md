@@ -9,30 +9,29 @@ ignores these distinctions tends to introduce subtle bugs, so read this first.
 
 ```
                  ┌─────────────────────────────┐
-   append_event  │  JSONL queue  (SOURCE OF      │   <-- the ONLY truth
-   ───────────►  │  TRUTH, append-only)          │
-                 │  <BRICK_HOME>/repos/<id>/.brick/provenance/queue/*.jsonl
+   append_event  │  brick.sqlite                │   <-- the ONLY local event truth
+   ───────────►  │  brick_events                │
+                 │  brick_event_chunks          │
+                 │  <BRICK_HOME>/brick.sqlite   │
                  └──────────────┬──────────────┘
                                 │ TraceIndex::build(read_all_events())
             ┌───────────────────┼────────────────────┐
             ▼                   ▼                     ▼
-   index.json (JSON graph)  brick.sqlite          agent views
+   index.json (JSON graph)  query-cache.sqlite    agent views
    IndexedOrg/Project/...   (query cache)         (markdown, human/agent)
    — rebuildable —          — rebuildable —       — rebuildable —
 ```
 
 Rules (enforced by convention, stated in each module header):
 
-- **The JSONL queue is authoritative.** Everything else can be deleted and
-  rebuilt from `read_all_events()`. Never let a derived cache become the truth.
-- `index.json` is the in-memory `TraceIndex` serialized. `brick.sqlite` is a flat
-  query cache projected from the index.
-- Two *additional* SQLite DBs have different truth semantics:
-  - `metadata.sqlite` — a **rebuildable cache** of external-tool ("source")
-    sessions. A schema bump triggers a full reset (currently schema v6). It also
-    holds `source_index_watermark`, the per-source incremental-refresh high-water
-    mark (`last_indexed_updated_at`) plus the persistent, cross-process
-    auto-refresh throttle timestamp (`last_refreshed_at`).
+- **The unified local event/chunk DB is authoritative.** Everything else can be
+  deleted and rebuilt from `read_all_events()`. Never let a derived cache become
+  the truth.
+- `index.json` is the in-memory `TraceIndex` serialized. `query-cache.sqlite` is
+  a flat query cache projected from the index.
+- `metadata.sqlite` is a source ingest/projection database for external-tool
+  profiles, scans, watermarks, source-session lists, and text search. It is not a
+  push-time event/chunk source of truth.
 
 ### Index loading
 
@@ -50,7 +49,7 @@ A diff capture exists as three structs, each a hand-copied projection of the one
 above it:
 
 ```
-brick_protocol::DiffCapturedPayload   (wire / JSONL truth)
+brick_protocol::DiffCapturedPayload   (wire / event truth)
         │  index.rs copies field-by-field
         ▼
 brick_core::IndexedDiff               (in-memory graph; adds aggregates)
@@ -66,10 +65,10 @@ automatically propagate** — you must update each layer that needs it.
 ### The deliberate exception: `patch_id`
 
 `DiffFileChange.patch_id` (in the payload) is **intentionally NOT mirrored** into
-`IndexedDiffFileChange` or the SQLite cache. Line-level owner blame is
+`IndexedDiffFileChange` or the SQLite query cache. Line-level owner blame is
 *events-authoritative*: `blame::blame_file` reads `patch_id` straight from the
-JSONL event stream, never from a cache. Mirroring it would invite "blame from the
-cache", which would silently mis-attribute whenever the cache lagged the queue. A
+local event stream, never from a cache. Mirroring it would invite "blame from the
+cache", which would silently mis-attribute whenever the cache lagged the event DB. A
 regression test (`blame::tests::indexed_diff_file_change_does_not_carry_patch_id`)
 guards this.
 
@@ -78,7 +77,7 @@ guards this.
 | Type | Backend | Use when |
 |---|---|---|
 | `SessionQuery` | in-memory `TraceIndex` | you already have/loaded the index |
-| `SqliteSessionQuery` | `brick.sqlite` | SQL-filterable queries over the cache |
+| `SqliteSessionQuery` | `query-cache.sqlite` | SQL-filterable queries over the cache |
 | `SourceSessionListQuery` / `SourceSessionTextQuery` | `metadata.sqlite` | external-tool session metadata / FTS |
 
 They share overlapping field names (`app_id`, `actor_id`, `limit`) with subtly
@@ -130,7 +129,7 @@ Watch for these when reading code:
   the external tool name string; (d) `StorageRootSource`: an unrelated enum for
   where the storage root was resolved from.
 - **"status"** — five unrelated types: `MissionStatus`, `SourceScanStatus`,
-  `IndexStatus`, `QueueStatus`, `SqliteIndexStatus`. Always read the type.
+  `IndexStatus`, `EventStoreStatus`, `SqliteIndexStatus`. Always read the type.
 - **"claim"** — only ever a *negative* assertion in blame/diff docs ("does NOT
   claim line-level authorship"). The old "session announcement" sense is gone
   (the announcements/claims feature was removed; live coordination is now the

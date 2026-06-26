@@ -1,6 +1,6 @@
 //! Projection logic from append-only events into a local inspection index.
 //!
-//! The index is derived data. It can be deleted and rebuilt from JSONL events,
+//! The index is derived data. It can be deleted and rebuilt from local events,
 //! so this module must never become the source of truth for provenance.
 
 use std::collections::{BTreeMap, BTreeSet};
