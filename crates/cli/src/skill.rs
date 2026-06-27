@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 
 /// Bumped whenever `SKILL_BODY` or the frontmatter changes so `status` can report
 /// an installed skill as stale and `install --force` can roll it forward.
-const SKILL_VERSION: u32 = 2;
+const SKILL_VERSION: u32 = 4;
 
 /// The skill directory name (becomes the `/brick` command in Claude Code) and the
 /// frontmatter `name`. The directory name — not the frontmatter — drives skill
@@ -93,15 +93,20 @@ they did it under, and whether another session is editing the file right now. de
 0 is the most recent change; higher depth is older.
 
 **What counts as a real Brick record.** A timeline step carrying an `actor_id`, a
-`mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY even
-when its `note` is null. Only fall back to git/grep when `explain` returns an empty
-`causal_chain` or an explicit \"No Brick record\" note.
+`mission_title`, or `confidence: explicit` IS provenance — treat it as useful history
+even when its `note` is null or shallow. If `causal_chain` is non-empty, Brick
+succeeded: do NOT call it useless just because the top-level note says file-level
+fallback or no exact line-level record. Only fall back to git/grep when `explain`
+returns an empty `causal_chain` or an explicit \"No Brick record\" note.
 
-**Go deeper than the `note` — read the full session.** A step's `note` is only that
-turn's CLOSING narration, which is often NOT the root cause. When the note doesn't
-answer your question, run the step's `transcript.read_session` command (a ready-to-run
-`sqlite3`/`read_file` that dumps the session's full trajectory) and read the original
-tool calls, errors, and reasoning end-to-end. The real cause lives in that deep read.
+**Follow `next_action` and go deeper than the `note`.** A step's `note` is only that
+turn's CLOSING narration, which is often NOT the root cause. When `explain` returns
+`next_action.kind = \"read_transcript\"`, run its bounded preview `command` before
+concluding WHY; use `full_command` only when the preview is insufficient. If there
+is no `next_action` but the note doesn't answer your question, run the step's
+`transcript.read_session` command and read the original tool calls, errors, and
+reasoning end-to-end. The real cause lives in that deep read.
+
 
 ## After you change code
 

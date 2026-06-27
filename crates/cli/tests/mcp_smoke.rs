@@ -180,6 +180,13 @@ fn main_surface_is_explain_only() {
     let unknown = m.call("totally_made_up_tool", json!({}));
     assert!(unknown.get("_rpc_error").is_some());
 
+    let resp = m.rpc("tools/list", json!({}));
+    let desc = resp["result"]["tools"][0]["description"]
+        .as_str()
+        .expect("tool description");
+    assert!(desc.contains("If `causal_chain` is non-empty"));
+    assert!(desc.contains("follow `next_action`"));
+
     drop(m);
     let _ = std::fs::remove_dir_all(root);
 }

@@ -147,13 +147,18 @@ fn explain_tool() -> Value {
     be read from the code), what was derived from / triggered by it, each step's \
     confidence (explicit > observed > inferred), a transcript pointer per step, and \
     a `live` field warning if another session is editing the same file right now. \
-    This subsumes line-level blame (WHO) into the WHY answer. \
-    IMPORTANT — go deeper than the `note`: each step's `note` is only that turn's \
-    CLOSING narration (an `observed` summary), which is frequently NOT the root \
-    cause. When the note doesn't answer your question, do NOT stop and fall back to \
-    git/grep — run the step's `transcript.read_session` command to read that \
-    session's FULL trajectory (the original tool calls, errors, and reasoning) from \
-    the source db/file. That deep read is where the real cause lives. \
+    This subsumes line-level blame (WHO) into the WHY answer. If `causal_chain` is \
+    non-empty, Brick succeeded and found useful provenance — do not dismiss it as \
+    useless because the note is shallow or because the anchor fell back to file-level \
+    sessions. IMPORTANT — follow `next_action` and go deeper than the `note`: each \
+    step's `note` is only that turn's CLOSING narration (an `observed` summary), \
+    which is frequently NOT the root cause. When `next_action.kind` is \
+    `read_transcript`, run its bounded preview `command` before concluding WHY; \
+    use `full_command` only when the preview is insufficient. When the note doesn't \
+    answer your question, do NOT stop and fall back to git/grep — run the step's \
+    `transcript.read_session` command to read that session's FULL trajectory (the \
+    original tool calls, errors, and reasoning) from the source db/file. That deep \
+    read is where the real cause lives. \
     Anchor can be a \
     `path:line` (e.g. `/abs/workspace/src/auth.rs:42`), a `path:start-end` line \
     range to explain a whole block at once (e.g. `/abs/workspace/src/auth.rs:10-20`), \
@@ -594,7 +599,7 @@ pub(crate) fn finalize_explain_chain(
         if let Value::Object(map) = &mut value {
             let note = match index_session_hint {
                 Some(count) => format!(
-                    "No line-level record for this anchor. But {count} indexed session(s) touched this file."
+                    "Brick found {count} indexed session(s) that touched this file, but none resolved to this exact line. Treat this as usable file-level provenance; prefer reading the session transcript before falling back to git/grep."
                 ),
                 None => "No Brick record for this anchor yet. Brick only records causal \
 edges for changes made while it was installed; fall back to git/grep here. As \
@@ -608,13 +613,61 @@ more changes flow through Brick, explain gets richer."
             map.insert(
                 "note".to_string(),
                 json!(format!(
-                    "No exact line-level record for this anchor; showing {count} file-level indexed session(s) that touched this file."
+                    "Brick found {count} real file-level session(s) for this anchor. The chain is useful provenance even without exact line ownership; read transcript.read_session for the relevant step before concluding root cause."
                 )),
             );
         }
     }
+    add_explain_agent_guidance(&mut value, index_session_hint);
 
     Ok(value)
+}
+
+fn add_explain_agent_guidance(value: &mut Value, index_session_hint: Option<usize>) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    let chain_non_empty = map
+        .get("causal_chain")
+        .and_then(Value::as_array)
+        .is_some_and(|steps| !steps.is_empty());
+    if !chain_non_empty {
+        return;
+    }
+    let first_transcript = map
+        .get("causal_chain")
+        .and_then(Value::as_array)
+        .and_then(|steps| steps.first())
+        .and_then(|step| step.get("transcript"));
+    let transcript_command = first_transcript
+        .and_then(|transcript| transcript.get("read_session"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let preview_command = first_transcript.and_then(read_session_preview_command_from_pointer);
+
+    map.insert(
+        "interpretation".to_string(),
+        json!({
+            "brick_result": "useful_provenance_found",
+            "do_not_stop_at_step_note": true,
+            "step_note_meaning": "A step.note is usually only the closing narration of that turn, not the root cause.",
+            "file_level_fallback": index_session_hint.map(|count| json!({
+                "session_count": count,
+                "meaning": "Exact line ownership was not available, but these sessions touched the file and are still useful for debugging."
+            }))
+        }),
+    );
+    map.insert(
+        "next_action".to_string(),
+        json!({
+            "kind": "read_transcript",
+            "required_before_concluding_root_cause": true,
+            "reason": "Brick found a non-empty causal_chain. To debug WHY, inspect the session trajectory rather than judging usefulness from the short step.note.",
+            "command": preview_command.or_else(|| transcript_command.clone()),
+            "full_command": transcript_command,
+            "step_depth": 0
+        }),
+    );
 }
 
 fn append_event(store: &LocalStore, event: &TraceEvent) -> Result<()> {
@@ -990,6 +1043,26 @@ fn enrich_transcripts(
     }
 }
 
+fn read_session_preview_command_from_pointer(transcript: &Value) -> Option<String> {
+    let source = transcript.get("source").and_then(Value::as_str)?;
+    let session_id = transcript.get("session_id").and_then(Value::as_str)?;
+    Some(read_session_preview_command(source, session_id))
+}
+
+fn read_session_preview_command(source: &str, session_id: &str) -> String {
+    match brick_core::local_event_db_path() {
+        Ok(path) => format!(
+            "sqlite3 -json \"{}\" \"SELECT chunk_index, occurred_at AS created_at, chunk_kind AS action_type, json_extract(raw_json, '$.function') AS function, substr(raw_json, 1, 2000) AS raw_preview FROM brick_event_chunks WHERE source_id='{}' AND external_session_id='{}' ORDER BY chunk_index LIMIT 120;\"",
+            path.display(),
+            source.replace('\'', "''"),
+            session_id.replace('\'', "''")
+        ),
+        Err(_) => format!(
+            "# local event/chunk DB unavailable; session source={source} external_session_id={session_id}"
+        ),
+    }
+}
+
 /// Builds a ready-to-run command that dumps one session's FULL trajectory, so an
 /// agent can deep-dive past the turn-final `note` into the normalized chunks in
 /// Brick's unified local event/chunk database.
@@ -1319,5 +1392,65 @@ mod tests {
         assert!(command.contains("external_session_id='session-1'"));
         assert!(!command.contains("source_session_chunks"));
         assert!(!command.contains("metadata.sqlite"));
+    }
+
+    #[test]
+    fn read_session_preview_command_is_bounded() {
+        let command = read_session_preview_command("orgii", "session-1");
+        assert!(command.contains("brick_event_chunks"));
+        assert!(command.contains("substr(raw_json, 1, 2000) AS raw_preview"));
+        assert!(command.contains("LIMIT 120"));
+        assert!(command.contains("source_id='orgii'"));
+        assert!(command.contains("external_session_id='session-1'"));
+    }
+
+    #[test]
+    fn explain_guidance_marks_non_empty_chain_as_useful_and_points_to_transcript() {
+        let full_command = read_session_command("orgii", "session-1");
+        let preview_command = read_session_preview_command("orgii", "session-1");
+        let mut value = json!({
+            "causal_chain": [{
+                "depth": 0,
+                "note": "closing narration only",
+                "transcript": {
+                    "read_session": full_command,
+                    "source": "orgii",
+                    "session_id": "session-1"
+                }
+            }]
+        });
+
+        add_explain_agent_guidance(&mut value, Some(3));
+
+        assert_eq!(
+            value["interpretation"]["brick_result"],
+            "useful_provenance_found"
+        );
+        assert_eq!(value["interpretation"]["do_not_stop_at_step_note"], true);
+        assert_eq!(
+            value["interpretation"]["file_level_fallback"]["session_count"],
+            3
+        );
+        assert_eq!(value["next_action"]["kind"], "read_transcript");
+        assert_eq!(value["next_action"]["command"], preview_command);
+        assert_eq!(value["next_action"]["full_command"], full_command);
+        assert!(value["next_action"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("LIMIT 120"));
+        assert_eq!(
+            value["next_action"]["required_before_concluding_root_cause"],
+            true
+        );
+    }
+
+    #[test]
+    fn explain_guidance_is_absent_for_empty_chain() {
+        let mut value = json!({ "causal_chain": [] });
+
+        add_explain_agent_guidance(&mut value, None);
+
+        assert!(value.get("interpretation").is_none());
+        assert!(value.get("next_action").is_none());
     }
 }

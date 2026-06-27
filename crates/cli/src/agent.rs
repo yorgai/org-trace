@@ -28,7 +28,7 @@ use crate::skill;
 
 /// Bumped whenever the managed-block wording changes so `status` can report a
 /// block as stale and `install` can roll it forward.
-const TEMPLATE_VERSION: u32 = 10;
+const TEMPLATE_VERSION: u32 = 12;
 const BLOCK_START_PREFIX: &str = "<!-- brick:managed:start";
 const BLOCK_END: &str = "<!-- brick:managed:end -->";
 
@@ -70,20 +70,22 @@ older. To understand a whole block at once, pass a line range:
 also be a whole file, an artifact, mission, or event id.
 
 **What counts as a real Brick record.** A timeline step carrying an `actor_id`, a
-`mission_title`, or `confidence: explicit` IS provenance — treat it as the WHY
-even when its `note` is null (not every change has a one-line rationale, but the
-mission it belonged to and who did it are still the reason). Only fall back to
-git/grep when `explain` returns an empty `causal_chain` or an explicit
-\"No Brick record\" note. Do NOT dismiss a populated timeline as \"no record\"
-just because `note` is null.
+`mission_title`, or `confidence: explicit` IS provenance — treat it as useful
+history even when its `note` is null or shallow. If `causal_chain` is non-empty,
+Brick succeeded: do NOT call it useless just because the top-level note says
+file-level fallback or no exact line-level record. Only fall back to git/grep
+when `explain` returns an empty `causal_chain` or an explicit \"No Brick record\"
+note.
 
-**Go deeper than the `note` — read the full session.** A step's `note` is only
+**Follow `next_action` and go deeper than the `note`.** A step's `note` is only
 that turn's CLOSING narration (an `observed` summary), which is often NOT the
-root cause. When the note doesn't answer your question, do NOT stop: run the
-step's `transcript.read_session` command (a ready-to-run `sqlite3`/`read_file`
-that dumps that session's full trajectory) and read the original tool calls,
-errors, and reasoning end-to-end. The real cause lives in that deep read, not in
-the one-line note.
+root cause. When `explain` returns `next_action.kind = \"read_transcript\"`, run
+its bounded preview `command` before concluding WHY; use `full_command` only when
+the preview is insufficient. If there is no `next_action` but the note doesn't
+answer your question, run the step's `transcript.read_session` command and read
+the original tool calls, errors, and reasoning end-to-end. The real cause lives
+in that deep read, not in the one-line note.
+
 
 **Prefer `explain` over `grep` and `git log` for understanding existing code.**
 git log / git blame / grep are a FALLBACK, used only when `explain` truly has no
