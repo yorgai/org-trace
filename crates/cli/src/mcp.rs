@@ -1050,34 +1050,45 @@ fn read_session_preview_command_from_pointer(transcript: &Value) -> Option<Strin
 }
 
 fn read_session_preview_command(source: &str, session_id: &str) -> String {
-    match brick_core::local_event_db_path() {
-        Ok(path) => format!(
-            "sqlite3 -json \"{}\" \"SELECT chunk_index, occurred_at AS created_at, chunk_kind AS action_type, json_extract(raw_json, '$.function') AS function, substr(raw_json, 1, 2000) AS raw_preview FROM brick_event_chunks WHERE source_id='{}' AND external_session_id='{}' ORDER BY chunk_index LIMIT 120;\"",
-            path.display(),
-            source.replace('\'', "''"),
-            session_id.replace('\'', "''")
-        ),
-        Err(_) => format!(
-            "# local event/chunk DB unavailable; session source={source} external_session_id={session_id}"
-        ),
-    }
+    read_session_sqlite_command(source, session_id, true)
 }
 
 /// Builds a ready-to-run command that dumps one session's FULL trajectory, so an
 /// agent can deep-dive past the turn-final `note` into the normalized chunks in
 /// Brick's unified local event/chunk database.
 fn read_session_command(source: &str, session_id: &str) -> String {
-    match brick_core::local_event_db_path() {
-        Ok(path) => format!(
-            "sqlite3 -json \"{}\" \"SELECT chunk_index, occurred_at AS created_at, chunk_kind AS action_type, json_extract(raw_json, '$.function') AS function, raw_json FROM brick_event_chunks WHERE source_id='{}' AND external_session_id='{}' ORDER BY chunk_index;\"",
-            path.display(),
-            source.replace('\'', "''"),
-            session_id.replace('\'', "''")
-        ),
-        Err(_) => format!(
+    read_session_sqlite_command(source, session_id, false)
+}
+
+fn read_session_sqlite_command(source: &str, session_id: &str, preview: bool) -> String {
+    let (Ok(event_db), Ok(metadata_db)) = (
+        brick_core::local_event_db_path(),
+        brick_core::metadata_db_path(),
+    ) else {
+        return format!(
             "# local event/chunk DB unavailable; session source={source} external_session_id={session_id}"
-        ),
-    }
+        );
+    };
+    let source = source.replace('\'', "''");
+    let session_id = session_id.replace('\'', "''");
+    let raw_column = if preview {
+        "substr(raw_json, 1, 2000) AS raw_preview"
+    } else {
+        "raw_json"
+    };
+    let limit = if preview { " LIMIT 120" } else { "" };
+    format!(
+        "sqlite3 -json \"{}\" \"ATTACH DATABASE '{}' AS metadata; WITH unified AS (SELECT chunk_index, occurred_at AS created_at, chunk_kind AS action_type, json_extract(raw_json, '$.function') AS function, {} FROM brick_event_chunks WHERE source_id='{}' AND external_session_id='{}'), legacy AS (SELECT c.chunk_index, c.created_at, c.action_type, c.function, {} FROM metadata.source_session_chunks c JOIN metadata.source_sessions s ON s.source_session_id = c.source_session_id WHERE s.source_id='{}' AND s.external_session_id='{}') SELECT * FROM (SELECT * FROM unified UNION ALL SELECT * FROM legacy WHERE NOT EXISTS (SELECT 1 FROM unified)) ORDER BY chunk_index{};\"",
+        event_db.display(),
+        metadata_db.display().to_string().replace('\'', "''"),
+        raw_column,
+        source,
+        session_id,
+        raw_column,
+        source,
+        session_id,
+        limit
+    )
 }
 
 /// Builds `external_session_id → (source_app_id, on-disk ref)` from the configured
@@ -1385,19 +1396,20 @@ mod tests {
     }
 
     #[test]
-    fn read_session_command_queries_unified_event_chunks() {
+    fn read_session_command_queries_unified_event_chunks_with_metadata_fallback() {
         let command = read_session_command("orgii", "session-1");
         assert!(command.contains("brick_event_chunks"));
+        assert!(command.contains("ATTACH DATABASE"));
+        assert!(command.contains("source_session_chunks"));
         assert!(command.contains("source_id='orgii'"));
         assert!(command.contains("external_session_id='session-1'"));
-        assert!(!command.contains("source_session_chunks"));
-        assert!(!command.contains("metadata.sqlite"));
     }
 
     #[test]
     fn read_session_preview_command_is_bounded() {
         let command = read_session_preview_command("orgii", "session-1");
         assert!(command.contains("brick_event_chunks"));
+        assert!(command.contains("source_session_chunks"));
         assert!(command.contains("substr(raw_json, 1, 2000) AS raw_preview"));
         assert!(command.contains("LIMIT 120"));
         assert!(command.contains("source_id='orgii'"));
