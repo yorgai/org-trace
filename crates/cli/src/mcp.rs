@@ -14,11 +14,11 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use brick_core::{
-    discover_repo_root, explain_from_events, infer_session_rationale, merge_source_steps_into,
-    resolve_direct_anchor, resolve_file_anchor, resolve_file_line_anchor,
-    resolve_file_range_anchor, source_sessions_to_steps, CausalChain, InferredRelation, LocalStore,
-    MetadataDb, SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH,
-    MAX_EXPLAIN_DEPTH,
+    build_source_session_event_with_chunks, discover_repo_root, explain_from_events,
+    infer_session_rationale, merge_source_steps_into, resolve_direct_anchor, resolve_file_anchor,
+    resolve_file_line_anchor, resolve_file_range_anchor, source_sessions_to_steps, ActivityChunk,
+    CausalChain, InferredRelation, LocalStore, MetadataDb, SourceFileSessionBlameQuery,
+    SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -562,6 +562,7 @@ pub(crate) fn finalize_explain_chain(
     if let Some(path) = anchored_path {
         refine_source_session_times(&mut chain, store.repo_root(), path);
     }
+    heal_missing_source_session_chunks(store, &chain);
     // For steps that have a resolved transcript but no asserted (`explicit`) note,
     // recover the turn's final assistant message as an `observed` rationale, so
     // ingested history isn't left with WHO/WHEN but zero WHY. Never overrides an
@@ -1123,6 +1124,58 @@ fn build_transcript_index(
         }
     }
     index
+}
+
+fn heal_missing_source_session_chunks(store: &LocalStore, chain: &CausalChain) {
+    let Ok(metadata_db) = MetadataDb::open_global() else {
+        return;
+    };
+    let Ok(event_store) = store.event_store() else {
+        return;
+    };
+    let repo_id = store.repo_id();
+    for step in &chain.steps {
+        let Some(transcript) = step.transcript.as_ref() else {
+            continue;
+        };
+        let (Some(source), Some(session_id)) = (
+            transcript.source.as_deref(),
+            transcript.session_id.as_deref(),
+        ) else {
+            continue;
+        };
+        if event_store
+            .read_session_chunks(source, session_id)
+            .is_ok_and(|chunks| !chunks.is_empty())
+        {
+            continue;
+        }
+        let Ok(Some(record)) = metadata_db.get_source_session(source, session_id) else {
+            continue;
+        };
+        let chunks = metadata_db
+            .list_source_session_chunks(source, session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<ActivityChunk>(row.raw_json).ok())
+            .collect::<Vec<_>>();
+        if chunks.is_empty() {
+            continue;
+        }
+        let Ok(event) = build_source_session_event_with_chunks(
+            ActorRef {
+                actor_type: ActorType::Agent,
+                actor_id: record.source_id.clone(),
+                display_name: Some(record.source_id.clone()),
+            },
+            &record,
+            &repo_id,
+            &chunks,
+        ) else {
+            continue;
+        };
+        let _ = event_store.append_event(&repo_id, &event);
+    }
 }
 
 fn refine_source_session_times(
