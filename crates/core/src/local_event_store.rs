@@ -202,6 +202,26 @@ impl LocalEventStore {
             .context("failed to count local events")
     }
 
+    pub fn repo_ids(&self) -> Result<Vec<String>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open(&self.path)
+            .with_context(|| format!("failed to open local event DB at {}", self.path.display()))?;
+        create_schema(&connection)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT repo_id FROM brick_events
+             WHERE repo_id IS NOT NULL AND repo_id <> ''
+             ORDER BY repo_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut repo_ids = Vec::new();
+        for row in rows {
+            repo_ids.push(row.context("failed to read local event repo id")?);
+        }
+        Ok(repo_ids)
+    }
+
     pub fn read_session_chunks(
         &self,
         source_id: &str,

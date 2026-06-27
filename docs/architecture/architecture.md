@@ -12,11 +12,11 @@ This document defines the current Brick storage and history architecture. The na
 | --- | --- | --- | --- |
 | Native source storage | The original storage owned by Cursor, Claude Code, Codex, OpenCode, ORGII, or another source app. | Yes, outside Brick | No |
 | Source metadata index | Brick's normalized metadata rows for external sessions, roots, paths, fingerprints, parser versions, and links. Stored in `<BRICK_HOME>/metadata.sqlite`. | Yes as Brick local metadata | Yes from native sources where available |
-| Provenance ledger | Brick's append-only accountability events. Stored as JSONL events. | Yes | No |
-| Derived query views | `index.json`, `brick.sqlite`, and Markdown `views/` rebuilt from the provenance ledger. | No | Yes |
+| Local event/chunk DB | Brick's append-only accountability events plus normalized source-session transcript chunks. Stored in `<BRICK_HOME>/brick.sqlite`. | Yes | No |
+| Derived query views | `index.json`, `query-cache.sqlite`, and Markdown `views/` rebuilt from the local event/chunk DB. | No | Yes |
 | Evidence blobs | Optional copied full transcript/log/attachment bytes in content-addressed storage. | Yes when explicitly copied | No |
 
-Avoid using “cache” for `metadata.sqlite` in product architecture. Use “metadata index” or “source metadata index”. “Cache” is still acceptable for repo-local derived query files such as `index.json` and `brick.sqlite`, because those are disposable projections of the provenance ledger.
+Avoid using “cache” for `metadata.sqlite` in product architecture. Use “metadata index” or “source metadata index”. “Cache” is still acceptable for derived query files such as `index.json` and `query-cache.sqlite`, because those are disposable projections of the local event/chunk DB.
 
 ## Source-of-truth boundaries
 
@@ -26,8 +26,8 @@ flowchart TD
     Native -->|lazy chunk load<br/>no default copy| History[brick history JSON API]
     Metadata -->|list sessions<br/>recent paths<br/>source filters| History
 
-    CLI[brick write commands] -->|append TraceEvent JSONL| Ledger[Provenance ledger<br/>events/queue + events/inbound]
-    Ledger -->|rebuild| Derived[Derived query views<br/>index.json<br/>brick.sqlite<br/>views/*.md]
+    CLI[brick write commands] -->|append TraceEvent| EventDB[(BRICK_HOME/brick.sqlite<br/>Local event/chunk DB)]
+    EventDB -->|rebuild| Derived[Derived query views<br/>index.json<br/>query-cache.sqlite<br/>views/*.md]
 
     Native -. explicit copy only .-> Blobs[Content-addressed evidence blobs]
     CLI -. explicit attach/copy .-> Blobs
@@ -37,8 +37,8 @@ Key points:
 
 - Native source storage remains the raw transcript/source-of-truth for external app history.
 - `metadata.sqlite` stores normalized source metadata, not full transcripts by default.
-- Brick JSONL events are the durable provenance claims.
-- Derived query views can be deleted and rebuilt from Brick JSONL events.
+- Brick events and source-session chunks in `<BRICK_HOME>/brick.sqlite` are the durable provenance store.
+- Derived query views can be deleted and rebuilt from the local event/chunk DB.
 - Evidence blobs exist only when the user explicitly copies/uploads full content.
 
 ## Local storage layout
@@ -48,26 +48,19 @@ flowchart LR
     subgraph Global[Global Brick home]
         Home[BRICK_HOME<br/>default ~/.brick]
         Metadata[(metadata.sqlite<br/>source metadata index)]
+        EventDB[(brick.sqlite<br/>local event/chunk DB)]
         OptionalBlobs[blobs/<sha256><br/>optional copied evidence]
+        Query[repos/&lt;repo_id&gt;/provenance/cache/index.json<br/>repos/&lt;repo_id&gt;/provenance/cache/query-cache.sqlite<br/>repos/&lt;repo_id&gt;/provenance/views/*.md]
         Home --> Metadata
+        Home --> EventDB
         Home --> OptionalBlobs
+        EventDB --> Query
     end
 
-    subgraph Repo[Per-repo store under the global home]
-        DotBrick["repos/&lt;repo_id&gt;/provenance/"]
-        Config[config.toml<br/>sources/*.toml]
-        Events[provenance/events/*.jsonl<br/>append-only ledger]
-        Query[provenance/cache/index.json<br/>provenance/cache/brick.sqlite<br/>provenance/views/*.md]
-        DotBrick --> Config
-        DotBrick --> Events
-        Events --> Query
-    end
-
-    Config -->|source roots and defaults| Metadata
-    Events -->|rebuild projections| Query
+    Config[repos/&lt;repo_id&gt;/provenance/config.toml<br/>sources/*.toml] -->|source roots and defaults| Metadata
 ```
 
-Storage is zero-config and fully under the global Brick home: there is no `brick init` and nothing is written into the working tree. Each repository's provenance ledger and derived caches live under `<BRICK_HOME>/repos/<repo_id>/provenance/`, where `repo_id` is derived from the repository's canonical root path. Source profiles are optional — when none are configured, sources are auto-discovered on demand.
+Storage is zero-config and fully under the global Brick home: there is no `brick init` and nothing is written into the working tree. Durable events and chunks live in `<BRICK_HOME>/brick.sqlite`; each repository's derived caches live under `<BRICK_HOME>/repos/<repo_id>/provenance/`, where `repo_id` is derived from the repository's canonical root path. Source profiles are optional — when none are configured, sources are auto-discovered on demand.
 
 ## History read path
 
@@ -102,20 +95,20 @@ sequenceDiagram
     participant User as User / Agent
     participant CLI as brick CLI
     participant Git as Git repo
-    participant Ledger as JSONL provenance ledger
+    participant EventDB as local event/chunk DB
     participant Views as derived query views
 
     User->>CLI: brick artifact/evidence/session command
     CLI->>Git: capture repo context when relevant
     Git-->>CLI: branch, commit, dirty state, diff stats
-    CLI->>Ledger: append TraceEvent JSONL
+    CLI->>EventDB: append TraceEvent + chunks
     CLI-->>User: IDs and status
     User->>CLI: brick maintenance index/db rebuild
-    CLI->>Ledger: read local + inbound events
-    CLI->>Views: rebuild index.json, brick.sqlite, Markdown views
+    CLI->>EventDB: read repo-scoped events
+    CLI->>Views: rebuild index.json, query-cache.sqlite, Markdown views
 ```
 
-The provenance ledger is not a metadata index and should not be mutated during history scans. It records accountability claims: who did what, in which session, attached to which mission/artifact, with which evidence.
+The local event/chunk DB is not a metadata index and should not be mutated during history scans. It records accountability claims: who did what, in which session, attached to which mission/artifact, with which evidence. `source.session_observed` events store normalized transcript chunks in `brick_event_chunks` so sync and explain can read a single local source of truth.
 
 ## ORGII offload boundary
 

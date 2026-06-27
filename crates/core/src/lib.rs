@@ -60,8 +60,6 @@ pub use store_options::*;
 
 pub const BRICK_DIR: &str = ".brick";
 pub const PROVENANCE_DIR: &str = ".brick/provenance";
-pub const QUEUE_DIR: &str = "queue";
-pub const EVENTS_DIR: &str = "events";
 pub const CACHE_DIR: &str = "cache";
 pub const BLOBS_DIR: &str = "blobs";
 pub const VIEWS_DIR: &str = "views";

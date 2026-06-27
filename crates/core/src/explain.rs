@@ -191,25 +191,24 @@ pub fn source_sessions_to_steps(
     steps
 }
 
-/// Merges metadata source-session steps into an existing JSONL causal chain,
+/// Merges metadata source-session steps into existing event-derived causal steps,
 /// producing one unified timeline instead of an either/or fallback.
 ///
 /// Why this exists: a file's history is commonly *interleaved* — some changes
-/// were `link`ed into the JSONL ledger (the authoritative half) and some were
-/// only seen by an external tool's session db (the indexed half). A naive
-/// "use JSONL if non-empty, else metadata" drops every un-`link`ed change that
-/// happens to sit next to a `link`ed one. This merges both.
+/// are represented as Brick events and some are only seen by an external tool's
+/// session db projection. A naive "use events if non-empty, else metadata" drops
+/// observed source-session changes that sit next to event-derived ones. This
+/// merges both.
 ///
-/// Dedup key is `session_id`: a session that was BOTH `link`ed and indexed
+/// Dedup key is `session_id`: a session that was BOTH event-recorded and indexed
 /// appears in both sources, so any `source_steps` whose `session_id` already
-/// appears among `chain_steps` is dropped (the JSONL version carries more — an
-/// explicit note, mission, relation). When a JSONL step has NO `session_id`
-/// (the `link` call omitted `session`), we deliberately do NOT fuzzy-match:
-/// keeping a possible duplicate is correct, silently dropping a real change is
-/// not. Such pairs are still distinguishable by `confidence` (explicit vs
-/// observed).
+/// appears among `chain_steps` is dropped (the event version carries more — an
+/// explicit note, mission, relation). When an event-derived step has NO `session_id`,
+/// we deliberately do NOT fuzzy-match: keeping a possible duplicate is correct,
+/// silently dropping a real change is not. Such pairs are still distinguishable
+/// by `confidence` (explicit vs observed).
 ///
-/// Ordering note: JSONL `occurred_at` is the moment the change happened, but a
+/// Ordering note: event `occurred_at` is the moment the change happened, but a
 /// source-session step's `occurred_at` is `last_seen_at` — when the indexer last
 /// scanned it, NOT the change moment. Mixing them is acceptable (external
 /// sessions only ever carry coarse time) but means a source step can sort later

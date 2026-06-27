@@ -1,6 +1,6 @@
 # Codex Example
 
-Import Codex transcripts from explicit JSONL, text, or Markdown files. Brick records imported events with `confidence=imported` and appends them to the local JSONL queue.
+Import Codex transcripts from explicit JSONL, text, or Markdown files. Brick records imported events with `confidence=imported` and stores them in the unified local event/chunk DB.
 
 ```bash
 cargo run -p brick -- source configure --name codex --app-id codex --actor-id codex-agent --actor-type agent --session-log-path ./exports/codex-transcript.md --notes "Codex transcript imports"

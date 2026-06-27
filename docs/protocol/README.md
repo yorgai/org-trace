@@ -1,6 +1,6 @@
 # Protocol
 
-Brick uses an append-only JSONL event protocol locally and the same event envelope over the self-hosted HTTP sync API. Schema version `1` is the current MVP version.
+Brick uses an append-only event envelope stored locally in the unified SQLite event/chunk database and sent over the self-hosted HTTP sync API as JSON. Schema version `1` is the current MVP version.
 
 ## Event envelope
 
@@ -68,8 +68,7 @@ plus a transcript pointer to read the full session.
 The timeline is built from existing events — `diff.captured` change events
 resolved through line-level blame, plus the deduped indexed source sessions — so
 no separate edge event family is needed. The timeline is materialized at query
-time relative to an anchor + depth and is fully reproducible from the JSONL
-ledger and the source metadata index.
+time relative to an anchor + depth and is fully reproducible from the local event/chunk database and the source metadata index.
 
 ## Sync endpoints
 

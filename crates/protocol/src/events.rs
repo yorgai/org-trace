@@ -1,7 +1,7 @@
 //! Enumerations for trace event categories and provenance confidence.
 //!
 //! Event variants serialize to stable snake/dotted wire names. These values are
-//! part of the local JSONL protocol and should only change through an explicit
+//! part of the event wire schema and should only change through an explicit
 //! schema migration.
 
 use serde::{Deserialize, Serialize};

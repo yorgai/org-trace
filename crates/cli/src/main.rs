@@ -76,7 +76,6 @@ fn main() -> Result<()> {
                 args.remote,
                 args.repo_id,
                 args.org_id,
-                args.full,
                 args.all_repos,
             )?,
             SyncCommand::Push(args) => handle_push(
@@ -85,7 +84,6 @@ fn main() -> Result<()> {
                 args.remote,
                 args.repo_id,
                 args.org_id,
-                args.full,
                 args.all_repos,
             )?,
             SyncCommand::Pull(args) => {

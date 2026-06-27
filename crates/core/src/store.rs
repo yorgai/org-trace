@@ -177,7 +177,7 @@ impl LocalStore {
             .read_events_for_repo(Some(&self.repo_id()))
     }
 
-    /// Returns all locally known event IDs across queued and inbound events.
+    /// Returns all locally known event IDs in the unified event/chunk database.
     pub fn known_event_ids(&self) -> Result<BTreeSet<Uuid>> {
         Ok(event_id_set(&self.read_all_events()?))
     }
@@ -199,7 +199,7 @@ impl LocalStore {
         Ok(store.path().to_path_buf())
     }
 
-    /// Returns the newest known events after loading local and inbound event logs.
+    /// Returns the newest known events from the unified event/chunk database.
     pub fn recent_events(&self, limit: usize) -> Result<Vec<TraceEvent>> {
         let mut events = self.read_all_events()?;
         let keep = limit.min(events.len());
@@ -245,7 +245,7 @@ impl LocalStore {
         Ok(())
     }
 
-    /// Rebuilds the derived inspection index from local and inbound events.
+    /// Rebuilds the derived inspection index from local event DB rows.
     pub fn rebuild_index(&self) -> Result<TraceIndex> {
         self.init()?;
         let events = self.read_all_events()?;

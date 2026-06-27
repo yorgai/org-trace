@@ -18,7 +18,7 @@ use uuid::Uuid;
 /// query value.
 pub type EventCursor = String;
 
-/// Request body for pushing locally queued events to a remote trace server.
+/// Request body for pushing locally stored events to a remote trace server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PushEventsRequest {
     pub events: Vec<TraceEvent>,

@@ -62,26 +62,15 @@ fn auto_pull(store: &LocalStore) -> Result<()> {
 
 fn auto_push(store: &LocalStore) -> Result<()> {
     let repo_id = repo_id_for_root(store.repo_root());
-    let repo_path = canonical_repo_path(store);
-    let metadata_db = MetadataDb::open_global().ok();
-    let since = metadata_db
-        .as_ref()
-        .and_then(|db| db.get_sync_watermark(&repo_id).ok().flatten());
-    let collected = collect_push_events(
-        store,
-        metadata_db.as_ref(),
-        repo_path.as_deref(),
-        since.as_deref(),
-        true,
-    )?;
-    if collected.events.is_empty() {
+    let events = collect_push_events(store, Some(&repo_id))?;
+    if events.is_empty() {
         return Ok(());
     }
     let identity = identity::refresh_if_needed()?;
     let remote = auto_sync_remote();
     let org_id = std::env::var("BRICK_SYNC_ORG_ID").ok();
     let request = PushEventsRequest {
-        events: scoped_events(collected.events, Some(&repo_id), org_id.as_deref())?,
+        events: scoped_events(events, Some(&repo_id), org_id.as_deref())?,
     };
     if supabase::is_supabase_remote(&remote) {
         supabase::SupabaseRemote::from_env()?.push_events(
@@ -97,54 +86,13 @@ fn auto_push(store: &LocalStore) -> Result<()> {
             Some(&identity.access_token),
         )?;
     };
-    advance_watermark(&repo_id, collected.max_last_seen_at);
     Ok(())
 }
 
-/// The events collected for one push pass plus the high-water `last_seen_at` of
-/// the source-sessions included, so the caller can advance the sync watermark.
-struct CollectedPushEvents {
-    events: Vec<TraceEvent>,
-    max_last_seen_at: Option<String>,
-}
-
-/// Gathers events to push for one repo from the unified local event/chunk DB.
-/// Source sessions are imported into that DB by the normal refresh path, so sync
-/// no longer re-synthesizes source events from metadata or hydrates chunks here.
-fn collect_push_events(
-    store: &LocalStore,
-    _metadata_db: Option<&MetadataDb>,
-    _repo_path: Option<&str>,
-    _since: Option<&str>,
-    include_local_events: bool,
-) -> Result<CollectedPushEvents> {
-    let events = if include_local_events {
-        store.read_local_events()?
-    } else {
-        Vec::new()
-    };
-    Ok(CollectedPushEvents {
-        events,
-        max_last_seen_at: None,
-    })
-}
-
-/// Canonicalized repo root path string, matched against `source_sessions.repo_path`.
-fn canonical_repo_path(store: &LocalStore) -> Option<String> {
-    let root = store.repo_root();
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    Some(canonical.display().to_string())
-}
-
-/// Best-effort: persist the new outbound-sync high-water mark. A failure here
-/// only means the next push re-sends already-uploaded (idempotent) events.
-fn advance_watermark(repo_id: &str, max_last_seen_at: Option<String>) {
-    let Some(max) = max_last_seen_at else {
-        return;
-    };
-    if let Ok(mut db) = MetadataDb::open_global() {
-        let _ = db.set_sync_watermark(repo_id, &max);
-    }
+fn collect_push_events(store: &LocalStore, repo_id: Option<&str>) -> Result<Vec<TraceEvent>> {
+    store
+        .event_store()?
+        .read_events_for_repo_with_chunks(repo_id)
 }
 
 fn auto_sync_remote() -> String {
@@ -171,7 +119,6 @@ pub fn handle_push(
     remote: Option<String>,
     repo_id: Option<String>,
     org_id: Option<String>,
-    full: bool,
     all_repos: bool,
 ) -> Result<()> {
     let remote = normalized_remote(remote);
@@ -189,38 +136,19 @@ pub fn handle_push(
         );
     }
     let repo_id = repo_id.unwrap_or_else(|| repo_id_for_root(store.repo_root()));
-    let metadata_db = MetadataDb::open_global().ok();
 
-    // Per-repo target list. Default: just the current repo. `--all-repos` fans
-    // out to every repo_path metadata has indexed (each pushed under its own
-    // repo_id), which is how source-sessions from OTHER repos get uploaded.
-    let targets = push_targets(store, metadata_db.as_ref(), &repo_id, all_repos);
+    let targets = push_targets(store, &repo_id, all_repos)?;
 
     if dry_run {
         let mut total = 0usize;
         for target in &targets {
-            let since = if full {
-                None
-            } else {
-                metadata_db
-                    .as_ref()
-                    .and_then(|db| db.get_sync_watermark(&target.repo_id).ok().flatten())
-            };
-            let collected = collect_push_events(
-                store,
-                metadata_db.as_ref(),
-                target.repo_path.as_deref(),
-                since.as_deref(),
-                target.include_local_events,
-            )?;
-            total += collected.events.len();
+            total += collect_push_events(store, Some(&target.repo_id))?.len();
         }
         println!("push_dry_run=true");
         println!("remote={remote}");
         println!("repo_id={repo_id}");
         println!("org_id={}", org_id.as_deref().unwrap_or(""));
         println!("all_repos={all_repos}");
-        println!("full={full}");
         println!("collected_event_count={total}");
         return Ok(());
     }
@@ -233,25 +161,12 @@ pub fn handle_push(
 
     let mut total_pushed = 0usize;
     for target in &targets {
-        let since = if full {
-            None
-        } else {
-            metadata_db
-                .as_ref()
-                .and_then(|db| db.get_sync_watermark(&target.repo_id).ok().flatten())
-        };
-        let collected = collect_push_events(
-            store,
-            metadata_db.as_ref(),
-            target.repo_path.as_deref(),
-            since.as_deref(),
-            target.include_local_events,
-        )?;
-        if collected.events.is_empty() {
+        let events = collect_push_events(store, Some(&target.repo_id))?;
+        if events.is_empty() {
             continue;
         }
         let request = PushEventsRequest {
-            events: scoped_events(collected.events, Some(&target.repo_id), org_id.as_deref())?,
+            events: scoped_events(events, Some(&target.repo_id), org_id.as_deref())?,
         };
         let response = if supabase::is_supabase_remote(&remote) {
             supabase::SupabaseRemote::from_env()?.push_events(
@@ -269,7 +184,6 @@ pub fn handle_push(
         };
         total_pushed += request.events.len();
         print_push_result(&response, request.events.len());
-        advance_watermark(&target.repo_id, collected.max_last_seen_at);
     }
     if total_pushed == 0 {
         println!("pushed_event_count=0");
@@ -277,47 +191,27 @@ pub fn handle_push(
     Ok(())
 }
 
-/// One repo to push: its `repo_id` (for scoping/watermark), the canonical
-/// `repo_path` string used to filter indexed source metadata, and whether this
-/// target should include local events from the unified event store.
 struct PushTarget {
     repo_id: String,
-    repo_path: Option<String>,
-    include_local_events: bool,
 }
 
-/// Builds the list of repos to push. The current repo always comes first and is
-/// the only target that includes local events. `--all-repos` appends one target
-/// per distinct indexed `repo_path` whose repo_id differs from the current repo.
 fn push_targets(
     store: &LocalStore,
-    metadata_db: Option<&MetadataDb>,
     current_repo_id: &str,
     all_repos: bool,
-) -> Vec<PushTarget> {
-    let mut targets = vec![PushTarget {
-        repo_id: current_repo_id.to_string(),
-        repo_path: canonical_repo_path(store),
-        include_local_events: true,
-    }];
-    if !all_repos {
-        return targets;
-    }
-    let Some(db) = metadata_db else {
-        return targets;
-    };
-    for path in db.list_distinct_repo_paths().unwrap_or_default() {
-        let repo_id = repo_id_for_root(std::path::Path::new(&path));
-        if repo_id == current_repo_id {
-            continue;
+) -> Result<Vec<PushTarget>> {
+    let mut repo_ids = vec![current_repo_id.to_string()];
+    if all_repos {
+        for repo_id in store.event_store()?.repo_ids()? {
+            if !repo_ids.contains(&repo_id) {
+                repo_ids.push(repo_id);
+            }
         }
-        targets.push(PushTarget {
-            repo_id,
-            repo_path: Some(path),
-            include_local_events: false,
-        });
     }
-    targets
+    Ok(repo_ids
+        .into_iter()
+        .map(|repo_id| PushTarget { repo_id })
+        .collect())
 }
 
 /// Handles `pull` by storing previously unknown remote events in the local event store.
@@ -354,20 +248,11 @@ pub fn handle_sync(
     remote: Option<String>,
     repo_id: Option<String>,
     org_id: Option<String>,
-    full: bool,
     all_repos: bool,
 ) -> Result<()> {
     let remote = normalized_remote(remote);
     handle_pull(store, dry_run, Some(remote.clone()), repo_id.clone())?;
-    handle_push(
-        store,
-        dry_run,
-        Some(remote),
-        repo_id,
-        org_id,
-        full,
-        all_repos,
-    )?;
+    handle_push(store, dry_run, Some(remote), repo_id, org_id, all_repos)?;
     Ok(())
 }
 
@@ -478,7 +363,7 @@ struct PullOutcome {
     remote_event_count: usize,
     pulled_event_count: usize,
     duplicate_count: usize,
-    inbound_path: Option<String>,
+    event_store_path: Option<String>,
 }
 
 fn pull_events(
@@ -495,7 +380,7 @@ fn pull_events(
         ingest_pulled_source_sessions(pulled_events)?
     };
     let pulled_event_count = pulled_events.len();
-    let inbound_path = if dry_run || pulled_events.is_empty() {
+    let event_store_path = if dry_run || pulled_events.is_empty() {
         None
     } else {
         Some(
@@ -510,7 +395,7 @@ fn pull_events(
         remote_event_count,
         pulled_event_count,
         duplicate_count,
-        inbound_path,
+        event_store_path,
     })
 }
 
@@ -606,8 +491,8 @@ fn print_pull_result(remote: &str, repo_id: Option<&str>, dry_run: bool, outcome
     println!("duplicate_count={}", outcome.duplicate_count);
     if !dry_run {
         println!(
-            "inbound_path={}",
-            outcome.inbound_path.as_deref().unwrap_or("")
+            "event_store_path={}",
+            outcome.event_store_path.as_deref().unwrap_or("")
         );
     }
 }
@@ -795,11 +680,10 @@ mod tests {
         .expect("build event");
 
         store.append_event(&event).expect("append source event");
-        let repo_path = canonical_repo_path(&store);
-        let collected = collect_push_events(&store, None, repo_path.as_deref(), None, true)
-            .expect("collect local events");
+        let collected =
+            collect_push_events(&store, Some(&store.repo_id())).expect("collect local events");
 
-        let normalized = collected.events[0].payload["normalized_chunks"]
+        let normalized = collected[0].payload["normalized_chunks"]
             .as_array()
             .expect("normalized chunks present from local event store");
         assert_eq!(normalized.len(), 1);
@@ -861,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_pull_dedupes_without_writing_inbound_events() {
+    fn dry_run_pull_dedupes_without_writing_event_store() {
         let repo_root = temp_repo_root("dry-run-pull");
         let store = LocalStore::new(&repo_root);
         let local_event = event("local");
@@ -876,7 +760,7 @@ mod tests {
         assert_eq!(outcome.remote_event_count, 2);
         assert_eq!(outcome.pulled_event_count, 1);
         assert_eq!(outcome.duplicate_count, 1);
-        assert_eq!(outcome.inbound_path, None);
+        assert_eq!(outcome.event_store_path, None);
     }
 
     #[test]
@@ -920,20 +804,16 @@ mod tests {
             .append_event(&event("native mission"))
             .expect("append");
 
-        let repo_path = canonical_repo_path(&store);
-        let collected =
-            collect_push_events(&store, None, repo_path.as_deref(), None, true).expect("collect");
+        let collected = collect_push_events(&store, Some(&store.repo_id())).expect("collect");
 
-        assert_eq!(collected.events.len(), 1);
+        assert_eq!(collected.len(), 1);
         assert_eq!(
-            collected.events[0].event_type,
+            collected[0].event_type,
             brick_protocol::EventType::MissionCreated
         );
-        assert!(collected.max_last_seen_at.is_none());
 
-        let no_queue =
-            collect_push_events(&store, None, repo_path.as_deref(), None, false).expect("no queue");
-        assert!(no_queue.events.is_empty());
+        let empty_repo = collect_push_events(&store, Some("missing-repo")).expect("missing repo");
+        assert!(empty_repo.is_empty());
 
         let _ = fs::remove_dir_all(&repo_root);
     }
@@ -951,7 +831,6 @@ mod tests {
             Some("http://127.0.0.1:7821".to_string()),
             None,
             None,
-            false,
             false,
         );
         assert!(

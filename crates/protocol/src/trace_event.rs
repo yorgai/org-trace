@@ -1,4 +1,4 @@
-//! Event envelope and constructors for the Brick JSONL protocol.
+//! Event envelope and constructors for Brick's append-only protocol.
 //!
 //! Constructors attach typed entity IDs to the generic envelope and serialize
 //! typed payload structs into the JSON payload slot. This keeps local writes
@@ -23,7 +23,7 @@ use crate::{
 /// Current protocol schema version for event envelopes and typed payloads.
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
 
-/// Append-only provenance event persisted in local JSONL and future remotes.
+/// Append-only provenance event persisted in local and remote event stores.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub event_id: Uuid,

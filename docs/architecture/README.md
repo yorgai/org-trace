@@ -8,7 +8,7 @@ See `architecture.md` for the source metadata index architecture, naming glossar
 
 Phase 14 completes the MVP documentation and end-to-end smoke harness around the implemented surface:
 
-- Local JSONL trace recording for missions, sessions, artifacts, repo contexts, diffs, logs, and imports.
+- Unified local SQLite event/chunk storage for missions, sessions, artifacts, repo contexts, diffs, logs, and imports.
 - Source profiles for stable app/actor defaults and optional store-root selection.
 - Content-addressed blob storage for artifact attachments and session logs.
 - Rebuildable JSON and SQLite local derived indexes for read-only inspection.

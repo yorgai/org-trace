@@ -128,7 +128,7 @@ pub struct SqliteAttachmentRecord {
     pub uploaded_at: String,
 }
 
-/// Rebuilds a SQLite cache at `path` from queued events and the derived graph index.
+/// Rebuilds a SQLite cache at `path` from event DB rows and the derived graph index.
 pub fn rebuild_sqlite_index(path: &Path, events: &[TraceEvent], index: &TraceIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {

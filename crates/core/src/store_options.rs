@@ -85,7 +85,7 @@ pub fn resolve_storage_root(
         });
     }
 
-    // Zero-config default: the provenance ledger lives in the global Brick home
+    // Zero-config default: per-repo derived files live in the global Brick home
     // (`~/.brick/repos/<repo_id>/provenance`), NOT under the user's working tree.
     // A user has exactly one `~/.brick`; nothing is written into the repo. Falls
     // back to a repo-local path only if the global home cannot be resolved.
