@@ -9,6 +9,7 @@
 //! Protocol invariant: stdout carries ONLY JSON-RPC; every diagnostic goes to
 //! stderr. A stray println on stdout corrupts the framing and breaks the client.
 
+use std::fs;
 use std::io::{BufRead, Write};
 use std::str::FromStr;
 
@@ -17,8 +18,8 @@ use brick_core::{
     build_source_session_event_with_chunks, discover_repo_root, explain_from_events,
     infer_session_rationale, merge_source_steps_into, resolve_direct_anchor, resolve_file_anchor,
     resolve_file_line_anchor, resolve_file_range_anchor, source_sessions_to_steps, ActivityChunk,
-    CausalChain, InferredRelation, LocalStore, MetadataDb, SourceFileSessionBlameQuery,
-    SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
+    CausalChain, InferredRelation, LocalStore, MetadataDb, SourceFileLineProvenanceQuery,
+    SourceFileSessionBlameQuery, SourceProfileStore, DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH,
 };
 use brick_protocol::{
     ActorRef, ActorType, ArtifactCreatedPayload, ArtifactFileRefRecordedPayload, ArtifactId,
@@ -433,6 +434,104 @@ pub(crate) fn merge_index_sessions_into_chain(
     fallback_count
 }
 
+pub(crate) fn merge_index_line_provenance_into_chain(
+    chain: &mut CausalChain,
+    repo_root: &std::path::Path,
+    anchored_path: &str,
+    selected_text: &str,
+    line_number: Option<u64>,
+    depth: usize,
+) -> Option<String> {
+    let line = selected_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let repo_root = repo_root.to_path_buf();
+    let abs_path = if std::path::Path::new(anchored_path).is_absolute() {
+        anchored_path.to_string()
+    } else {
+        repo_root.join(anchored_path).display().to_string()
+    };
+    let db = MetadataDb::open_global().ok()?;
+    let query = SourceFileLineProvenanceQuery {
+        file_path: abs_path,
+        line_text: line.to_string(),
+        line_number,
+        source_id: None,
+        repo_path: Some(repo_root),
+        limit: depth.clamp(DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH),
+    };
+    let rows = db.query_source_file_line_provenance(&query).ok()?;
+    let source_rows: Vec<_> = rows.iter().map(|record| record.row.clone()).collect();
+    let source_steps = source_sessions_to_steps(&source_rows, 0);
+    if source_steps.is_empty() {
+        return None;
+    }
+    let confidence = source_rows
+        .iter()
+        .filter_map(|row| row.confidence.as_deref())
+        .min_by_key(|confidence| match *confidence {
+            "exact_edit_hunk" => 0,
+            "exact_diff_hunk" => 1,
+            "text_match_edit_tool" => 2,
+            "text_match_diff_output" => 3,
+            _ => 4,
+        })
+        .unwrap_or("exact_edit_hunk")
+        .to_string();
+    merge_source_steps_into(&mut chain.steps, source_steps);
+    chain.anchor.resolved_events = chain.steps.iter().map(|s| s.event_id.clone()).collect();
+    chain.anchor.blame_confidence = Some(confidence.clone());
+    Some(confidence)
+}
+
+pub(crate) fn merge_index_text_matches_into_chain(
+    chain: &mut CausalChain,
+    repo_root: &std::path::Path,
+    anchored_path: &str,
+    selected_text: &str,
+    depth: usize,
+) -> bool {
+    let repo_root = repo_root.to_path_buf();
+    let abs_path = if std::path::Path::new(anchored_path).is_absolute() {
+        anchored_path.to_string()
+    } else {
+        repo_root.join(anchored_path).display().to_string()
+    };
+    let Ok(db) = MetadataDb::open_global() else {
+        return false;
+    };
+    let query = SourceFileSessionBlameQuery {
+        file_path: abs_path,
+        source_id: None,
+        repo_path: Some(repo_root),
+        limit: depth.clamp(DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH),
+    };
+    let Ok(rows) = db.query_source_file_session_text_match(&query, selected_text) else {
+        return false;
+    };
+    let source_steps = source_sessions_to_steps(&rows, 0);
+    if source_steps.is_empty() {
+        return false;
+    }
+    let confidence = rows
+        .iter()
+        .filter_map(|row| row.confidence.as_deref())
+        .min_by_key(|confidence| match *confidence {
+            "exact_edit_hunk" => 0,
+            "exact_diff_hunk" => 1,
+            "text_match_edit_tool" => 2,
+            "text_match_diff_output" => 3,
+            _ => 4,
+        })
+        .unwrap_or("exact_diff_hunk")
+        .to_string();
+    merge_source_steps_into(&mut chain.steps, source_steps);
+    chain.anchor.resolved_events = chain.steps.iter().map(|s| s.event_id.clone()).collect();
+    chain.anchor.blame_confidence = Some(confidence);
+    true
+}
+
 /// `explain` dispatch: resolve the anchor (file:line via blame, or a direct id),
 /// walk the causal graph, then enrich with transcript pointers and the `live`
 /// coordination field.
@@ -472,17 +571,19 @@ fn explain_tool_call(
 
     // file:line and file:start-end anchors need git + the working tree; direct
     // ids do not.
-    let (anchor, anchored_path, is_file_line) =
+    let (anchor, anchored_path, is_file_line, selected_text, line_number) =
         if let Some((path, start, end)) = parse_file_range(&anchor_input) {
             let repo_root = store.repo_root().to_path_buf();
             let rel_path = normalize_repo_relative(&repo_root, &path);
             let anchor = resolve_file_range_anchor(store, &repo_root, &rel_path, start, end)?;
-            (anchor, Some(rel_path), true)
+            let selected_text = read_line_selection(&repo_root, &rel_path, start, end);
+            (anchor, Some(rel_path), true, selected_text, Some(start))
         } else if let Some((path, line)) = parse_file_line(&anchor_input) {
             let repo_root = store.repo_root().to_path_buf();
             let rel_path = normalize_repo_relative(&repo_root, &path);
             let anchor = resolve_file_line_anchor(store, &repo_root, &rel_path, line)?;
-            (anchor, Some(rel_path), true)
+            let selected_text = read_line_selection(&repo_root, &rel_path, line, line);
+            (anchor, Some(rel_path), true, selected_text, Some(line))
         } else if looks_like_path(&anchor_input) {
             // A whole-file anchor (no `:line`) — agents very often ask about a file,
             // not a line. Match the file's change events directly instead of treating
@@ -492,22 +593,64 @@ fn explain_tool_call(
                 resolve_file_anchor(&events, &rel_path),
                 Some(rel_path),
                 false,
+                None,
+                None,
             )
         } else {
-            (resolve_direct_anchor(&events, &anchor_input), None, false)
+            (
+                resolve_direct_anchor(&events, &anchor_input),
+                None,
+                false,
+                None,
+                None,
+            )
         };
 
     let mut chain = explain_from_events(&events, anchor, depth.min(MAX_EXPLAIN_DEPTH));
+    let line_provenance_found = if is_file_line {
+        match (anchored_path.as_deref(), selected_text.as_deref()) {
+            (Some(path), Some(text)) => merge_index_line_provenance_into_chain(
+                &mut chain,
+                store.repo_root(),
+                path,
+                text,
+                line_number,
+                depth,
+            )
+            .is_some(),
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let text_match_found = if is_file_line && !line_provenance_found {
+        match (anchored_path.as_deref(), selected_text.as_deref()) {
+            (Some(path), Some(text)) => merge_index_text_matches_into_chain(
+                &mut chain,
+                store.repo_root(),
+                path,
+                text,
+                depth,
+            ),
+            _ => false,
+        }
+    } else {
+        false
+    };
     // One db, one explain: when a WHOLE-FILE anchor has no recorded trace events,
     // the metadata db's indexed `source_sessions` ARE the chain. Shared with the
     // CLI `explain` command so both entry points behave identically.
-    let index_session_hint = merge_index_sessions_into_chain(
-        &mut chain,
-        store.repo_root(),
-        anchored_path.as_deref(),
-        is_file_line,
-        depth,
-    );
+    let index_session_hint = if line_provenance_found || text_match_found {
+        None
+    } else {
+        merge_index_sessions_into_chain(
+            &mut chain,
+            store.repo_root(),
+            anchored_path.as_deref(),
+            is_file_line,
+            depth,
+        )
+    };
     let value = finalize_explain_chain(
         chain,
         store,
@@ -580,7 +723,7 @@ pub(crate) fn finalize_explain_chain(
         if let Value::Object(map) = &mut value {
             let note = match index_session_hint {
                 Some(count) => format!(
-                    "Brick found {count} indexed session(s) that touched this file, but none resolved to this exact line. Treat this as usable file-level provenance; prefer reading the session transcript before falling back to git/grep."
+                    "Brick found {count} indexed session(s) that touched this file, but none resolved to this exact line. Treat this as weak file-level provenance, not a line-level WHY answer; read the transcript or fall back to git/grep."
                 ),
                 None => "No Brick record for this anchor yet. Brick only records causal \
 edges for changes made while it was installed; fall back to git/grep here. As \
@@ -594,7 +737,7 @@ more changes flow through Brick, explain gets richer."
             map.insert(
                 "note".to_string(),
                 json!(format!(
-                    "Brick found {count} real file-level session(s) for this anchor. The chain is useful provenance even without exact line ownership; read transcript.read_session for the relevant step before concluding root cause."
+                    "Brick found {count} file-level session(s) for this line/range anchor, but exact line ownership was not available. This is weak provenance, not a real line-level WHY answer; read transcript.read_session and fall back to git/grep when it does not explain the code."
                 )),
             );
         }
@@ -626,16 +769,30 @@ fn add_explain_agent_guidance(value: &mut Value, index_session_hint: Option<usiz
         .map(str::to_string);
     let preview_command = first_transcript.and_then(read_session_preview_command_from_pointer);
 
+    let evidence_kind = map
+        .get("anchor")
+        .and_then(|anchor| anchor.get("blame_confidence"))
+        .and_then(Value::as_str);
+    let brick_result = if index_session_hint.is_some() {
+        "weak_file_level_provenance"
+    } else {
+        "useful_provenance_found"
+    };
+    let file_level_fallback = index_session_hint.map(|count| {
+        json!({
+            "session_count": count,
+            "meaning": "Exact line ownership was not available. These sessions only touched the file, so this is a weak clue rather than a real line-level WHY answer."
+        })
+    });
+
     map.insert(
         "interpretation".to_string(),
         json!({
-            "brick_result": "useful_provenance_found",
+            "brick_result": brick_result,
+            "evidence_kind": evidence_kind,
             "do_not_stop_at_step_note": true,
             "step_note_meaning": "A step.note is usually only the closing narration of that turn, not the root cause.",
-            "file_level_fallback": index_session_hint.map(|count| json!({
-                "session_count": count,
-                "meaning": "Exact line ownership was not available, but these sessions touched the file and are still useful for debugging."
-            }))
+            "file_level_fallback": file_level_fallback
         }),
     );
     map.insert(
@@ -1287,6 +1444,36 @@ fn normalize_repo_relative(repo_root: &std::path::Path, path: &str) -> String {
     path.trim_start_matches("./").to_string()
 }
 
+pub(crate) fn read_line_selection(
+    repo_root: &std::path::Path,
+    rel_path: &str,
+    line_start: u64,
+    line_end: u64,
+) -> Option<String> {
+    let (lo, hi) = if line_start <= line_end {
+        (line_start, line_end)
+    } else {
+        (line_end, line_start)
+    };
+    let path = if std::path::Path::new(rel_path).is_absolute() {
+        std::path::PathBuf::from(rel_path)
+    } else {
+        repo_root.join(rel_path)
+    };
+    let content = fs::read_to_string(path).ok()?;
+    let selected = content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_no = u64::try_from(index).ok()?.saturating_add(1);
+            (line_no >= lo && line_no <= hi).then_some(line.trim())
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!selected.is_empty()).then_some(selected)
+}
+
 /// Returns a trimmed non-empty string argument, or None.
 fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key)
@@ -1450,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn explain_guidance_marks_non_empty_chain_as_useful_and_points_to_transcript() {
+    fn explain_guidance_marks_file_level_fallback_as_weak_and_points_to_transcript() {
         let full_command = read_session_command("orgii", "session-1");
         let preview_command = read_session_preview_command("orgii", "session-1");
         let mut value = json!({
@@ -1469,7 +1656,7 @@ mod tests {
 
         assert_eq!(
             value["interpretation"]["brick_result"],
-            "useful_provenance_found"
+            "weak_file_level_provenance"
         );
         assert_eq!(value["interpretation"]["do_not_stop_at_step_note"], true);
         assert_eq!(
@@ -1487,6 +1674,29 @@ mod tests {
             value["next_action"]["required_before_concluding_root_cause"],
             true
         );
+    }
+
+    #[test]
+    fn explain_guidance_marks_exact_chain_as_useful() {
+        let full_command = read_session_command("orgii", "session-1");
+        let mut value = json!({
+            "causal_chain": [{
+                "depth": 0,
+                "transcript": {
+                    "read_session": full_command,
+                    "source": "orgii",
+                    "session_id": "session-1"
+                }
+            }]
+        });
+
+        add_explain_agent_guidance(&mut value, None);
+
+        assert_eq!(
+            value["interpretation"]["brick_result"],
+            "useful_provenance_found"
+        );
+        assert!(value["interpretation"]["file_level_fallback"].is_null());
     }
 
     #[test]

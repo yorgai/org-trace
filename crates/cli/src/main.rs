@@ -230,7 +230,7 @@ fn handle_explain(
     let events = store.read_all_events()?;
     let depth = depth.unwrap_or(brick_core::DEFAULT_EXPLAIN_DEPTH);
 
-    let (resolved, anchored_path, is_file_line) =
+    let (resolved, anchored_path, is_file_line, selected_text) =
         if let Some((rel_path, start, end)) = parse_anchor_file_range(anchor) {
             let cwd = std::env::current_dir()?;
             let repo_root = discover_repo_root(&cwd)?;
@@ -238,10 +238,12 @@ fn handle_explain(
                 Ok(stripped) => stripped.to_string_lossy().into_owned(),
                 Err(_) => rel_path.trim_start_matches("./").to_string(),
             };
+            let selected_text = mcp::read_line_selection(&repo_root, &rel, start, end);
             (
                 brick_core::resolve_file_range_anchor(store, &repo_root, &rel, start, end)?,
                 Some(rel),
                 true,
+                selected_text,
             )
         } else if let Some((rel_path, line)) = parse_anchor_file_line(anchor) {
             let cwd = std::env::current_dir()?;
@@ -250,10 +252,12 @@ fn handle_explain(
                 Ok(stripped) => stripped.to_string_lossy().into_owned(),
                 Err(_) => rel_path.trim_start_matches("./").to_string(),
             };
+            let selected_text = mcp::read_line_selection(&repo_root, &rel, line, line);
             (
                 brick_core::resolve_file_line_anchor(store, &repo_root, &rel, line)?,
                 Some(rel),
                 true,
+                selected_text,
             )
         } else if anchor_looks_like_path(anchor) {
             let cwd = std::env::current_dir()?;
@@ -268,23 +272,43 @@ fn handle_explain(
                 brick_core::resolve_file_anchor(&events, &rel),
                 Some(rel),
                 false,
+                None,
             )
         } else {
             (
                 brick_core::resolve_direct_anchor(&events, anchor),
                 None,
                 false,
+                None,
             )
         };
 
     let mut chain = brick_core::explain_from_events(&events, resolved, depth);
-    let index_session_hint = mcp::merge_index_sessions_into_chain(
-        &mut chain,
-        store.repo_root(),
-        anchored_path.as_deref(),
-        is_file_line,
-        depth,
-    );
+    let text_match_found = if is_file_line {
+        match (anchored_path.as_deref(), selected_text.as_deref()) {
+            (Some(path), Some(text)) => mcp::merge_index_text_matches_into_chain(
+                &mut chain,
+                store.repo_root(),
+                path,
+                text,
+                depth,
+            ),
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let index_session_hint = if text_match_found {
+        None
+    } else {
+        mcp::merge_index_sessions_into_chain(
+            &mut chain,
+            store.repo_root(),
+            anchored_path.as_deref(),
+            is_file_line,
+            depth,
+        )
+    };
     let value = mcp::finalize_explain_chain(
         chain,
         store,

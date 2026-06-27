@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     metadata_db_path, metadata_db_path_in_home, FileSessionBlameEvidenceKind, FileSessionBlameRow,
@@ -19,7 +20,7 @@ use crate::{
 };
 
 /// Current schema version for the unified metadata database.
-pub const METADATA_DB_SCHEMA_VERSION: u16 = 6;
+pub const METADATA_DB_SCHEMA_VERSION: u16 = 7;
 
 const METADATA_KEY_SCHEMA_VERSION: &str = "schema_version";
 const METADATA_KEY_RESET_AT: &str = "reset_at";
@@ -114,6 +115,22 @@ pub struct SourceSessionChunkRecord {
     pub source_message_id: Option<String>,
     pub source_part_id: Option<String>,
     pub raw_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFileLineProvenanceQuery {
+    pub file_path: String,
+    pub line_text: String,
+    pub line_number: Option<u64>,
+    pub source_id: Option<String>,
+    pub repo_path: Option<PathBuf>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceFileLineProvenanceRecord {
+    pub row: FileSessionBlameRow,
+    pub evidence: Value,
 }
 
 /// Input for replacing the fused chunks for one source session.
@@ -344,6 +361,10 @@ impl MetadataDb {
             "DELETE FROM source_session_chunks WHERE source_session_id = ?1",
             params![source_session_id],
         )?;
+        transaction.execute(
+            "DELETE FROM source_file_line_provenance WHERE source_session_id = ?1",
+            params![source_session_id],
+        )?;
         for (index, chunk) in upsert.chunks.iter().enumerate() {
             let raw_json =
                 serde_json::to_value(chunk).context("failed to encode activity chunk")?;
@@ -374,6 +395,12 @@ impl MetadataDb {
                     chunk.source_part_id,
                     raw_json,
                 ],
+            )?;
+            insert_line_provenance_for_chunk(
+                &transaction,
+                source_session_id,
+                i64::try_from(index).context("source session chunk index exceeds i64")?,
+                chunk,
             )?;
         }
         transaction
@@ -584,6 +611,227 @@ impl MetadataDb {
         Ok(ranked)
     }
 
+    pub fn query_source_file_line_provenance(
+        &self,
+        query: &SourceFileLineProvenanceQuery,
+    ) -> Result<Vec<SourceFileLineProvenanceRecord>> {
+        let needle = normalize_line_text(&query.line_text);
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let line_hash = line_hash(&needle);
+        let limit = normalized_limit(query.limit);
+        let mut statement = self.connection.prepare(
+            "SELECT s.source_id, s.external_session_id, s.title, s.name, s.source_path, s.source_uri,
+                    s.source_mtime, s.source_size, s.source_fingerprint, s.parser_version,
+                    s.session_created_at, s.session_updated_at, s.model, s.input_tokens, s.output_tokens, s.repo_path, s.branch,
+                    s.files_changed, s.lines_added, s.lines_removed, s.touched_files_json, s.listable,
+                    s.discovered_at, s.last_seen_at, s.created_at, s.updated_at, s.metadata_json,
+                    p.file_path, p.chunk_id, p.chunk_index, p.function, p.evidence_kind,
+                    p.matched_line_count, p.selected_line_count, p.created_at, p.evidence_json
+             FROM source_file_line_provenance p
+             JOIN source_sessions s ON s.source_session_id = p.source_session_id
+             WHERE (?1 IS NULL OR s.source_id = ?1)
+               AND (p.line_hash = ?2 OR p.line_text = ?3 OR p.line_preview = ?3)
+             ORDER BY p.created_at DESC, s.source_id ASC, s.external_session_id ASC, p.chunk_index DESC",
+        )?;
+        let rows = statement.query_map(params![query.source_id, line_hash, needle], |row| {
+            let record = source_session_from_row(row)?;
+            let file_path: String = row.get(27)?;
+            let chunk_id: String = row.get(28)?;
+            let chunk_index: i64 = row.get(29)?;
+            let function: String = row.get(30)?;
+            let evidence_kind: String = row.get(31)?;
+            let matched_line_count: i64 = row.get(32)?;
+            let selected_line_count: i64 = row.get(33)?;
+            let occurred_at: String = row.get(34)?;
+            let evidence_json = parse_metadata_json(row.get::<_, Option<String>>(35)?)?
+                .unwrap_or_else(|| json!({}));
+            Ok((
+                record,
+                file_path,
+                chunk_id,
+                chunk_index,
+                function,
+                evidence_kind,
+                matched_line_count,
+                selected_line_count,
+                occurred_at,
+                evidence_json,
+            ))
+        })?;
+        let preferred_repo = query
+            .repo_path
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let mut matched: Vec<(bool, u8, SourceFileLineProvenanceRecord)> = Vec::new();
+        for row in rows {
+            let (
+                record,
+                file_path,
+                chunk_id,
+                chunk_index,
+                function,
+                evidence_kind,
+                matched_line_count,
+                selected_line_count,
+                occurred_at,
+                mut evidence,
+            ) = row.context("failed to read source file line provenance row")?;
+            let repo_path = record
+                .repo_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+            if !blame_path_matches(&query.file_path, &file_path, repo_path.as_deref()) {
+                continue;
+            }
+            let same_repo = matches!(
+                (&preferred_repo, &repo_path),
+                (Some(want), Some(have)) if want == have
+            );
+            let mut blame = source_session_blame_row(&query.file_path, record, Some(occurred_at));
+            blame.confidence = Some(evidence_kind.clone());
+            if let Value::Object(map) = &mut evidence {
+                map.insert("kind".to_string(), json!(evidence_kind.clone()));
+                map.insert("chunk_id".to_string(), json!(chunk_id.clone()));
+                map.insert("chunk_index".to_string(), json!(chunk_index));
+                map.insert("function".to_string(), json!(function.clone()));
+                map.insert("matched_line_count".to_string(), json!(matched_line_count));
+                map.insert(
+                    "selected_line_count".to_string(),
+                    json!(selected_line_count),
+                );
+                if let Some(line_number) = query.line_number {
+                    map.insert("line_no".to_string(), json!(line_number));
+                }
+            }
+            if let Some(Value::Object(pointer)) = blame.source_pointer.as_mut() {
+                pointer.insert("chunk_id".to_string(), json!(chunk_id));
+                pointer.insert("chunk_index".to_string(), json!(chunk_index));
+                pointer.insert("function".to_string(), json!(function));
+                pointer.insert("match_confidence".to_string(), json!(evidence_kind.clone()));
+                pointer.insert("evidence".to_string(), evidence.clone());
+            }
+            matched.push((
+                same_repo,
+                provenance_rank(&evidence_kind),
+                SourceFileLineProvenanceRecord {
+                    row: blame,
+                    evidence,
+                },
+            ));
+        }
+        matched.sort_by_key(|(same_repo, rank, record)| {
+            (
+                std::cmp::Reverse(*same_repo),
+                *rank,
+                std::cmp::Reverse(record.row.occurred_at.clone()),
+            )
+        });
+        let mut records: Vec<SourceFileLineProvenanceRecord> =
+            matched.into_iter().map(|(_, _, record)| record).collect();
+        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(records)
+    }
+
+    /// Queries source metadata rows that touched a file path.
+    /// `repo_path` is a *ranking preference*, not a hard filter: matches whose
+    /// session repo equals it are ordered first, but sessions from other repos
+    /// still match so blame works regardless of the caller's CWD. Path matching
+    /// is robust to absolute-vs-relative form (see `blame_path_matches`).
+    pub fn query_source_file_session_text_match(
+        &self,
+        query: &SourceFileSessionBlameQuery,
+        text: &str,
+    ) -> Result<Vec<FileSessionBlameRow>> {
+        let needle = normalize_match_text(text);
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = normalized_limit(query.limit);
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, external_session_id, title, name, source_path, source_uri,
+                    source_mtime, source_size, source_fingerprint, parser_version,
+                    session_created_at, session_updated_at, model, input_tokens, output_tokens, repo_path, branch,
+                    files_changed, lines_added, lines_removed, touched_files_json, listable,
+                    discovered_at, last_seen_at, created_at, updated_at, metadata_json
+             FROM source_sessions
+             WHERE (?1 IS NULL OR source_id = ?1)
+               AND touched_files_json IS NOT NULL
+             ORDER BY last_seen_at DESC, source_id ASC, external_session_id ASC",
+        )?;
+        let rows = statement.query_map(params![query.source_id], source_session_from_row)?;
+        let preferred_repo = query
+            .repo_path
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let mut matched: Vec<(bool, u8, FileSessionBlameRow)> = Vec::new();
+        for row in rows {
+            let record = row.context("failed to read metadata source-session text-match row")?;
+            let repo_path = record
+                .repo_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let touched = touched_files_from_value(record.touched_files_json.as_ref());
+            if !touched
+                .iter()
+                .any(|stored| blame_path_matches(&query.file_path, stored, repo_path.as_deref()))
+            {
+                continue;
+            }
+            let Some((chunk, mut evidence)) = self.source_session_text_match_chunk(
+                &record.source_id,
+                &record.external_session_id,
+                &needle,
+            )?
+            else {
+                continue;
+            };
+            let evidence_kind = evidence
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("text_match_diff_output")
+                .to_string();
+
+            let evidence_rank = provenance_rank(&evidence_kind);
+            let same_repo = matches!(
+                (&preferred_repo, &repo_path),
+                (Some(want), Some(have)) if want == have
+            );
+            let mut row =
+                source_session_blame_row(&query.file_path, record, Some(chunk.created_at));
+            row.confidence = Some(evidence_kind.clone());
+            if let Some(Value::Object(pointer)) = row.source_pointer.as_mut() {
+                if let Value::Object(evidence_map) = &mut evidence {
+                    evidence_map.insert(
+                        "source".to_string(),
+                        json!(record_source_from_pointer(pointer)),
+                    );
+                    evidence_map.insert(
+                        "session_id".to_string(),
+                        json!(record_external_from_pointer(pointer)),
+                    );
+                    evidence_map.insert("chunk_id".to_string(), json!(chunk.chunk_id.clone()));
+                    evidence_map.insert("chunk_index".to_string(), json!(chunk.chunk_index));
+                    evidence_map.insert("function".to_string(), json!(chunk.function.clone()));
+                }
+                pointer.insert("chunk_id".to_string(), json!(chunk.chunk_id));
+                pointer.insert("chunk_index".to_string(), json!(chunk.chunk_index));
+                pointer.insert("function".to_string(), json!(chunk.function));
+                pointer.insert("match_confidence".to_string(), json!(evidence_kind));
+                pointer.insert("evidence".to_string(), evidence);
+            }
+            matched.push((same_repo, evidence_rank, row));
+        }
+        matched.sort_by_key(|(same_repo, evidence_rank, _)| {
+            (std::cmp::Reverse(*same_repo), *evidence_rank)
+        });
+        let mut records: Vec<FileSessionBlameRow> =
+            matched.into_iter().map(|(_, _, row)| row).collect();
+        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(records)
+    }
+
     /// Queries source metadata rows that touched a file path.
     /// `repo_path` is a *ranking preference*, not a hard filter: matches whose
     /// session repo equals it are ordered first, but sessions from other repos
@@ -686,6 +934,39 @@ impl MetadataDb {
             }
         }
         Ok(None)
+    }
+
+    fn source_session_text_match_chunk(
+        &self,
+        source_id: &str,
+        external_session_id: &str,
+        text: &str,
+    ) -> Result<Option<(SourceSessionChunkRecord, Value)>> {
+        let chunks = self.list_source_session_chunks(source_id, external_session_id)?;
+        let mut best: Option<(u8, i64, SourceSessionChunkRecord, Value)> = None;
+        for chunk in chunks {
+            if chunk.action_type != "tool_call" || !is_file_mutation_tool(&chunk.function) {
+                continue;
+            }
+            if let Some(evidence) =
+                chunk_text_evidence(&chunk.args_json, &chunk.result_json, &chunk.raw_json, text)
+            {
+                let rank = evidence
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(provenance_rank)
+                    .unwrap_or(2);
+                let chunk_index = chunk.chunk_index;
+                let replace = best.as_ref().is_none_or(|(best_rank, best_index, _, _)| {
+                    (rank, std::cmp::Reverse(chunk_index))
+                        < (*best_rank, std::cmp::Reverse(*best_index))
+                });
+                if replace {
+                    best = Some((rank, chunk_index, chunk, evidence));
+                }
+            }
+        }
+        Ok(best.map(|(_, _, chunk, evidence)| (chunk, evidence)))
     }
 
     /// Counts source-session rows matching an optional source filter.
@@ -1408,6 +1689,26 @@ fn create_schema(connection: &Connection) -> Result<()> {
             UNIQUE(source_session_id, chunk_id),
             FOREIGN KEY(source_session_id) REFERENCES source_sessions(source_session_id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS source_file_line_provenance (
+            source_file_line_provenance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_session_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            normalized_file_path TEXT NOT NULL,
+            line_hash TEXT NOT NULL,
+            line_text TEXT NOT NULL,
+            line_preview TEXT NOT NULL,
+            context_hash TEXT,
+            chunk_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            function TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            matched_line_count INTEGER NOT NULL,
+            selected_line_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            UNIQUE(source_session_id, normalized_file_path, line_hash, chunk_id),
+            FOREIGN KEY(source_session_id) REFERENCES source_sessions(source_session_id) ON DELETE CASCADE
+        );
         CREATE TABLE IF NOT EXISTS source_plans (
              source_plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
              source_id TEXT NOT NULL,
@@ -1496,6 +1797,8 @@ fn create_schema(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_source_sessions_fingerprint ON source_sessions(source_fingerprint);
         CREATE INDEX IF NOT EXISTS idx_source_session_chunks_session ON source_session_chunks(source_session_id, chunk_index);
         CREATE INDEX IF NOT EXISTS idx_source_session_chunks_text ON source_session_chunks(action_type, function, created_at);
+        CREATE INDEX IF NOT EXISTS idx_source_file_line_prov_lookup ON source_file_line_provenance(normalized_file_path, line_hash, created_at);
+        CREATE INDEX IF NOT EXISTS idx_source_file_line_prov_session ON source_file_line_provenance(source_session_id, chunk_index);
         CREATE INDEX IF NOT EXISTS idx_source_plans_source ON source_plans(source_id, last_seen_at);
 
          CREATE INDEX IF NOT EXISTS idx_source_plans_path ON source_plans(source_path);
@@ -1746,6 +2049,152 @@ fn read_source_session_id(
         .context("failed to read metadata source-session id")
 }
 
+fn insert_line_provenance_for_chunk(
+    connection: &Connection,
+    source_session_id: i64,
+    chunk_index: i64,
+    chunk: &crate::ActivityChunk,
+) -> Result<()> {
+    if chunk.action_type != crate::ACTION_TYPE_TOOL_CALL || !is_file_mutation_tool(&chunk.function)
+    {
+        return Ok(());
+    }
+    let Some(file_path) = chunk_file_path(chunk) else {
+        return Ok(());
+    };
+    let kind = if edit_tool_payload_has_content(&chunk.args) {
+        "exact_edit_hunk"
+    } else {
+        "exact_diff_hunk"
+    };
+    let lines = chunk_provenance_lines(chunk, kind);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    for line in lines {
+        connection.execute(
+            "INSERT OR IGNORE INTO source_file_line_provenance (
+                source_session_id, file_path, normalized_file_path, line_hash, line_text, line_preview,
+                context_hash, chunk_id, chunk_index, function, evidence_kind,
+                matched_line_count, selected_line_count, created_at, evidence_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                source_session_id,
+                file_path,
+                normalize_index_path(&file_path),
+                line_hash(&line),
+                line,
+                line_preview(&line),
+                chunk.chunk_id,
+                chunk_index,
+                chunk.function,
+                kind,
+                1_i64,
+                1_i64,
+                chunk.created_at,
+                serialize_metadata_json(Some(&json!({
+                    "kind": kind,
+                    "file_path": file_path,
+                    "line_preview": line_preview(&line),
+                    "source": chunk.source_id,
+                    "session_id": chunk.session_id,
+                    "chunk_id": chunk.chunk_id,
+                    "chunk_index": chunk_index,
+                    "function": chunk.function,
+                })))?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn chunk_file_path(chunk: &crate::ActivityChunk) -> Option<String> {
+    for key in ["file_path", "path", "target_file", "file"] {
+        if let Some(path) = chunk.args.get(key).and_then(Value::as_str) {
+            return Some(path.to_string());
+        }
+    }
+    chunk.source_path.clone()
+}
+
+fn chunk_provenance_lines(chunk: &crate::ActivityChunk, kind: &str) -> Vec<String> {
+    let mut strings = Vec::new();
+    if kind == "exact_edit_hunk" {
+        for key in ["new_string", "content", "new_content", "patch", "input"] {
+            if let Some(value) = chunk.args.get(key) {
+                collect_json_strings(value, &mut strings);
+            }
+        }
+    } else {
+        collect_json_strings(&chunk.result, &mut strings);
+    }
+    let mut lines = Vec::new();
+    for value in strings {
+        for line in value.lines().filter_map(diff_added_or_plain_line) {
+            let normalized = normalize_line_text(line);
+            if normalized.len() >= 6 && !lines.contains(&normalized) {
+                lines.push(normalized);
+            }
+        }
+    }
+    lines
+}
+
+fn edit_tool_payload_has_content(args: &Value) -> bool {
+    ["new_string", "content", "new_content", "patch", "input"]
+        .iter()
+        .any(|key| args.get(key).is_some())
+}
+
+fn diff_added_or_plain_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim_end();
+    if trimmed.starts_with("+++") || trimmed.starts_with("---") || trimmed.starts_with("@@") {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        return Some(rest);
+    }
+    let plain = trimmed.trim_start();
+    if plain.is_empty() || plain.starts_with('-') {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn normalize_line_text(text: &str) -> String {
+    text.trim().to_string()
+}
+
+fn normalize_index_path(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
+fn line_hash(line: &str) -> String {
+    format!("{:x}", Sha256::digest(normalize_line_text(line).as_bytes()))
+}
+
+fn line_preview(line: &str) -> String {
+    line.chars().take(160).collect()
+}
+
+fn provenance_rank(kind: &str) -> u8 {
+    match kind {
+        "exact_edit_hunk" => 0,
+        "exact_diff_hunk" => 1,
+        "text_match_edit_tool" => 2,
+        "text_match_diff_output" => 3,
+        _ => 4,
+    }
+}
+
+fn record_source_from_pointer(pointer: &serde_json::Map<String, Value>) -> Option<&str> {
+    pointer.get("source_id").and_then(Value::as_str)
+}
+
+fn record_external_from_pointer(pointer: &serde_json::Map<String, Value>) -> Option<&str> {
+    pointer.get("external_session_id").and_then(Value::as_str)
+}
+
 fn source_session_blame_row(
     file_path: &str,
     record: SourceSessionRecord,
@@ -1827,10 +2276,85 @@ fn chunk_mentions_file(raw_json: &str, file_path: &str, repo_path: Option<&str>)
         .any(|candidate| blame_path_matches(file_path, candidate, repo_path))
 }
 
+fn chunk_text_evidence(args: &Value, result: &Value, raw: &Value, text: &str) -> Option<Value> {
+    let mut arg_strings = Vec::new();
+    for key in ["new_string", "content", "new_content", "patch", "input"] {
+        if let Some(value) = args.get(key) {
+            collect_json_strings(value, &mut arg_strings);
+        }
+    }
+    let mut output_strings = Vec::new();
+    collect_json_strings(result, &mut output_strings);
+    collect_json_strings(raw, &mut output_strings);
+    if let Some(evidence) = text_evidence_from_strings(&arg_strings, text, "exact_edit_hunk") {
+        return Some(evidence);
+    }
+    text_evidence_from_strings(&output_strings, text, "exact_diff_hunk")
+}
+
+fn text_evidence_from_strings(strings: &[&str], text: &str, kind: &str) -> Option<Value> {
+    let selected_lines = match_lines(text);
+    for candidate in strings {
+        let candidate = normalize_match_text(candidate);
+        let matched_lines = matched_lines(&candidate, &selected_lines);
+        if candidate.contains(text)
+            || enough_line_overlap_count(matched_lines.len(), selected_lines.len())
+        {
+            let preview = matched_lines
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(json!({
+                "kind": kind,
+                "matched_line_count": matched_lines.len(),
+                "selected_line_count": selected_lines.len(),
+                "matched_preview": preview,
+            }));
+        }
+    }
+    None
+}
+
+fn matched_lines(candidate: &str, selected: &[String]) -> Vec<String> {
+    selected
+        .iter()
+        .filter(|line| candidate.contains(line.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn enough_line_overlap_count(matched: usize, selected: usize) -> bool {
+    selected >= 2 && matched >= 2 && (matched * 5 >= selected * 2 || matched >= 4)
+}
+
+fn match_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.len() >= 6)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_match_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn is_file_mutation_tool(function: &str) -> bool {
     matches!(
         function,
-        "edit_file" | "write_file" | "delete_file" | "run_shell" | "create_file"
+        "edit_file"
+            | "write_file"
+            | "delete_file"
+            | "run_shell"
+            | "create_file"
+            | "apply_patch"
+            | "edit_file_by_replace"
     )
 }
 
@@ -2501,6 +3025,180 @@ mod tests {
             })
             .expect("query missing source file blame");
         assert!(missing_rows.is_empty());
+    }
+
+    #[test]
+    fn source_file_session_text_match_uses_edit_chunk_content() {
+        let path = temp_home("source-text-match").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Text match session", 0))
+            .expect("insert source session");
+        let mut chunk = crate::ActivityChunk::new(
+            TEST_EXTERNAL_SESSION_ID,
+            crate::ACTION_TYPE_TOOL_CALL,
+            "edit_file",
+        );
+        chunk.chunk_id = "edit-1".to_string();
+        chunk.created_at = "2026-06-18T01:03:00Z".to_string();
+        chunk.args = json!({
+            "file_path": "/tmp/repo/src/lib.rs",
+            "new_string": "fn important() {\n    answer();\n    another();\n    final_line();\n}"
+        });
+        db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+            source_id: TEST_SOURCE_ID.to_string(),
+            external_session_id: TEST_EXTERNAL_SESSION_ID.to_string(),
+            chunks: vec![chunk],
+        })
+        .expect("upsert chunks");
+
+        let rows = db
+            .query_source_file_session_text_match(
+                &SourceFileSessionBlameQuery {
+                    file_path: "src/lib.rs".to_string(),
+                    source_id: Some(TEST_SOURCE_ID.to_string()),
+                    repo_path: Some(PathBuf::from("/tmp/repo")),
+                    limit: 20,
+                },
+                "    answer();",
+            )
+            .expect("query text match");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].confidence.as_deref(), Some("exact_edit_hunk"));
+        assert_eq!(rows[0].occurred_at.as_deref(), Some("2026-06-18T01:03:00Z"));
+        let pointer = rows[0].source_pointer.as_ref().unwrap();
+        assert_eq!(pointer["chunk_id"], "edit-1");
+        assert_eq!(pointer["evidence"]["kind"], "exact_edit_hunk");
+        assert_eq!(pointer["evidence"]["matched_line_count"], 1);
+
+        let misses = db
+            .query_source_file_session_text_match(
+                &SourceFileSessionBlameQuery {
+                    file_path: "src/lib.rs".to_string(),
+                    source_id: Some(TEST_SOURCE_ID.to_string()),
+                    repo_path: Some(PathBuf::from("/tmp/repo")),
+                    limit: 20,
+                },
+                "not in the edit",
+            )
+            .expect("query missing text match");
+        assert!(misses.is_empty());
+
+        let overlap = db
+            .query_source_file_session_text_match(
+                &SourceFileSessionBlameQuery {
+                    file_path: "src/lib.rs".to_string(),
+                    source_id: Some(TEST_SOURCE_ID.to_string()),
+                    repo_path: Some(PathBuf::from("/tmp/repo")),
+                    limit: 20,
+                },
+                "fn important() {\n    answer();\n    unrelated();",
+            )
+            .expect("query overlapping text match");
+        assert_eq!(overlap.len(), 1);
+
+        let large_selection = db
+            .query_source_file_session_text_match(
+                &SourceFileSessionBlameQuery {
+                    file_path: "src/lib.rs".to_string(),
+                    source_id: Some(TEST_SOURCE_ID.to_string()),
+                    repo_path: Some(PathBuf::from("/tmp/repo")),
+                    limit: 20,
+                },
+                "fn important() {\n    answer();\n    another();\n    final_line();\n    missing1();\n    missing2();\n    missing3();\n    missing4();\n    missing5();\n    missing6();",
+            )
+            .expect("query large overlapping text match");
+        assert_eq!(large_selection.len(), 1);
+    }
+
+    #[test]
+    fn source_file_line_provenance_indexes_edit_tool_lines() {
+        let path = temp_home("line-provenance-edit").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Line provenance session", 0))
+            .expect("insert source session");
+        let mut chunk = crate::ActivityChunk::new(
+            TEST_EXTERNAL_SESSION_ID,
+            crate::ACTION_TYPE_TOOL_CALL,
+            "edit_file",
+        );
+        chunk.chunk_id = "edit-line-1".to_string();
+        chunk.created_at = "2026-06-18T01:05:00Z".to_string();
+        chunk.args = json!({
+            "file_path": "/tmp/repo/src/lib.rs",
+            "new_string": "fn exact_owner() {\n    unique_line_owner();\n}"
+        });
+        db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+            source_id: TEST_SOURCE_ID.to_string(),
+            external_session_id: TEST_EXTERNAL_SESSION_ID.to_string(),
+            chunks: vec![chunk],
+        })
+        .expect("upsert chunks");
+
+        let rows = db
+            .query_source_file_line_provenance(&SourceFileLineProvenanceQuery {
+                file_path: "src/lib.rs".to_string(),
+                line_text: "    unique_line_owner();".to_string(),
+                line_number: Some(42),
+                source_id: Some(TEST_SOURCE_ID.to_string()),
+                repo_path: Some(PathBuf::from("/tmp/repo")),
+                limit: 20,
+            })
+            .expect("query line provenance");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row.confidence.as_deref(), Some("exact_edit_hunk"));
+        assert_eq!(rows[0].evidence["kind"], "exact_edit_hunk");
+        assert_eq!(rows[0].evidence["chunk_id"], "edit-line-1");
+        assert_eq!(rows[0].evidence["line_no"], 42);
+        assert_eq!(rows[0].evidence["line_preview"], "unique_line_owner();");
+    }
+
+    #[test]
+    fn source_file_session_text_match_classifies_diff_output() {
+        let path = temp_home("source-diff-match").join(crate::METADATA_DB_FILE);
+        let mut db = MetadataDb::open_path(&path).expect("open metadata DB");
+        db.upsert_source_session(&sample_upsert("Diff match session", 0))
+            .expect("insert source session");
+        let mut chunk = crate::ActivityChunk::new(
+            TEST_EXTERNAL_SESSION_ID,
+            crate::ACTION_TYPE_TOOL_CALL,
+            "run_shell",
+        );
+        chunk.chunk_id = "diff-1".to_string();
+        chunk.created_at = "2026-06-18T01:04:00Z".to_string();
+        chunk.args = json!({
+            "command": "git diff -- src/lib.rs"
+        });
+        chunk.result = json!({
+            "observation": "+fn diffed() {\n+    changed();\n+    finished();\n+}"
+        });
+        db.upsert_source_session_chunks(&SourceSessionChunksUpsert {
+            source_id: TEST_SOURCE_ID.to_string(),
+            external_session_id: TEST_EXTERNAL_SESSION_ID.to_string(),
+            chunks: vec![chunk],
+        })
+        .expect("upsert chunks");
+
+        let rows = db
+            .query_source_file_session_text_match(
+                &SourceFileSessionBlameQuery {
+                    file_path: "src/lib.rs".to_string(),
+                    source_id: Some(TEST_SOURCE_ID.to_string()),
+                    repo_path: Some(PathBuf::from("/tmp/repo")),
+                    limit: 20,
+                },
+                "fn diffed() {\n    changed();\n    finished();\n}",
+            )
+            .expect("query diff text match");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].confidence.as_deref(), Some("exact_diff_hunk"));
+
+        let pointer = rows[0].source_pointer.as_ref().unwrap();
+        assert_eq!(pointer["evidence"]["kind"], "exact_diff_hunk");
+        assert_eq!(pointer["evidence"]["chunk_id"], "diff-1");
+        assert_eq!(pointer["evidence"]["function"], "run_shell");
     }
 
     #[test]

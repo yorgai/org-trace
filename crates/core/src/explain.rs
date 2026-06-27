@@ -95,6 +95,8 @@ pub struct CausalStep {
     /// `observed` (transcript-captured) / `inferred` (heuristic) / a blame
     /// confidence for line anchors.
     pub confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
     pub transcript: Option<TranscriptPointer>,
     /// Distance from the anchor in the timeline (0 = newest / anchor itself).
     pub depth: usize,
@@ -179,6 +181,10 @@ pub fn source_sessions_to_steps(
             relation: None,
             note: None,
             confidence: "observed".to_string(),
+            evidence: row
+                .source_pointer
+                .as_ref()
+                .and_then(|pointer| pointer.get("evidence").cloned()),
             transcript: Some(TranscriptPointer {
                 source: (!source.is_empty()).then(|| source.clone()),
                 session_ref: source_path,
@@ -548,6 +554,7 @@ fn build_step(
             relation: None,
             note: None,
             confidence: confidence_wire(event),
+            evidence: None,
             transcript: transcript_pointer(event),
             depth,
         },
@@ -566,6 +573,7 @@ fn build_step(
             relation: None,
             note: None,
             confidence: "unknown".to_string(),
+            evidence: None,
             transcript: None,
             depth,
         },
@@ -602,6 +610,7 @@ fn build_source_session_step(event: &TraceEvent, event_id: &str, depth: usize) -
         relation: None,
         note: None,
         confidence: confidence_wire(event),
+        evidence: None,
         transcript: Some(TranscriptPointer {
             source,
             session_ref: source_path,
@@ -1167,6 +1176,7 @@ mod tests {
             relation: None,
             note: None,
             confidence: confidence.to_string(),
+            evidence: None,
             transcript: None,
             depth: 0,
         }
