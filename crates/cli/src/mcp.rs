@@ -422,30 +422,10 @@ pub(crate) fn merge_index_sessions_into_chain(
         limit: depth.clamp(DEFAULT_EXPLAIN_DEPTH, MAX_EXPLAIN_DEPTH),
     };
     let rows = db.query_source_file_session_blame(&query).ok()?;
-    // Strict same-repo filter: source_sessions is a global table, so never let
-    // another repo's session bleed in. Canonicalize both sides so a symlinked root
-    // (macOS `/var`→`/private/var`) still matches while a genuinely different repo
-    // is excluded.
-    let want = std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
-    let same_repo: Vec<_> = rows
-        .into_iter()
-        .filter(|row| {
-            row.source_pointer
-                .as_ref()
-                .and_then(|p| p.get("repo_path"))
-                .and_then(|v| v.as_str())
-                .map(|rp| {
-                    let have =
-                        std::fs::canonicalize(rp).unwrap_or_else(|_| std::path::PathBuf::from(rp));
-                    have == want
-                })
-                .unwrap_or(false)
-        })
-        .collect();
     let fallback_count = is_file_line
-        .then_some(same_repo.len())
+        .then_some(rows.len())
         .filter(|count| *count > 0);
-    let source_steps = source_sessions_to_steps(&same_repo, 0);
+    let source_steps = source_sessions_to_steps(&rows, 0);
     if !source_steps.is_empty() {
         merge_source_steps_into(&mut chain.steps, source_steps);
         chain.anchor.resolved_events = chain.steps.iter().map(|s| s.event_id.clone()).collect();
