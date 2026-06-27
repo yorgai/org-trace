@@ -698,6 +698,23 @@ impl MetadataDb {
         usize::try_from(count).context("metadata source-session count exceeds usize")
     }
 
+    /// Returns true when this source has any indexed session from an older parser.
+    pub fn source_has_parser_version_mismatch(
+        &self,
+        source_id: &str,
+        parser_version: &str,
+    ) -> Result<bool> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM source_sessions
+             WHERE source_id = ?1
+               AND listable = 1
+               AND (parser_version IS NULL OR parser_version <> ?2)",
+            params![source_id, parser_version],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Reads one source-session row by source and external session ID.
     pub fn get_source_session(
         &self,

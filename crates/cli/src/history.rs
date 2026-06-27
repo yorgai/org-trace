@@ -184,9 +184,20 @@ fn refresh_profiles_to_metadata(
     for profile in profiles {
         let scan_id = metadata_db.begin_source_scan(&profile.name)?;
         let watermark = metadata_db.get_source_watermark(&profile.name)?;
-        let since = watermark
-            .as_ref()
-            .and_then(|(high_water, _)| high_water.as_deref());
+        let parser_version_mismatch = brick_core::list_source_sessions(profile, Some(1))?
+            .first()
+            .is_some_and(|session| {
+                metadata_db
+                    .source_has_parser_version_mismatch(&profile.name, &session.parser_version)
+                    .unwrap_or(false)
+            });
+        let since = if parser_version_mismatch {
+            None
+        } else {
+            watermark
+                .as_ref()
+                .and_then(|(high_water, _)| high_water.as_deref())
+        };
         let profile_stats = match refresh_single_profile(
             metadata_db,
             event_store,
@@ -313,6 +324,7 @@ fn refresh_single_profile(
             (&existing, &upsert.source_fingerprint),
             (Some(record), Some(fingerprint))
                 if record.source_fingerprint.as_deref() == Some(fingerprint.as_str())
+                    && record.parser_version.as_deref() == upsert.parser_version.as_deref()
         );
         let chunks = if unchanged {
             metadata_db.touch_source_session_last_seen(

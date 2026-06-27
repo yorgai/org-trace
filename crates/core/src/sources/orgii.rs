@@ -27,7 +27,7 @@ use super::jsonl::normalize_title;
 use super::shell_edits::shell_edit_targets;
 
 const ORGII_SOURCE_ID: &str = "orgii";
-const ORGII_SQLITE_PARSER_VERSION: &str = "orgii-sqlite-v2";
+const ORGII_SQLITE_PARSER_VERSION: &str = "orgii-sqlite-v3";
 const ORGII_PROVIDER_SLUG: &str = "orgii";
 const ORGII_DB_FILE: &str = "sessions.db";
 
@@ -299,7 +299,7 @@ pub(super) fn format_chunks(
 
     let mut statement = connection
         .prepare(
-            "SELECT event_type, function_name, args_json, content, created_at
+            "SELECT event_type, function_name, args_json, result_json, content, created_at
              FROM events
              WHERE session_id = ?1
                AND event_type IN ('assistant','tool_call')
@@ -314,11 +314,12 @@ pub(super) fn format_chunks(
                 row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(5)?.unwrap_or_default(),
             ))
         })
         .context("failed to query ORGII transcript")?;
     for row in rows {
-        let (event_type, function_name, args_json, content, created_at) = row?;
+        let (event_type, function_name, args_json, result_json, content, created_at) = row?;
         match event_type.as_str() {
             "assistant" => {
                 let message = strip_assistant_prefix(&content);
@@ -343,12 +344,13 @@ pub(super) fn format_chunks(
                     args,
                     created_at: created_at.clone(),
                 };
+                let output = tool_output_from_result_json(&result_json);
                 chunks.push(tool_call_chunk(
                     external_session_id,
                     ORGII_PROVIDER_SLUG,
                     sequence,
                     &call,
-                    "",
+                    &output,
                 ));
                 sequence += 1;
             }
@@ -362,6 +364,15 @@ pub(super) fn format_chunks(
 /// strip it so the recovered rationale reads naturally.
 fn strip_assistant_prefix(content: &str) -> &str {
     content.strip_prefix("assistant ").unwrap_or(content).trim()
+}
+
+fn tool_output_from_result_json(result_json: &str) -> String {
+    let value: Value = serde_json::from_str(result_json).unwrap_or(Value::Null);
+    ["content", "observation", "output"]
+        .iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn parse_time(value: Option<&str>) -> Option<SystemTime> {
@@ -528,6 +539,7 @@ mod tests {
                     event_type TEXT NOT NULL DEFAULT '',
                     function_name TEXT,
                     args_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT NOT NULL DEFAULT '{}',
                     content TEXT NOT NULL DEFAULT '',
                     created_at TEXT,
                     history_sequence INTEGER
@@ -562,8 +574,8 @@ mod tests {
             .expect("insert assistant");
         connection
             .execute(
-                "INSERT INTO events (id, session_id, event_type, function_name, args_json, content, created_at, history_sequence)
-                 VALUES ('t1', 's1', 'tool_call', 'edit_file', '{\"file_path\":\"/repo/src/lib.rs\"}', '', '2026-06-18T01:20:00+00:00', 2)",
+                "INSERT INTO events (id, session_id, event_type, function_name, args_json, result_json, content, created_at, history_sequence)
+                 VALUES ('t1', 's1', 'tool_call', 'edit_file', '{\"file_path\":\"/repo/src/lib.rs\"}', '{\"content\":\"Edit applied to /repo/src/lib.rs\"}', '', '2026-06-18T01:20:00+00:00', 2)",
                 [],
             )
             .expect("insert tool_call");
@@ -595,6 +607,10 @@ mod tests {
         assert_eq!(
             final_msg.as_deref(),
             Some("I fixed the bug by serializing the refresh.")
+        );
+        assert_eq!(
+            chunks[1].result["output"].as_str(),
+            Some("Edit applied to /repo/src/lib.rs")
         );
     }
 }
